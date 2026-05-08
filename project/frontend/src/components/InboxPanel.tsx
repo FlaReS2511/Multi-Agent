@@ -32,7 +32,11 @@ export function InboxPanel({ summary, config, onConfigChange }: Props) {
   }, [selected, refreshKey])
 
   const messages = useMemo(() => parseInbox(content), [content])
-  const currentAgentConfig = config?.agents[selected] ?? { provider: 'anthropic', model: 'unknown' }
+  const entry = config?.agents[selected]
+  const currentAgentConfig = {
+    provider: entry?.provider ?? 'anthropic',
+    model: entry?.model ?? entry?.backend?.model ?? 'unknown',
+  }
 
   return (
     <div className="flex flex-col h-full">

@@ -1,14 +1,15 @@
 import { useState, useEffect } from 'react'
-import { AGENTS, AgentName, Priority, Task } from '../lib/api'
+import { AgentName, Priority, Task } from '../lib/api'
 
 interface Props {
   open: boolean
   onClose: () => void
   onCreated: () => void
   existingTasks: Task[]
+  agents: string[]
 }
 
-export function NewTaskDialog({ open, onClose, onCreated, existingTasks }: Props) {
+export function NewTaskDialog({ open, onClose, onCreated, existingTasks, agents }: Props) {
   const [title, setTitle] = useState('')
   const [description, setDescription] = useState('')
   const [owner, setOwner] = useState<AgentName>('orchestrator')
@@ -114,7 +115,7 @@ export function NewTaskDialog({ open, onClose, onCreated, existingTasks }: Props
                 onChange={(e) => setOwner(e.target.value as AgentName)}
                 className="w-full px-3 py-2 bg-zinc-950 border border-zinc-700 rounded text-sm text-zinc-100 focus:outline-none focus:border-zinc-500"
               >
-                {AGENTS.map((a) => (
+                {agents.map((a) => (
                   <option key={a} value={a}>
                     {a}
                   </option>

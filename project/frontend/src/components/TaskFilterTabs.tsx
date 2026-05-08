@@ -3,12 +3,13 @@ import { Task, TaskStatus } from '../lib/api'
 export type StatusFilter = TaskStatus | 'all'
 
 const TABS: { key: StatusFilter; label: string }[] = [
-  { key: 'all',         label: 'All' },
-  { key: 'todo',        label: 'TODO' },
-  { key: 'in_progress', label: 'In Progress' },
-  { key: 'review',      label: 'Review' },
-  { key: 'done',        label: 'Done' },
-  { key: 'blocked',     label: 'Blocked' },
+  { key: 'all',              label: 'All' },
+  { key: 'todo',             label: 'TODO' },
+  { key: 'in_progress',      label: 'In Progress' },
+  { key: 'waiting_children', label: 'Waiting' },
+  { key: 'review',           label: 'Review' },
+  { key: 'done',             label: 'Done' },
+  { key: 'blocked',          label: 'Blocked' },
 ]
 
 interface Props {
@@ -25,6 +26,7 @@ export function TaskFilterTabs({ tasks, active, onChange }: Props) {
     review: 0,
     done: 0,
     blocked: 0,
+    waiting_children: 0,
   }
   for (const t of tasks) counts[t.status]++
 

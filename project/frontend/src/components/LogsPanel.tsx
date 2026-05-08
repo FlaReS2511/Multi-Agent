@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useState } from 'react'
-import { AgentLogs, AGENTS, AgentName, AGENT_COLORS } from '../lib/api'
+import { AgentLogs, AgentName, colorFor } from '../lib/api'
 import { LogSearchBar } from './LogSearchBar'
 
 interface Props {
   logs: AgentLogs[]
+  agents: string[]
 }
 
 interface LogEntry {
@@ -21,11 +22,22 @@ function parseLine(agent: string, raw: string): LogEntry {
   return { agent, ts: '', text: raw, raw }
 }
 
-export function LogsPanel({ logs }: Props) {
+export function LogsPanel({ logs, agents }: Props) {
   const [search, setSearch] = useState('')
-  const [selectedAgents, setSelectedAgents] = useState<Set<AgentName>>(new Set(AGENTS))
+  const [selectedAgents, setSelectedAgents] = useState<Set<AgentName>>(new Set(agents))
   const [allLogs, setAllLogs] = useState<AgentLogs[] | null>(null)
   const [showAll, setShowAll] = useState(false)
+
+  // Keep selectedAgents in sync when the agent list changes (clones added/removed).
+  useEffect(() => {
+    setSelectedAgents((prev) => {
+      const next = new Set(prev)
+      let changed = false
+      for (const a of agents) if (!next.has(a)) { next.add(a); changed = true }
+      for (const a of Array.from(next)) if (!agents.includes(a)) { next.delete(a); changed = true }
+      return changed ? next : prev
+    })
+  }, [agents])
 
   useEffect(() => {
     if (!showAll) return
@@ -93,6 +105,7 @@ export function LogsPanel({ logs }: Props) {
       </div>
 
       <LogSearchBar
+        agents={agents}
         search={search}
         onSearchChange={setSearch}
         selectedAgents={selectedAgents}
@@ -115,9 +128,7 @@ export function LogsPanel({ logs }: Props) {
                 className="px-2 py-1 text-[11px] font-mono leading-relaxed flex items-start gap-2 hover:bg-zinc-900/40 rounded"
               >
                 <span
-                  className={`shrink-0 font-semibold w-32 truncate ${
-                    AGENT_COLORS[e.agent] ?? 'text-zinc-300'
-                  }`}
+                  className={`shrink-0 font-semibold w-32 truncate ${colorFor(e.agent)}`}
                 >
                   {e.agent}
                 </span>

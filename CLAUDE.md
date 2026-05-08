@@ -4,7 +4,14 @@
 
 ## Hệ thống
 
-6 agent Claude Code chạy song song, giao tiếp qua filesystem:
+8 agent chạy song song, giao tiếp qua filesystem. Mỗi agent có thể chạy bằng Claude Code CLI (default), Codex CLI, Gemini CLI, direct API (Anthropic/Google/OpenAI), hoặc LM Studio local. Backend được chọn per-agent qua `shared/agents-config.json`.
+
+Agents:
+- `planner`, `orchestrator` — coordination (pre-warmed)
+- `backend-engineer`, `frontend-engineer`, `ai-engineer` — workers (lazy spawn)
+- `be-reviewer`, `fe-reviewer`, `ai-reviewer` — per-domain reviewers (lazy spawn)
+
+**Spawn policy:** chỉ `orchestrator` + `planner` spawn lúc Electron khởi động. 6 agent còn lại spawn khi (a) inbox của họ có message mới, hoặc (b) user mở tab Terminals của họ. PTY bị kill sau 15 phút idle (pre-warmed agent miễn). Sau 5 giây spawn fresh, runtime gửi "check inbox" để CLI có thời gian load context.
 
 ```
 User ─chat──▶ Planner (draft spec) ──user-approves-via-UI──▶ Orchestrator
@@ -13,8 +20,10 @@ User ─chat──▶ Planner (draft spec) ──user-approves-via-UI──▶ O
                        │
                        ├──▶ Backend Engineer  (Python, API, DB)
                        ├──▶ Frontend Engineer (HTML/CSS/JS, React, Tailwind)
-                       ├──▶ AI Engineer       (Prompt, eval, Claude API)
-                       └──▶ Reviewer/QA       (Code review, test, security)
+                       ├──▶ AI Engineer       (Prompt, eval, model wiring)
+                       ├──▶ BE Reviewer       (Python review, pytest, security)
+                       ├──▶ FE Reviewer       (TypeScript review, a11y, build)
+                       └──▶ AI Reviewer       (prompt review, eval, schema)
 ```
 
 - **Planner** đối thoại với user để build spec, ghi vào `agents/planner/workspace/current-draft.md`. KHÔNG tự gửi inbox. User bấm Approve trong Electron Plan Composer → UI ghi message vào inbox Orchestrator.
@@ -73,12 +82,19 @@ Mỗi message là một block markdown, append vào cuối inbox file của ngư
 }
 ```
 
-**Status values:** `todo` | `in_progress` | `review` | `done` | `blocked`
+**Status values:** `todo` | `in_progress` | `review` | `done` | `blocked` | `waiting_children`
+
+**HTN fields (depth cap = 2):**
+- `parent_id: string | null` — null cho root task. Nếu có giá trị, task này là child của task đó.
+- `children: string[]` — list ID của children. Rỗng cho leaf hoặc task chưa split.
+- Status `waiting_children` áp dụng cho parent task đang chờ tất cả children done. Khi tất cả children = `done`, Orchestrator flip parent → `review` hoặc `done`.
+- Hard cap: child không được có children. IPC `create-task` / `split-task` reject grandchild.
 
 **Quy tắc ghi tasks.json:**
 - CHỈ Orchestrator được ghi `tasks.json`.
 - Worker muốn đổi status → gửi message vào `shared/inbox/orchestrator.md`, Orchestrator update.
 - Khi tạo task mới: lấy id = `T-` + zero-pad của `next_id`, tăng `next_id` thêm 1.
+- Khi split task: dùng IPC `split-task` (qua Electron) hoặc ghi tay parent.children + children's parent_id. Set parent.status = `waiting_children`.
 
 ## Logging
 
@@ -95,7 +111,7 @@ Ví dụ: `[2026-05-04 12:15] software-engineer wrote project/backend/parsers.py
 Mỗi khi user gõ prompt mới (kể cả "check inbox"), agent thực hiện:
 
 1. **Đọc inbox của mình** → `shared/inbox/<role>.md`. Parse các block tách bằng `---`.
-2. Xử lý message (theo role-specific workflow trong `agents/<role>/CLAUDE.md`).
+2. Xử lý message (theo role-specific workflow trong `agents/<role>/AGENT.md` — file context canonical, được launcher copy ra `CLAUDE.md`/`GEMINI.md`/`AGENTS.md` cho từng CLI).
 3. Sau khi xử lý xong từng message: archive vào `shared/outbox/`, xoá khỏi inbox.
 4. **Log** action vào `shared/logs/<role>.log`.
 5. Nếu cần phản hồi → append vào inbox người nhận.

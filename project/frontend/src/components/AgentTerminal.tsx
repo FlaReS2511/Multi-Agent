@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
@@ -12,10 +12,30 @@ export function AgentTerminal({ agent, active }: Props) {
   const containerRef = useRef<HTMLDivElement>(null)
   const termRef = useRef<Terminal | null>(null)
   const fitRef = useRef<FitAddon | null>(null)
+  const [alive, setAlive] = useState<boolean | null>(null)
+  const [starting, setStarting] = useState(false)
 
-  // Mount xterm + start pty + subscribe
+  // Poll alive state so external spawns (inbox event, pre-warm) flip the UI
+  // from placeholder to terminal without a manual refresh.
   useEffect(() => {
-    if (!containerRef.current) return
+    let cancelled = false
+    const tick = async () => {
+      const detail = await window.api.ptyStatusDetail()
+      if (cancelled) return
+      const isAlive = detail.some((d) => d.agent === agent)
+      setAlive((prev) => (prev === isAlive ? prev : isAlive))
+    }
+    tick()
+    const i = setInterval(tick, 2000)
+    return () => {
+      cancelled = true
+      clearInterval(i)
+    }
+  }, [agent])
+
+  // Mount xterm + attach (no spawn) when agent is alive.
+  useEffect(() => {
+    if (!alive || !containerRef.current) return
 
     const term = new Terminal({
       cursorBlink: true,
@@ -52,13 +72,11 @@ export function AgentTerminal({ agent, active }: Props) {
     termRef.current = term
     fitRef.current = fit
 
-    // Initial fit + start pty
     requestAnimationFrame(() => {
       fit.fit()
       const cols = term.cols
       const rows = term.rows
-
-      window.api.ptyStart(agent).then(({ history }) => {
+      window.api.ptyAttach(agent).then(({ history }) => {
         if (history) term.write(history)
         window.api.ptyResize(agent, cols, rows)
       })
@@ -68,7 +86,7 @@ export function AgentTerminal({ agent, active }: Props) {
       term.write(data)
     })
     const offExit = window.api.onPtyExit(agent, ({ exitCode }) => {
-      term.write(`\r\n\x1b[31m[claude exited with code ${exitCode}]\x1b[0m\r\n`)
+      term.write(`\r\n\x1b[31m[agent exited with code ${exitCode}]\x1b[0m\r\n`)
     })
 
     const dataDisposable = term.onData((data) => {
@@ -94,8 +112,10 @@ export function AgentTerminal({ agent, active }: Props) {
       resizeDisposable.dispose()
       ro.disconnect()
       term.dispose()
+      termRef.current = null
+      fitRef.current = null
     }
-  }, [agent])
+  }, [agent, alive])
 
   // When this terminal becomes active, refit & focus
   useEffect(() => {
@@ -110,6 +130,46 @@ export function AgentTerminal({ agent, active }: Props) {
       })
     }
   }, [active])
+
+  const onStart = async () => {
+    if (starting) return
+    setStarting(true)
+    try {
+      await window.api.ptyStart(agent)
+      // Polling tick will detect alive on next cycle (≤2s); flip handled there.
+    } finally {
+      setStarting(false)
+    }
+  }
+
+  if (alive === null) {
+    return (
+      <div className="h-full w-full bg-zinc-950 flex items-center justify-center">
+        <span className="text-xs text-zinc-600">Checking session…</span>
+      </div>
+    )
+  }
+
+  if (!alive) {
+    return (
+      <div className="h-full w-full bg-zinc-950 flex flex-col items-center justify-center gap-3">
+        <div className="text-xs text-zinc-500">
+          <span className="font-mono text-zinc-400">{agent}</span> is not running.
+        </div>
+        <div className="text-[10px] text-zinc-600 max-w-md text-center px-4">
+          Tab clicks no longer auto-spawn agents. Click Start to launch this PTY,
+          or send the agent a message — it will wake up automatically.
+        </div>
+        <button
+          onClick={onStart}
+          disabled={starting}
+          className="px-4 py-1.5 text-xs font-medium bg-blue-600 hover:bg-blue-500 disabled:bg-zinc-800 disabled:text-zinc-600 text-white rounded transition-colors"
+        >
+          {starting ? 'Starting…' : 'Start agent'}
+        </button>
+      </div>
+    )
+  }
 
   return (
     <div className="h-full w-full bg-zinc-950">

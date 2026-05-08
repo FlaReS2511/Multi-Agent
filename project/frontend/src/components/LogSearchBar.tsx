@@ -1,6 +1,7 @@
-import { AGENTS, AgentName, AGENT_COLORS } from '../lib/api'
+import { AgentName, colorFor } from '../lib/api'
 
 interface Props {
+  agents: string[]
   search: string
   onSearchChange: (s: string) => void
   selectedAgents: Set<AgentName>
@@ -11,6 +12,7 @@ interface Props {
 }
 
 export function LogSearchBar({
+  agents,
   search,
   onSearchChange,
   selectedAgents,
@@ -26,7 +28,7 @@ export function LogSearchBar({
     onAgentsChange(next)
   }
 
-  const allOn = selectedAgents.size === AGENTS.length
+  const allOn = selectedAgents.size === agents.length
 
   return (
     <div className="border-b border-zinc-800 bg-zinc-950/60">
@@ -56,12 +58,12 @@ export function LogSearchBar({
       </div>
       <div className="px-3 pb-2 flex items-center gap-1 flex-wrap">
         <button
-          onClick={() => onAgentsChange(allOn ? new Set() : new Set(AGENTS))}
+          onClick={() => onAgentsChange(allOn ? new Set() : new Set(agents))}
           className="px-2 py-0.5 text-[10px] rounded text-zinc-500 hover:text-zinc-200 hover:bg-zinc-900"
         >
           {allOn ? 'none' : 'all'}
         </button>
-        {AGENTS.map((a) => {
+        {agents.map((a) => {
           const on = selectedAgents.has(a)
           return (
             <button
@@ -69,7 +71,7 @@ export function LogSearchBar({
               onClick={() => toggleAgent(a)}
               className={`px-2 py-0.5 text-[10px] font-medium rounded ring-1 ring-inset transition-colors ${
                 on
-                  ? `bg-zinc-900 ring-zinc-700 ${AGENT_COLORS[a] ?? 'text-zinc-200'}`
+                  ? `bg-zinc-900 ring-zinc-700 ${colorFor(a)}`
                   : 'bg-transparent text-zinc-600 ring-zinc-800 hover:text-zinc-400'
               }`}
             >

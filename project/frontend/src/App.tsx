@@ -1,12 +1,15 @@
 import { useEffect, useState, useCallback } from 'react'
 import { TasksPanel } from './components/TasksPanel'
-import { InboxPanel } from './components/InboxPanel'
+import { TaskInboxPanel } from './components/TaskInboxPanel'
 import { LogsPanel } from './components/LogsPanel'
 import { NewTaskDialog } from './components/NewTaskDialog'
 import { TerminalsView } from './components/TerminalsView'
 import { ArtifactViewer } from './components/ArtifactViewer'
 import { PlanComposer } from './components/PlanComposer'
-import { Task, InboxSummary, AgentLogs, AgentsConfig } from './lib/api'
+import { BackendSettingsModal } from './components/BackendSettingsModal'
+import { CostBadge } from './components/CostBadge'
+import { CostDashboardModal } from './components/CostDashboardModal'
+import { Task, InboxSummary, AgentLogs, AgentsConfig, activeAgents } from './lib/api'
 
 type View = 'dashboard' | 'plan' | 'terminals' | 'artifacts'
 
@@ -20,10 +23,15 @@ export default function App() {
   const [, setRoot] = useState<string>('')
   const [lastUpdate, setLastUpdate] = useState<Date>(new Date())
   const [showNewTask, setShowNewTask] = useState(false)
+  const [showBackendSettings, setShowBackendSettings] = useState(false)
+  const [showCostDashboard, setShowCostDashboard] = useState(false)
   const [view, setView] = useState<View>('dashboard')
   const [autoTrigger, setAutoTrigger] = useState(true)
   const [lastTriggered, setLastTriggered] = useState<{ agent: string; ts: number } | null>(null)
   const [artifactTaskId, setArtifactTaskId] = useState<string | null>(null)
+  const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null)
+  const selectedTask = selectedTaskId ? tasks.find((t) => t.id === selectedTaskId) ?? null : null
+  const agents = activeAgents(config)
 
   useEffect(() => {
     window.api.getAutoTrigger().then((r) => setAutoTrigger(r.enabled))
@@ -109,6 +117,7 @@ export default function App() {
           <Stat label="In progress" value={inProgressCount} color="text-blue-300" />
           <Stat label="Inbox" value={totalInbox} color="text-amber-300" />
           {blockedCount > 0 && <Stat label="Blocked" value={blockedCount} color="text-rose-300" />}
+          <CostBadge onClick={() => setShowCostDashboard(true)} />
           <span className="text-zinc-600 font-mono">
             {lastUpdate.toLocaleTimeString()}
           </span>
@@ -137,6 +146,13 @@ export default function App() {
             Auto-trigger {autoTrigger ? 'ON' : 'OFF'}
           </button>
           <button
+            onClick={() => setShowBackendSettings(true)}
+            title="Backend settings — switch each agent between Claude Code, Codex, Gemini, direct API, or LM Studio"
+            className="px-2 py-1 text-[11px] font-medium rounded border border-zinc-700 bg-zinc-900 text-zinc-400 hover:text-zinc-200 hover:border-zinc-600 transition-colors"
+          >
+            ⚙
+          </button>
+          <button
             onClick={() => setShowNewTask(true)}
             className="px-3 py-1 text-xs font-medium bg-blue-600 hover:bg-blue-500 text-white rounded transition-colors flex items-center gap-1.5"
           >
@@ -148,18 +164,20 @@ export default function App() {
       {/* Main view */}
       {view === 'dashboard' && (
         <main className="flex-1 grid grid-cols-12 gap-px bg-zinc-800 overflow-hidden">
-          <section className="col-span-4 bg-zinc-950 overflow-hidden">
+          <section className="col-span-5 bg-zinc-950 overflow-hidden">
             <TasksPanel
               tasks={tasks}
               onChanged={refreshAll}
               onOpenArtifact={openArtifact}
+              selectedId={selectedTaskId}
+              onSelectTask={setSelectedTaskId}
             />
           </section>
           <section className="col-span-4 bg-zinc-950 overflow-hidden">
-            <InboxPanel summary={inbox} config={config} onConfigChange={refreshConfig} />
+            <TaskInboxPanel taskId={selectedTaskId} task={selectedTask} />
           </section>
-          <section className="col-span-4 bg-zinc-950 overflow-hidden">
-            <LogsPanel logs={logs} />
+          <section className="col-span-3 bg-zinc-950 overflow-hidden">
+            <LogsPanel logs={logs} agents={agents} />
           </section>
         </main>
       )}
@@ -190,6 +208,17 @@ export default function App() {
         onClose={() => setShowNewTask(false)}
         onCreated={refreshAll}
         existingTasks={tasks}
+        agents={agents}
+      />
+
+      <BackendSettingsModal
+        open={showBackendSettings}
+        onClose={() => { setShowBackendSettings(false); refreshConfig() }}
+      />
+
+      <CostDashboardModal
+        open={showCostDashboard}
+        onClose={() => setShowCostDashboard(false)}
       />
     </div>
   )
