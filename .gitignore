@@ -27,6 +27,12 @@ project/frontend/.vite/
 shared/inbox/
 shared/outbox/
 shared/logs/
+shared/.secrets.json
+
+# Auto-generated agent context copies (canonical: agents/<role>/AGENT.md)
+agents/*/CLAUDE.md
+agents/*/GEMINI.md
+agents/*/AGENTS.md
 
 # IDEs and editors
 .vscode/
