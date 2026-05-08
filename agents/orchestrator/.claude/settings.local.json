@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(> /Users/tom/Downloads/multi-agent/shared/inbox/orchestrator.md)"
+    ]
+  }
+}

@@ -1,0 +1,48 @@
+{
+  "agents": {
+    "planner": {
+      "provider": "anthropic",
+      "model": "claude-opus-4-7"
+    },
+    "orchestrator": {
+      "provider": "anthropic",
+      "model": "claude-sonnet-4-6"
+    },
+    "backend-engineer": {
+      "provider": "anthropic",
+      "model": "claude-sonnet-4-6"
+    },
+    "frontend-engineer": {
+      "provider": "anthropic",
+      "model": "claude-sonnet-4-6"
+    },
+    "ai-engineer": {
+      "provider": "anthropic",
+      "model": "claude-sonnet-4-6"
+    },
+    "reviewer": {
+      "provider": "anthropic",
+      "model": "claude-sonnet-4-6"
+    }
+  },
+  "available_models": [
+    {
+      "provider": "anthropic",
+      "id": "claude-opus-4-7",
+      "label": "Claude Opus 4.7",
+      "tier": "smart"
+    },
+    {
+      "provider": "anthropic",
+      "id": "claude-sonnet-4-6",
+      "label": "Claude Sonnet 4.6",
+      "tier": "balanced"
+    },
+    {
+      "provider": "anthropic",
+      "id": "claude-haiku-4-5",
+      "label": "Claude Haiku 4.5",
+      "tier": "fast"
+    }
+  ]
+}

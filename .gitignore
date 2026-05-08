@@ -1,0 +1,40 @@
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+venv/
+env/
+ENV/
+.venv/
+
+# Node / frontend
+node_modules/
+project/frontend/node_modules/
+project/frontend/dist/
+project/frontend/dist-electron/
+project/frontend/tsconfig.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# Electron / build artefacts
+project/frontend/.vite/
+
+# Runtime files
+shared/inbox/
+shared/outbox/
+shared/logs/
+
+# IDEs and editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*.tmp
+*.bak
+
+# macOS
+.DS_Store
