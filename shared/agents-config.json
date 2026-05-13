@@ -9,10 +9,11 @@
     },
     "orchestrator": {
       "backend": {
-        "kind": "claude-cli"
+        "kind": "claude-cli",
+        "model": "claude-opus-4-7"
       },
       "provider": "anthropic",
-      "model": "claude-sonnet-4-6"
+      "model": "claude-opus-4-7"
     },
     "backend-engineer": {
       "backend": {

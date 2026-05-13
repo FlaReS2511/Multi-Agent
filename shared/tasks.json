@@ -309,7 +309,9 @@
       "title": "Review T-027 migration audit (phase1_diff + phase2 fixes)",
       "owner": "reviewer",
       "status": "done",
-      "deps": ["T-027"],
+      "deps": [
+        "T-027"
+      ],
       "priority": "high",
       "created_at": "2026-05-05 11:42",
       "updated_at": "2026-05-05 11:45",
@@ -331,7 +333,9 @@
       "title": "manager-livestream: TikTokClient infrastructure (decoupled, queue-based, daemon thread, auto-reconnect)",
       "owner": "backend-engineer",
       "status": "done",
-      "deps": ["T-029"],
+      "deps": [
+        "T-029"
+      ],
       "priority": "high",
       "created_at": "2026-05-05 13:50",
       "updated_at": "2026-05-05 13:53",
@@ -342,7 +346,9 @@
       "title": "manager-livestream: CommentReader tiktok branch + multi-source driver + fix hardcode source bug",
       "owner": "backend-engineer",
       "status": "done",
-      "deps": ["T-030"],
+      "deps": [
+        "T-030"
+      ],
       "priority": "high",
       "created_at": "2026-05-05 13:50",
       "updated_at": "2026-05-05 13:55",
@@ -353,7 +359,9 @@
       "title": "manager-livestream: Dedupe TikTok per-source (reuse OCRDedupeService, isolate scope)",
       "owner": "backend-engineer",
       "status": "done",
-      "deps": ["T-031"],
+      "deps": [
+        "T-031"
+      ],
       "priority": "medium",
       "created_at": "2026-05-05 13:50",
       "updated_at": "2026-05-05 13:57",
@@ -364,11 +372,13 @@
       "title": "manager-livestream: UI TikTok section + multi-source checkbox group trong comment_setup_tab.py",
       "owner": "frontend-engineer",
       "status": "done",
-      "deps": ["T-029", "T-030"],
+      "deps": [
+        "T-029",
+        "T-030"
+      ],
       "priority": "high",
       "created_at": "2026-05-05 13:50",
       "updated_at": "2026-05-05 14:06",
-      "artifact": "shared/artifacts/T-033/",
       "artifact": "shared/artifacts/T-033/"
     },
     {
@@ -376,11 +386,12 @@
       "title": "manager-livestream: UI Keyword Log tab mới (Treeview + filter + auto-refresh + brand reload)",
       "owner": "frontend-engineer",
       "status": "done",
-      "deps": ["T-029"],
+      "deps": [
+        "T-029"
+      ],
       "priority": "high",
       "created_at": "2026-05-05 13:50",
       "updated_at": "2026-05-05 13:55",
-      "artifact": "shared/artifacts/T-034/",
       "artifact": "shared/artifacts/T-034/"
     },
     {
@@ -388,11 +399,14 @@
       "title": "manager-livestream: Wire main_window + TikTokClient lifecycle + autostart + brand-switch reload",
       "owner": "frontend-engineer",
       "status": "done",
-      "deps": ["T-030", "T-033", "T-034"],
+      "deps": [
+        "T-030",
+        "T-033",
+        "T-034"
+      ],
       "priority": "high",
       "created_at": "2026-05-05 13:50",
       "updated_at": "2026-05-05 14:08",
-      "artifact": "shared/artifacts/T-035/",
       "artifact": "shared/artifacts/T-035/"
     },
     {
@@ -400,7 +414,9 @@
       "title": "manager-livestream: requirements.txt TikTokLive pin + smoke run verify",
       "owner": "backend-engineer",
       "status": "done",
-      "deps": ["T-030"],
+      "deps": [
+        "T-030"
+      ],
       "priority": "medium",
       "created_at": "2026-05-05 13:50",
       "updated_at": "2026-05-05 13:55",
@@ -411,7 +427,14 @@
       "title": "manager-livestream: Test + acceptance A1–A12 (TikTok + multi-source + keyword log)",
       "owner": "reviewer",
       "status": "done",
-      "deps": ["T-031", "T-032", "T-033", "T-034", "T-035", "T-036"],
+      "deps": [
+        "T-031",
+        "T-032",
+        "T-033",
+        "T-034",
+        "T-035",
+        "T-036"
+      ],
       "priority": "high",
       "created_at": "2026-05-05 13:50",
       "updated_at": "2026-05-05 14:14",
@@ -422,7 +445,9 @@
       "title": "manager-livestream: Fix critical — wire run_multi_source_switch + fix auto_reconnect default",
       "owner": "frontend-engineer",
       "status": "done",
-      "deps": ["T-037"],
+      "deps": [
+        "T-037"
+      ],
       "priority": "high",
       "created_at": "2026-05-05 14:12",
       "updated_at": "2026-05-05 14:13",
@@ -433,12 +458,756 @@
       "title": "manager-livestream: Re-review T-038 fixes (A7 multi-source wire + auto_reconnect default)",
       "owner": "reviewer",
       "status": "done",
-      "deps": ["T-038"],
+      "deps": [
+        "T-038"
+      ],
       "priority": "high",
       "created_at": "2026-05-05 14:12",
       "updated_at": "2026-05-05 14:14",
       "artifact": "shared/artifacts/T-039/"
+    },
+    {
+      "id": "T-040",
+      "title": "Refactor backup repo Multi-Agent (parent) — A..G + E1..E5",
+      "owner": "orchestrator",
+      "status": "done",
+      "deps": [],
+      "parent_id": null,
+      "children": [
+        "T-041",
+        "T-042",
+        "T-043",
+        "T-044",
+        "T-045",
+        "T-046",
+        "T-047",
+        "T-048",
+        "T-049",
+        "T-050",
+        "T-051"
+      ],
+      "priority": "medium",
+      "created_at": "2026-05-08 21:40",
+      "updated_at": "2026-05-08 22:48"
+    },
+    {
+      "id": "T-041",
+      "title": "A. Cleanup __pycache__ + .gitignore tweaks (backup repo)",
+      "owner": "frontend-engineer",
+      "status": "done",
+      "deps": [],
+      "parent_id": "T-040",
+      "children": [],
+      "priority": "low",
+      "created_at": "2026-05-08 21:40",
+      "updated_at": "2026-05-08 22:00",
+      "artifact": "shared/artifacts/T-041/"
+    },
+    {
+      "id": "T-042",
+      "title": "B. Split electron/main.ts (1213→~200) into ipc/* + services/*",
+      "owner": "frontend-engineer",
+      "status": "done",
+      "deps": [],
+      "parent_id": "T-040",
+      "children": [],
+      "priority": "medium",
+      "created_at": "2026-05-08 21:40",
+      "updated_at": "2026-05-08 22:00",
+      "artifact": "shared/artifacts/T-042/"
+    },
+    {
+      "id": "T-043",
+      "title": "C. Split scripts/agent_runtime.py (547→~150) into runtime/ package",
+      "owner": "backend-engineer",
+      "status": "done",
+      "deps": [],
+      "parent_id": "T-040",
+      "children": [],
+      "priority": "medium",
+      "created_at": "2026-05-08 21:40",
+      "updated_at": "2026-05-08 21:45",
+      "artifact": "shared/artifacts/T-043/"
+    },
+    {
+      "id": "T-044",
+      "title": "D. Extract hooks: usePlanDraft/usePlanApprove + useTabs/useGlobalShortcuts",
+      "owner": "frontend-engineer",
+      "status": "done",
+      "deps": [],
+      "parent_id": "T-040",
+      "children": [],
+      "priority": "medium",
+      "created_at": "2026-05-08 21:40",
+      "updated_at": "2026-05-08 22:00",
+      "artifact": "shared/artifacts/T-044/"
+    },
+    {
+      "id": "T-045",
+      "title": "F. Pytest suite for scripts/runtime/* (dispatch/idle/spawner/keyring_io)",
+      "owner": "backend-engineer",
+      "status": "done",
+      "deps": [
+        "T-043"
+      ],
+      "parent_id": "T-040",
+      "children": [],
+      "priority": "medium",
+      "created_at": "2026-05-08 21:40",
+      "updated_at": "2026-05-08 21:51",
+      "artifact": "shared/artifacts/T-045/"
+    },
+    {
+      "id": "T-046",
+      "title": "E1. Agent status pill on tabs (idle/running/error)",
+      "owner": "frontend-engineer",
+      "status": "done",
+      "deps": [
+        "T-044"
+      ],
+      "parent_id": "T-040",
+      "children": [],
+      "priority": "low",
+      "created_at": "2026-05-08 21:40",
+      "updated_at": "2026-05-08 22:10",
+      "artifact": "shared/artifacts/T-046/"
+    },
+    {
+      "id": "T-047",
+      "title": "E2. Floating Approve & Send button in Plan Composer",
+      "owner": "frontend-engineer",
+      "status": "done",
+      "deps": [
+        "T-044"
+      ],
+      "parent_id": "T-040",
+      "children": [],
+      "priority": "low",
+      "created_at": "2026-05-08 21:40",
+      "updated_at": "2026-05-08 22:10",
+      "artifact": "shared/artifacts/T-047/"
+    },
+    {
+      "id": "T-048",
+      "title": "E3. Cost dashboard: day/week/month totals + per-backend chart",
+      "owner": "frontend-engineer-2",
+      "status": "done",
+      "deps": [
+        "T-044"
+      ],
+      "parent_id": "T-040",
+      "children": [],
+      "priority": "low",
+      "created_at": "2026-05-08 21:40",
+      "updated_at": "2026-05-08 22:40",
+      "artifact": "shared/artifacts/T-048/"
+    },
+    {
+      "id": "T-049",
+      "title": "E4. Inbox filter by FROM",
+      "owner": "frontend-engineer-2",
+      "status": "done",
+      "deps": [
+        "T-044"
+      ],
+      "parent_id": "T-040",
+      "children": [],
+      "priority": "low",
+      "created_at": "2026-05-08 21:40",
+      "updated_at": "2026-05-08 22:40",
+      "artifact": "shared/artifacts/T-049/"
+    },
+    {
+      "id": "T-050",
+      "title": "E5. Confirm dialog before destroy-agent.sh",
+      "owner": "frontend-engineer-3",
+      "status": "done",
+      "deps": [
+        "T-044"
+      ],
+      "parent_id": "T-040",
+      "children": [],
+      "priority": "low",
+      "created_at": "2026-05-08 21:40",
+      "updated_at": "2026-05-08 22:07",
+      "artifact": "shared/artifacts/T-050/"
+    },
+    {
+      "id": "T-051",
+      "title": "G. Merge README.draft.md (EN) into README.md, drop draft",
+      "owner": "frontend-engineer",
+      "status": "done",
+      "deps": [
+        "T-046",
+        "T-047",
+        "T-048",
+        "T-049",
+        "T-050"
+      ],
+      "parent_id": "T-040",
+      "children": [],
+      "priority": "low",
+      "created_at": "2026-05-08 21:40",
+      "updated_at": "2026-05-08 22:48",
+      "artifact": "shared/artifacts/T-051/"
+    },
+    {
+      "id": "T-052",
+      "title": "Review T-043 split agent_runtime.py (be-reviewer)",
+      "owner": "be-reviewer",
+      "status": "done",
+      "deps": [
+        "T-043"
+      ],
+      "parent_id": null,
+      "children": [],
+      "priority": "medium",
+      "created_at": "2026-05-08 21:43",
+      "updated_at": "2026-05-08 21:45",
+      "artifact": "shared/artifacts/T-052/"
+    },
+    {
+      "id": "T-053",
+      "title": "Review T-045 pytest suite for runtime/* (be-reviewer)",
+      "owner": "be-reviewer",
+      "status": "done",
+      "deps": [
+        "T-045"
+      ],
+      "parent_id": null,
+      "children": [],
+      "priority": "medium",
+      "created_at": "2026-05-08 21:50",
+      "updated_at": "2026-05-08 21:51",
+      "artifact": "shared/artifacts/T-053/"
+    },
+    {
+      "id": "T-054",
+      "title": "Review T-041 cleanup pycache + .gitignore (fe-reviewer)",
+      "owner": "fe-reviewer",
+      "status": "done",
+      "deps": [
+        "T-041"
+      ],
+      "parent_id": null,
+      "children": [],
+      "priority": "low",
+      "created_at": "2026-05-08 21:55",
+      "updated_at": "2026-05-08 21:55",
+      "artifact": "shared/artifacts/T-054/"
+    },
+    {
+      "id": "T-055",
+      "title": "Review T-042 split electron/main.ts (fe-reviewer)",
+      "owner": "fe-reviewer",
+      "status": "done",
+      "deps": [
+        "T-042"
+      ],
+      "parent_id": null,
+      "children": [],
+      "priority": "medium",
+      "created_at": "2026-05-08 21:55",
+      "updated_at": "2026-05-08 21:55",
+      "artifact": "shared/artifacts/T-055/"
+    },
+    {
+      "id": "T-056",
+      "title": "Review T-044 extract hooks PlanComposer/App (fe-reviewer)",
+      "owner": "fe-reviewer",
+      "status": "done",
+      "deps": [
+        "T-044"
+      ],
+      "parent_id": null,
+      "children": [],
+      "priority": "medium",
+      "created_at": "2026-05-08 21:55",
+      "updated_at": "2026-05-08 21:55",
+      "artifact": "shared/artifacts/T-056/"
+    },
+    {
+      "id": "T-057",
+      "title": "Review T-050 confirm dialog before destroy-agent (fe-reviewer)",
+      "owner": "fe-reviewer",
+      "status": "done",
+      "deps": [
+        "T-050"
+      ],
+      "parent_id": null,
+      "children": [],
+      "priority": "low",
+      "created_at": "2026-05-08 22:03",
+      "updated_at": "2026-05-08 22:05",
+      "artifact": "shared/artifacts/T-057/"
+    },
+    {
+      "id": "T-058",
+      "title": "Re-review T-050 post-fix (a11y + error handling)",
+      "owner": "fe-reviewer",
+      "status": "done",
+      "deps": [
+        "T-050"
+      ],
+      "parent_id": null,
+      "children": [],
+      "priority": "low",
+      "created_at": "2026-05-08 22:06",
+      "updated_at": "2026-05-08 22:07",
+      "artifact": "shared/artifacts/T-058/"
+    },
+    {
+      "id": "T-059",
+      "title": "Review T-046 agent status pill on tabs (fe-reviewer)",
+      "owner": "fe-reviewer",
+      "status": "done",
+      "deps": [
+        "T-046"
+      ],
+      "parent_id": null,
+      "children": [],
+      "priority": "low",
+      "created_at": "2026-05-08 22:08",
+      "updated_at": "2026-05-08 22:10",
+      "artifact": "shared/artifacts/T-059/"
+    },
+    {
+      "id": "T-060",
+      "title": "Review T-047 floating Approve button in Plan Composer (fe-reviewer)",
+      "owner": "fe-reviewer",
+      "status": "done",
+      "deps": [
+        "T-047"
+      ],
+      "parent_id": null,
+      "children": [],
+      "priority": "low",
+      "created_at": "2026-05-08 22:08",
+      "updated_at": "2026-05-08 22:10",
+      "artifact": "shared/artifacts/T-060/"
+    },
+    {
+      "id": "T-061",
+      "title": "Review T-048 cost dashboard totals + chart (fe-reviewer)",
+      "owner": "fe-reviewer",
+      "status": "done",
+      "deps": [
+        "T-048"
+      ],
+      "parent_id": null,
+      "children": [],
+      "priority": "low",
+      "created_at": "2026-05-08 22:37",
+      "updated_at": "2026-05-08 22:40",
+      "artifact": "shared/artifacts/T-061/"
+    },
+    {
+      "id": "T-062",
+      "title": "Review T-049 inbox filter by FROM (fe-reviewer)",
+      "owner": "fe-reviewer",
+      "status": "done",
+      "deps": [
+        "T-049"
+      ],
+      "parent_id": null,
+      "children": [],
+      "priority": "low",
+      "created_at": "2026-05-08 22:37",
+      "updated_at": "2026-05-08 22:40",
+      "artifact": "shared/artifacts/T-062/"
+    },
+    {
+      "id": "T-063",
+      "title": "Review T-051 README merge EN (fe-reviewer)",
+      "owner": "fe-reviewer",
+      "status": "done",
+      "deps": [
+        "T-051"
+      ],
+      "parent_id": null,
+      "children": [],
+      "priority": "low",
+      "created_at": "2026-05-08 22:42",
+      "updated_at": "2026-05-08 22:45",
+      "artifact": "shared/artifacts/T-063/"
+    },
+    {
+      "id": "T-064",
+      "title": "Re-review T-051 README post-fix (3 issues)",
+      "owner": "fe-reviewer",
+      "status": "done",
+      "deps": [
+        "T-051"
+      ],
+      "parent_id": null,
+      "children": [],
+      "priority": "low",
+      "created_at": "2026-05-08 22:47",
+      "updated_at": "2026-05-08 22:48",
+      "artifact": "shared/artifacts/T-064/"
+    },
+    {
+      "id": "T-065",
+      "title": "E-commerce production-grade app (parent) — FastAPI + React/TS + Tailwind",
+      "owner": "orchestrator",
+      "status": "done",
+      "deps": [],
+      "parent_id": null,
+      "children": [
+        "T-066",
+        "T-067",
+        "T-068",
+        "T-069",
+        "T-070",
+        "T-071",
+        "T-072",
+        "T-073",
+        "T-074",
+        "T-075",
+        "T-076",
+        "T-077",
+        "T-078",
+        "T-079",
+        "T-080",
+        "T-082",
+        "T-083"
+      ],
+      "priority": "medium",
+      "created_at": "2026-05-13 21:31",
+      "updated_at": "2026-05-13 21:59"
+    },
+    {
+      "id": "T-066",
+      "title": "BE skeleton + auth (FastAPI app layout, settings, CORS, JWT, roles customer/admin)",
+      "owner": "backend-engineer",
+      "status": "done",
+      "deps": [],
+      "parent_id": "T-065",
+      "children": [],
+      "priority": "high",
+      "created_at": "2026-05-13 21:31",
+      "updated_at": "2026-05-13 21:59",
+      "artifact": "shared/artifacts/T-066/"
+    },
+    {
+      "id": "T-067",
+      "title": "BE catalog (Product/Category/Brand CRUD + filters + search + pagination) + image upload service",
+      "owner": "backend-engineer",
+      "status": "done",
+      "deps": [
+        "T-066"
+      ],
+      "parent_id": "T-065",
+      "children": [],
+      "priority": "high",
+      "created_at": "2026-05-13 21:31",
+      "updated_at": "2026-05-13 21:55",
+      "artifact": "shared/artifacts/T-067/"
+    },
+    {
+      "id": "T-068",
+      "title": "BE cart + checkout + multi-coupon stacking + mock payment + shipping/tax math",
+      "owner": "backend-engineer",
+      "status": "done",
+      "deps": [
+        "T-066"
+      ],
+      "parent_id": "T-065",
+      "children": [],
+      "priority": "high",
+      "created_at": "2026-05-13 21:31",
+      "updated_at": "2026-05-13 21:55",
+      "artifact": "shared/artifacts/T-068/"
+    },
+    {
+      "id": "T-069",
+      "title": "BE reviews (verified purchase) + wishlist + inventory + mock notifier + analytics",
+      "owner": "backend-engineer",
+      "status": "done",
+      "deps": [
+        "T-067",
+        "T-068"
+      ],
+      "parent_id": "T-065",
+      "children": [],
+      "priority": "medium",
+      "created_at": "2026-05-13 21:31",
+      "updated_at": "2026-05-13 21:55",
+      "artifact": "shared/artifacts/T-069/"
+    },
+    {
+      "id": "T-070",
+      "title": "BE Alembic migrations + seed script + smoke E2E (httpx)",
+      "owner": "backend-engineer",
+      "status": "done",
+      "deps": [
+        "T-069"
+      ],
+      "parent_id": "T-065",
+      "children": [],
+      "priority": "medium",
+      "created_at": "2026-05-13 21:31",
+      "updated_at": "2026-05-13 21:55",
+      "artifact": "shared/artifacts/T-070/"
+    },
+    {
+      "id": "T-071",
+      "title": "FE skeleton (Vite+React+TS+Tailwind) + auth UI + protected routes + role-aware nav",
+      "owner": "frontend-engineer",
+      "status": "done",
+      "deps": [
+        "T-066"
+      ],
+      "parent_id": "T-065",
+      "children": [],
+      "priority": "high",
+      "created_at": "2026-05-13 21:31",
+      "updated_at": "2026-05-13 21:55",
+      "artifact": "shared/artifacts/T-071/"
+    },
+    {
+      "id": "T-072",
+      "title": "FE catalog (home/category grid + filter sidebar + search debounce + pagination) + product detail",
+      "owner": "frontend-engineer",
+      "status": "done",
+      "deps": [
+        "T-067",
+        "T-071"
+      ],
+      "parent_id": "T-065",
+      "children": [],
+      "priority": "high",
+      "created_at": "2026-05-13 21:31",
+      "updated_at": "2026-05-13 21:55",
+      "artifact": "shared/artifacts/T-072/"
+    },
+    {
+      "id": "T-073",
+      "title": "FE cart + checkout (multi-coupon chips, totals breakdown) + mock payment screen",
+      "owner": "frontend-engineer",
+      "status": "done",
+      "deps": [
+        "T-068",
+        "T-071"
+      ],
+      "parent_id": "T-065",
+      "children": [],
+      "priority": "high",
+      "created_at": "2026-05-13 21:31",
+      "updated_at": "2026-05-13 21:55",
+      "artifact": "shared/artifacts/T-073/"
+    },
+    {
+      "id": "T-074",
+      "title": "FE order history + wishlist + UX polish (toast, skeletons, error boundary, responsive nav)",
+      "owner": "frontend-engineer",
+      "status": "done",
+      "deps": [
+        "T-073"
+      ],
+      "parent_id": "T-065",
+      "children": [],
+      "priority": "medium",
+      "created_at": "2026-05-13 21:31",
+      "updated_at": "2026-05-13 21:55",
+      "artifact": "shared/artifacts/T-074/"
+    },
+    {
+      "id": "T-075",
+      "title": "FE admin panel (products CRUD + image uploader + orders + coupons + analytics dashboard w/ recharts)",
+      "owner": "frontend-engineer",
+      "status": "done",
+      "deps": [
+        "T-067",
+        "T-069",
+        "T-071"
+      ],
+      "parent_id": "T-065",
+      "children": [],
+      "priority": "medium",
+      "created_at": "2026-05-13 21:31",
+      "updated_at": "2026-05-13 21:55",
+      "artifact": "shared/artifacts/T-075/"
+    },
+    {
+      "id": "T-076",
+      "title": "AI notification templates (order confirm / shipping update / low-stock) + render util",
+      "owner": "ai-engineer",
+      "status": "done",
+      "deps": [],
+      "parent_id": "T-065",
+      "children": [],
+      "priority": "low",
+      "created_at": "2026-05-13 21:31",
+      "updated_at": "2026-05-13 22:02",
+      "artifact": "shared/artifacts/T-076/"
+    },
+    {
+      "id": "T-077",
+      "title": "docker-compose.yml (Postgres) + project/README.md (setup/run/seed)",
+      "owner": "backend-engineer",
+      "status": "done",
+      "deps": [
+        "T-070"
+      ],
+      "parent_id": "T-065",
+      "children": [],
+      "priority": "low",
+      "created_at": "2026-05-13 21:31",
+      "updated_at": "2026-05-13 21:55",
+      "artifact": "shared/artifacts/T-077/"
+    },
+    {
+      "id": "T-078",
+      "title": "BE review (auth, catalog, cart/checkout, reviews/wishlist/inventory/analytics, migrations, smoke, compose)",
+      "owner": "be-reviewer",
+      "status": "done",
+      "deps": [
+        "T-066",
+        "T-067",
+        "T-068",
+        "T-069",
+        "T-070",
+        "T-077"
+      ],
+      "parent_id": "T-065",
+      "children": [],
+      "priority": "high",
+      "created_at": "2026-05-13 21:31",
+      "updated_at": "2026-05-13 21:55",
+      "artifact": "shared/artifacts/T-078/"
+    },
+    {
+      "id": "T-079",
+      "title": "FE review (skeleton/auth, catalog, cart/checkout, history/wishlist/polish, admin)",
+      "owner": "fe-reviewer",
+      "status": "done",
+      "deps": [
+        "T-071",
+        "T-072",
+        "T-073",
+        "T-074",
+        "T-075"
+      ],
+      "parent_id": "T-065",
+      "children": [],
+      "priority": "high",
+      "created_at": "2026-05-13 21:31",
+      "updated_at": "2026-05-13 21:55",
+      "artifact": "shared/artifacts/T-079/"
+    },
+    {
+      "id": "T-087",
+      "title": "Re-review T-085 BE fixes (verify HIGH coupon abuse + 5 MEDIUM closed)",
+      "owner": "be-reviewer",
+      "status": "done",
+      "deps": [
+        "T-085"
+      ],
+      "parent_id": null,
+      "children": [],
+      "priority": "high",
+      "created_at": "2026-05-13 23:06",
+      "updated_at": "2026-05-13 23:06",
+      "artifact": "shared/artifacts/T-087/"
+    },
+    {
+      "id": "T-086",
+      "title": "Re-review T-084 FE fixes (verify P1+P2 closed + bundle target)",
+      "owner": "fe-reviewer",
+      "status": "done",
+      "deps": [
+        "T-084"
+      ],
+      "parent_id": null,
+      "children": [],
+      "priority": "high",
+      "created_at": "2026-05-13 22:46",
+      "updated_at": "2026-05-13 22:46",
+      "artifact": "shared/artifacts/T-086/"
+    },
+    {
+      "id": "T-085",
+      "title": "BE fixes from T-078 review (coupon used_count, stock recheck, secret, magic-bytes)",
+      "owner": "backend-engineer",
+      "status": "done",
+      "deps": [],
+      "parent_id": null,
+      "children": [],
+      "priority": "high",
+      "created_at": "2026-05-13 23:01",
+      "updated_at": "2026-05-13 23:01",
+      "artifact": "shared/artifacts/T-085/"
+    },
+    {
+      "id": "T-084",
+      "title": "FE fixes from T-079 review (P1 error handling, a11y, P2 callbacks/bundle, P3 lints)",
+      "owner": "frontend-engineer",
+      "status": "done",
+      "deps": [],
+      "parent_id": null,
+      "children": [],
+      "priority": "high",
+      "created_at": "2026-05-13 22:43",
+      "updated_at": "2026-05-13 22:43",
+      "artifact": "shared/artifacts/T-084/"
+    },
+    {
+      "id": "T-082",
+      "title": "BE coupon admin CRUD (POST/PATCH/DELETE /admin/coupons) + GET list",
+      "owner": "backend-engineer",
+      "status": "done",
+      "deps": [],
+      "parent_id": "T-065",
+      "children": [],
+      "priority": "low",
+      "created_at": "2026-05-13 22:41",
+      "updated_at": "2026-05-13 22:41",
+      "artifact": "shared/artifacts/T-082/"
+    },
+    {
+      "id": "T-083",
+      "title": "BE stock movements admin endpoint (GET /admin/inventory/movements + per-product)",
+      "owner": "backend-engineer",
+      "status": "done",
+      "deps": [],
+      "parent_id": "T-065",
+      "children": [],
+      "priority": "low",
+      "created_at": "2026-05-13 22:41",
+      "updated_at": "2026-05-13 22:41",
+      "artifact": "shared/artifacts/T-083/"
+    },
+    {
+      "id": "T-081",
+      "title": "Re-review T-076 notification templates post-fix (fallback + edge cases + contracts)",
+      "owner": "ai-reviewer",
+      "status": "done",
+      "deps": [
+        "T-076"
+      ],
+      "parent_id": null,
+      "children": [],
+      "priority": "low",
+      "created_at": "2026-05-13 22:04",
+      "updated_at": "2026-05-13 22:04",
+      "artifact": "shared/artifacts/T-081/"
+    },
+    {
+      "id": "T-080",
+      "title": "AI review (notification templates: injection/schema/cost)",
+      "owner": "ai-reviewer",
+      "status": "done",
+      "deps": [
+        "T-076"
+      ],
+      "parent_id": "T-065",
+      "children": [],
+      "priority": "low",
+      "created_at": "2026-05-13 21:31",
+      "updated_at": "2026-05-13 21:55",
+      "artifact": "shared/artifacts/T-080/"
     }
   ],
-  "next_id": 40
+  "next_id": 88
 }
