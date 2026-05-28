@@ -83,6 +83,11 @@ const api = {
     ipcRenderer.on(channel, listener)
     return () => ipcRenderer.removeListener(channel, listener)
   },
+  workspaceListFiles: () => ipcRenderer.invoke('workspace-list-files'),
+  workspaceReadFile: (relPath: string) => ipcRenderer.invoke('workspace-read-file', relPath),
+  workspaceWriteFile: (relPath: string, content: string) => ipcRenderer.invoke('workspace-write-file', relPath, content),
+  workspaceGitStatus: () => ipcRenderer.invoke('workspace-git-status'),
+  workspaceGitShowHead: (relPath: string) => ipcRenderer.invoke('workspace-git-show-head', relPath),
   setAutoTrigger: (enabled: boolean) => ipcRenderer.invoke('set-auto-trigger', enabled),
   getAutoTrigger: () => ipcRenderer.invoke('get-auto-trigger'),
   onAutoTrigger: (cb: (info: { agent: string }) => void) => {

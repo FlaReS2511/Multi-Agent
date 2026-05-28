@@ -9,9 +9,10 @@ import { PlanComposer } from './components/PlanComposer'
 import { BackendSettingsModal } from './components/BackendSettingsModal'
 import { CostBadge } from './components/CostBadge'
 import { CostDashboardModal } from './components/CostDashboardModal'
+import { IDEView } from './components/IDEView'
 import { Task, InboxSummary, AgentLogs, AgentsConfig, activeAgents } from './lib/api'
 
-type View = 'dashboard' | 'plan' | 'terminals' | 'artifacts'
+type View = 'dashboard' | 'plan' | 'terminals' | 'artifacts' | 'ide'
 
 const POLL_MS = 2000
 
@@ -107,6 +108,7 @@ export default function App() {
             <ViewTab label="Dashboard" active={view === 'dashboard'} onClick={() => setView('dashboard')} />
             <ViewTab label="Plan" active={view === 'plan'} onClick={() => setView('plan')} />
             <ViewTab label="Artifacts" active={view === 'artifacts'} onClick={() => setView('artifacts')} />
+            <ViewTab label="IDE" active={view === 'ide'} onClick={() => setView('ide')} />
             <ViewTab label="Terminals" active={view === 'terminals'} onClick={() => setView('terminals')} />
           </div>
         </div>
@@ -189,6 +191,11 @@ export default function App() {
       {view === 'artifacts' && (
         <main className="flex-1 overflow-hidden">
           <ArtifactViewer initialTaskId={artifactTaskId} />
+        </main>
+      )}
+      {view === 'ide' && (
+        <main className="flex-1 overflow-hidden">
+          <IDEView />
         </main>
       )}
       {view === 'terminals' && (

@@ -237,6 +237,11 @@ declare global {
       getAutoTrigger(): Promise<{ enabled: boolean }>
       onAutoTrigger(cb: (info: { agent: string }) => void): () => void
       onAgentKilled(cb: (info: { agent: string; reason: string }) => void): () => void
+      workspaceListFiles(): Promise<any[]>
+      workspaceReadFile(relPath: string): Promise<{ ok: boolean; content: string }>
+      workspaceWriteFile(relPath: string, content: string): Promise<{ ok: boolean; error?: string }>
+      workspaceGitStatus(): Promise<{ file: string; type: string }[]>
+      workspaceGitShowHead(relPath: string): Promise<{ ok: boolean; content: string }>
     }
   }
 }

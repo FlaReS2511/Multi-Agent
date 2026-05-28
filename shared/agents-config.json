@@ -17,10 +17,11 @@
     },
     "backend-engineer": {
       "backend": {
-        "kind": "claude-cli"
+        "kind": "codex-cli",
+        "model": "gpt-5-codex"
       },
-      "provider": "anthropic",
-      "model": "claude-sonnet-4-6"
+      "provider": "openai",
+      "model": "gpt-5-codex"
     },
     "frontend-engineer": {
       "backend": {

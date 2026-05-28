@@ -1134,7 +1134,105 @@ ipcMain.handle('read-artifact-file', async (_evt, taskId: string, filename: stri
   }
 })
 
+// ── Workspace & Git IDE handlers ─────────────────────────────
+
+async function scanDir(currentDir: string): Promise<any[]> {
+  const entries = await fs.readdir(currentDir, { withFileTypes: true })
+  const list: any[] = []
+  for (const e of entries) {
+    const name = e.name
+    // Exclude noise and hidden folders (except .gitignore or similar files if needed, but skip dot-folders)
+    if ((name.startsWith('.') && e.isDirectory()) || name === 'node_modules' || name === 'dist' || name === 'dist-electron' || name === 'outbox' || name === 'logs') {
+      continue
+    }
+    const fullPath = path.join(currentDir, name)
+    const relPath = path.relative(ROOT, fullPath)
+    if (e.isDirectory()) {
+      const children = await scanDir(fullPath)
+      list.push({ name, relPath, isDir: true, children })
+    } else {
+      list.push({ name, relPath, isDir: false })
+    }
+  }
+  // Sort folders first, then files alphabetically
+  list.sort((a, b) => {
+    if (a.isDir !== b.isDir) return a.isDir ? -1 : 1
+    return a.name.localeCompare(b.name)
+  })
+  return list
+}
+
+ipcMain.handle('workspace-list-files', async () => {
+  try {
+    return await scanDir(ROOT)
+  } catch (err) {
+    console.error('Failed to scan workspace:', err)
+    return []
+  }
+})
+
+ipcMain.handle('workspace-read-file', async (_evt, relPath: string) => {
+  const absPath = path.resolve(ROOT, relPath)
+  if (!absPath.startsWith(ROOT + path.sep) && absPath !== ROOT) {
+    return { ok: false, content: 'Access denied: path is outside project root' }
+  }
+  try {
+    const content = await fs.readFile(absPath, 'utf-8')
+    return { ok: true, content }
+  } catch (err: any) {
+    return { ok: false, content: err.message }
+  }
+})
+
+ipcMain.handle('workspace-write-file', async (_evt, relPath: string, content: string) => {
+  const absPath = path.resolve(ROOT, relPath)
+  if (!absPath.startsWith(ROOT + path.sep)) {
+    return { ok: false, error: 'Access denied: path is outside project root' }
+  }
+  try {
+    await fs.mkdir(path.dirname(absPath), { recursive: true })
+    await fs.writeFile(absPath, content, 'utf-8')
+    return { ok: true }
+  } catch (err: any) {
+    return { ok: false, error: err.message }
+  }
+})
+
+ipcMain.handle('workspace-git-status', async () => {
+  return new Promise((resolve) => {
+    execFile('git', ['status', '--porcelain'], { cwd: ROOT }, (err, stdout) => {
+      if (err) {
+        resolve([])
+        return
+      }
+      const lines = stdout.trim().split('\n').filter(Boolean)
+      const changes = lines.map((line) => {
+        const type = line.slice(0, 2).trim() // e.g. 'M', 'A', '??', 'D'
+        // Git might quote filenames with special chars
+        const file = line.slice(3).trim().replace(/^"|"$/g, '')
+        return { file, type }
+      })
+      resolve(changes)
+    })
+  })
+})
+
+ipcMain.handle('workspace-git-show-head', async (_evt, relPath: string) => {
+  return new Promise((resolve) => {
+    const gitPath = relPath.replace(/\\/g, '/')
+    execFile('git', ['show', `HEAD:${gitPath}`], { cwd: ROOT }, (err, stdout) => {
+      if (err) {
+        // Return empty content if file is not in HEAD (new untracked file)
+        resolve({ ok: true, content: '' })
+      } else {
+        resolve({ ok: true, content: stdout })
+      }
+    })
+  })
+})
+
 // ── Task update ─────────────────────────────────────────────────
+
 
 ipcMain.handle('update-task', async (_evt, id: string, changes: { deps?: string[]; priority?: 'low' | 'medium' | 'high' }) => {
   const tasksPath = path.join(SHARED, 'tasks.json')
