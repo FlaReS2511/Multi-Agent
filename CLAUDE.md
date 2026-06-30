@@ -2,9 +2,15 @@
 
 > File này load vào MỌI agent. Mọi agent phải đọc và tuân thủ protocol bên dưới.
 
+> **KIẾN TRÚC HIỆN TẠI (v0.4): API-ONLY + SQLite.**
+> - State động (tasks, messages/inbox, usage, logs, secrets) sống trong **`shared/state.db`** (SQLite), KHÔNG còn ở file markdown/JSON. `shared/agents-config.json` vẫn là file (config tĩnh).
+> - Agent chạy qua **API provider** (`scripts/agent_runtime.py`), không còn CLI (Claude Code/Codex/Gemini). Provider khai động trong `agents-config.json` → `providers` (kind + base_url + models). Cắm được VietAPI và mọi OpenAI-compatible/Anthropic/OpenAI/Google.
+> - Agent giao tiếp bằng **tools** do runtime cấp: `SendMessage`, `ListTasks`, `CreateTask`/`UpdateTask` (orchestrator only) — KHÔNG đọc/ghi file inbox/tasks.json bằng tay.
+> - Phần mô tả file-based bên dưới giữ lại cho bối cảnh lịch sử; chỗ nào nói "ghi `shared/inbox/*.md`" hay "ghi `tasks.json`" nay thay bằng tool tương ứng. Xem `REDESIGN_PLAN.md`.
+
 ## Hệ thống
 
-8 agent chạy song song, giao tiếp qua filesystem. Mỗi agent có thể chạy bằng Claude Code CLI (default), Codex CLI, Gemini CLI, direct API (Anthropic/Google/OpenAI), hoặc LM Studio local. Backend được chọn per-agent qua `shared/agents-config.json`.
+8 agent chạy song song, điều phối qua **SQLite (`shared/state.db`)**. Mỗi agent chạy bằng một API provider chọn per-agent qua `shared/agents-config.json` (provider + model). UI là Electron app (`project/frontend`).
 
 Agents:
 - `planner`, `orchestrator` — coordination (pre-warmed)

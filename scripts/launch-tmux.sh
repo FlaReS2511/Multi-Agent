@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# DEPRECATED (API-only): this tmux launcher spawns CLI agents (claude/codex/
+# gemini) in panes. The system is now API-only — agents run via
+# scripts/agent_runtime.py launched by the Electron app. Kept for reference /
+# future CLI revival. See REDESIGN_PLAN.md "CLI removal — hồi sinh tương lai".
+#
 # launch-tmux.sh — open a tmux session with 9 panes:
 #   8 agents + 1 monitor dashboard, in a 3x3 grid.
 # Layout:

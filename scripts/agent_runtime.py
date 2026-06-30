@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
-"""agent_runtime.py — runs one multi-agent role using a non-CLI backend.
+"""agent_runtime.py — runs one multi-agent role using an API backend.
 
-Reads `agents/<role>/AGENT.md` as the system prompt, polls
-`shared/inbox/<role>.md` for new messages, and dispatches each message to the
-configured LLM with a Read/Write/Edit/Bash/Grep/Glob tool kit.
+Reads `agents/<role>/AGENT.md` as the system prompt, polls the SQLite messages
+table (shared/state.db) for unread messages addressed to this role, and
+dispatches each message to the configured LLM with a Read/Write/Edit/Bash/Grep/
+Glob tool kit.
 
-Backends supported (selected via shared/agents-config.json):
-  api-anthropic  — Anthropic SDK
-  api-google     — google-genai SDK
-  api-openai     — openai SDK
-  lm-studio      — openai SDK with custom base_url
+API-only: there is no CLI/markdown bridge. Providers are defined dynamically in
+shared/agents-config.json under "providers"; each provider declares a `kind`
+(anthropic | openai | google | openai-compatible) and, for OpenAI-compatible
+gateways (e.g. VietAPI), a `base_url`. Any number of custom providers can be
+added without code changes.
 
-Usage:  python3 agent_runtime.py --role <role>
+Usage:  python agent_runtime.py --role <role>
 
-API keys are read from env vars (ANTHROPIC_API_KEY, GOOGLE_API_KEY,
-OPENAI_API_KEY). scripts/keyring.sh is responsible for exporting them
-before this script starts.
+API keys are read from env vars MULTIAGENT_KEY_<PROVIDER_UPPER> (the Electron
+main process injects these from the encrypted secrets table when it spawns the
+runtime). For standalone runs, export them yourself.
 """
 
 from __future__ import annotations
@@ -35,11 +36,48 @@ ROOT = SCRIPT_DIR.parent
 SHARED = ROOT / "shared"
 AGENTS = ROOT / "agents"
 
+sys.path.insert(0, str(SCRIPT_DIR))
+from db import Db  # noqa: E402
+
 POLL_INTERVAL = 2.0
 MAX_TURNS = 25
 BASH_TIMEOUT = 120
 
-# USD per million tokens, (input_rate, output_rate). As of 2026-05; update when prices change.
+# Appended to every agent's AGENT.md system prompt. API-only mode stores all
+# coordination state in shared/state.db, so the old file-based protocol (editing
+# shared/inbox/*.md, shared/outbox/*.md, shared/tasks.json, shared/logs/*.log by
+# hand) NO LONGER APPLIES. Use the DB-aware tools instead. This appendix
+# overrides any conflicting file-based instructions above.
+PROTOCOL_APPENDIX = """
+
+---
+
+# RUNTIME PROTOCOL (API mode) — overrides any file-based instructions above
+
+You run via a direct API backend. All coordination state lives in a SQLite
+database, not in markdown/JSON files. IGNORE older instructions that tell you to
+read/write `shared/inbox/*.md`, `shared/outbox/*.md`, `shared/tasks.json`, or
+`shared/logs/*.log` by hand. Use these tools instead:
+
+- **SendMessage(to, body, task_id?, subject?, priority?)** — message another
+  agent. This is the ONLY way to communicate. Workers report to `orchestrator`;
+  the orchestrator routes to workers. Do not edit inbox files.
+- **ListTasks(status?)** — read the task board.
+- **CreateTask(title, owner, priority?, deps?, parent_id?)** — orchestrator only.
+- **UpdateTask(task_id, status, artifact?)** — orchestrator only. Status is one
+  of todo|in_progress|review|done|blocked|waiting_children.
+
+The message you are processing was delivered from the DB inbox; it is marked
+processed automatically when you finish this turn. Your activity is logged
+automatically — you do not need to append to any log file.
+
+Code lives under `project/`. Use Read/Write/Edit/Bash/Grep/Glob for code as
+usual. Your role here is: {role}.
+"""
+
+# USD per million tokens, (input_rate, output_rate). Used only as a fallback for
+# known model ids. Custom/gateway models default to 0 unless the provider config
+# declares price_in / price_out. As of 2026-05; update when prices change.
 PRICING_USD_PER_MTOK: dict[str, tuple[float, float]] = {
     "claude-opus-4-7":    (15.00, 75.00),
     "claude-sonnet-4-6":  ( 3.00, 15.00),
@@ -53,8 +91,9 @@ PRICING_USD_PER_MTOK: dict[str, tuple[float, float]] = {
 }
 
 
-def estimate_cost_usd(model: str, tokens_in: int, tokens_out: int) -> float:
-    in_rate, out_rate = PRICING_USD_PER_MTOK.get(model, (0.0, 0.0))
+def estimate_cost_usd(model: str, tokens_in: int, tokens_out: int,
+                      rates: tuple[float, float] | None = None) -> float:
+    in_rate, out_rate = rates if rates else PRICING_USD_PER_MTOK.get(model, (0.0, 0.0))
     return (tokens_in * in_rate + tokens_out * out_rate) / 1_000_000
 
 
@@ -139,9 +178,72 @@ def tool_glob(pattern: str, **_) -> str:
     return "\n".join(matches[:200]) or "no matches"
 
 
+# DB-aware tools. These operate on shared/state.db (the source of truth) instead
+# of markdown files. _CTX is populated in main() with the live Db handle + role.
+_CTX: dict = {"db": None, "role": None}
+
+
+def tool_send_message(to: str, body: str, task_id: str = "", subject: str = "",
+                      priority: str = "", **_) -> str:
+    """Send a message to another agent's inbox (DB messages table)."""
+    db: Db = _CTX["db"]
+    role: str = _CTX["role"]
+    mid = db.add_message(
+        from_role=role, to_role=to, body=body,
+        task_id=task_id or None, subject=subject or None,
+        priority=priority or None, status="unread",
+    )
+    return f"sent message id={mid} to {to}" + (f" (task {task_id})" if task_id else "")
+
+
+def tool_list_tasks(status: str = "", **_) -> str:
+    """List tasks from the board, optionally filtered by status."""
+    db: Db = _CTX["db"]
+    tasks = db.list_tasks()
+    if status:
+        tasks = [t for t in tasks if t["status"] == status]
+    if not tasks:
+        return "no tasks"
+    lines = [
+        f"{t['id']} [{t['status']}] owner={t['owner']} "
+        f"deps={t['deps']} parent={t.get('parent_id') or '-'} :: {t['title']}"
+        for t in tasks
+    ]
+    return "\n".join(lines)
+
+
+def tool_create_task(title: str, owner: str, priority: str = "medium",
+                     deps: list | None = None, parent_id: str = "", **_) -> str:
+    """Create a task on the board (orchestrator only). Returns the new id."""
+    db: Db = _CTX["db"]
+    role: str = _CTX["role"]
+    if role != "orchestrator":
+        return "error: only the orchestrator may create tasks"
+    try:
+        tid = db.create_task(
+            title=title, owner=owner, priority=priority,
+            deps=deps or [], parent_id=parent_id or None,
+        )
+    except ValueError as e:
+        return f"error: {e}"
+    return f"created {tid} owner={owner}"
+
+
+def tool_update_task(task_id: str, status: str, artifact: str = "", **_) -> str:
+    """Update a task's status (orchestrator only)."""
+    db: Db = _CTX["db"]
+    role: str = _CTX["role"]
+    if role != "orchestrator":
+        return "error: only the orchestrator may update tasks"
+    ok = db.update_task_status(task_id, status, artifact or None)
+    return f"updated {task_id} -> {status}" if ok else f"error: task {task_id} not found"
+
+
 TOOLS = {
     "Read": tool_read, "Write": tool_write, "Edit": tool_edit,
     "Bash": tool_bash, "Grep": tool_grep, "Glob": tool_glob,
+    "SendMessage": tool_send_message, "ListTasks": tool_list_tasks,
+    "CreateTask": tool_create_task, "UpdateTask": tool_update_task,
 }
 
 TOOL_SPECS = [
@@ -212,6 +314,62 @@ TOOL_SPECS = [
             "required": ["pattern"],
         },
     },
+    {
+        "name": "SendMessage",
+        "description": "Send a message to another agent's inbox. Use this to report progress, "
+                       "hand off work, or reply to the orchestrator. Workers talk only via the orchestrator.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "to": {"type": "string", "description": "recipient role, e.g. orchestrator, backend-engineer"},
+                "body": {"type": "string"},
+                "task_id": {"type": "string", "description": "T-XXX this message relates to (optional)"},
+                "subject": {"type": "string"},
+                "priority": {"type": "string", "enum": ["low", "medium", "high"]},
+            },
+            "required": ["to", "body"],
+        },
+    },
+    {
+        "name": "ListTasks",
+        "description": "List tasks on the board, optionally filtered by status "
+                       "(todo|in_progress|review|done|blocked|waiting_children).",
+        "input_schema": {
+            "type": "object",
+            "properties": {"status": {"type": "string"}},
+            "required": [],
+        },
+    },
+    {
+        "name": "CreateTask",
+        "description": "Create a task on the board. Orchestrator only. Pass parent_id to make it a "
+                       "child (HTN depth cap = 2). Returns the new T-XXX id.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "owner": {"type": "string"},
+                "priority": {"type": "string", "enum": ["low", "medium", "high"]},
+                "deps": {"type": "array", "items": {"type": "string"}},
+                "parent_id": {"type": "string"},
+            },
+            "required": ["title", "owner"],
+        },
+    },
+    {
+        "name": "UpdateTask",
+        "description": "Update a task's status. Orchestrator only. status one of "
+                       "todo|in_progress|review|done|blocked|waiting_children. artifact optional path.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string"},
+                "status": {"type": "string"},
+                "artifact": {"type": "string"},
+            },
+            "required": ["task_id", "status"],
+        },
+    },
 ]
 
 
@@ -221,9 +379,9 @@ TOOL_SPECS = [
 
 
 class AnthropicAdapter:
-    def __init__(self, model: str):
+    def __init__(self, model: str, api_key: str | None = None):
         from anthropic import Anthropic
-        self.client = Anthropic()
+        self.client = Anthropic(api_key=api_key) if api_key else Anthropic()
         self.model = model
         self.tools = [
             {"name": s["name"], "description": s["description"], "input_schema": s["input_schema"]}
@@ -260,11 +418,11 @@ class AnthropicAdapter:
 
 
 class GoogleAdapter:
-    def __init__(self, model: str):
+    def __init__(self, model: str, api_key: str | None = None):
         from google import genai
         from google.genai import types
         self._types = types
-        self.client = genai.Client()
+        self.client = genai.Client(api_key=api_key) if api_key else genai.Client()
         self.model = model
         decls = [types.FunctionDeclaration(
             name=s["name"], description=s["description"], parameters=s["input_schema"],
@@ -329,14 +487,18 @@ class GoogleAdapter:
 
 
 class OpenAIAdapter:
-    """Used by api-openai (real OpenAI) and lm-studio (custom base_url)."""
+    """Used by openai (real OpenAI) and openai-compatible gateways (VietAPI,
+    LM Studio, OpenRouter, ...) — anything that speaks the Chat Completions API.
+    """
 
-    def __init__(self, model: str, base_url: str | None = None):
+    def __init__(self, model: str, base_url: str | None = None, api_key: str | None = None):
         from openai import OpenAI
         kwargs: dict = {}
         if base_url:
             kwargs["base_url"] = base_url
-            kwargs["api_key"] = os.environ.get("OPENAI_API_KEY") or "lm-studio"
+        # OpenAI SDK requires a non-empty key. Local servers (LM Studio) don't
+        # validate it, so fall back to a placeholder when none is configured.
+        kwargs["api_key"] = api_key or os.environ.get("OPENAI_API_KEY") or "no-key"
         self.client = OpenAI(**kwargs)
         self.model = model
         self.tools = [
@@ -386,7 +548,7 @@ class OpenAIAdapter:
 
 
 # ---------------------------------------------------------------------------
-# Inbox / outbox / log
+# DB-backed messaging / logging
 # ---------------------------------------------------------------------------
 
 
@@ -394,68 +556,74 @@ def now() -> str:
     return dt.datetime.now().strftime("%Y-%m-%d %H:%M")
 
 
-def append_log(role: str, message: str) -> None:
-    log = SHARED / "logs" / f"{role}.log"
-    log.parent.mkdir(parents=True, exist_ok=True)
-    with log.open("a", encoding="utf-8") as f:
-        f.write(f"[{now()}] {role} {message}\n")
-
-
-def archive_to_outbox(role: str, content: str) -> None:
-    today = dt.datetime.now().strftime("%Y-%m-%d")
-    outbox = SHARED / "outbox" / f"{role}-{today}.md"
-    outbox.parent.mkdir(parents=True, exist_ok=True)
-    with outbox.open("a", encoding="utf-8") as f:
-        f.write(content.rstrip() + "\n\n")
-
-
-def read_new_inbox(role: str, last_offset: int) -> tuple[str, int]:
-    inbox = SHARED / "inbox" / f"{role}.md"
-    if not inbox.exists():
-        return "", 0
-    size = inbox.stat().st_size
-    if size < last_offset:
-        last_offset = 0  # truncated/reset
-    if size == last_offset:
-        return "", last_offset
-    with inbox.open("rb") as f:
-        f.seek(last_offset)
-        new_bytes = f.read()
-    return new_bytes.decode("utf-8", errors="replace"), size
-
-
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
 
 
-def build_adapter(backend: dict):
-    kind = backend.get("kind")
-    model = backend.get("model") or ""
-    if kind == "api-anthropic":
-        return AnthropicAdapter(model or "claude-sonnet-4-6")
-    if kind == "api-google":
-        return GoogleAdapter(model or "gemini-2.5-pro")
-    if kind == "api-openai":
-        return OpenAIAdapter(model or "gpt-5")
-    if kind == "lm-studio":
-        return OpenAIAdapter(model or "lm-studio-local",
-                             base_url=backend.get("base_url", "http://localhost:1234/v1"))
-    raise ValueError(f"agent_runtime.py does not handle backend kind: {kind!r}")
+def resolve_provider(cfg: dict, agent_cfg: dict) -> tuple[dict, str, str]:
+    """Return (provider_cfg, provider_id, model) for an agent.
+
+    provider_cfg comes from cfg['providers'][provider_id]. Supports the dynamic
+    provider model (kind + optional base_url + models). Falls back gracefully.
+    """
+    providers = cfg.get("providers", {})
+    provider_id = agent_cfg.get("provider") or ""
+    model = agent_cfg.get("model") or ""
+    provider_cfg = dict(providers.get(provider_id, {}))
+    if not provider_cfg:
+        # Unknown provider — assume openai-compatible with no base_url.
+        provider_cfg = {"kind": "openai-compatible"}
+    return provider_cfg, provider_id, model
 
 
-def handle_message(role: str, adapter, system_prompt: str, message: str) -> None:
-    messages: list[dict] = [{"role": "user", "content": message}]
+def api_key_for(provider_id: str) -> str | None:
+    """Key injected by the Electron main process as MULTIAGENT_KEY_<PROVIDER>.
+
+    Provider id is uppercased and non-alphanumerics become underscores, e.g.
+    'vietapi' -> MULTIAGENT_KEY_VIETAPI, 'lm-studio' -> MULTIAGENT_KEY_LM_STUDIO.
+    """
+    env_name = "MULTIAGENT_KEY_" + re.sub(r"[^A-Za-z0-9]", "_", provider_id).upper()
+    return os.environ.get(env_name)
+
+
+def build_adapter(provider_cfg: dict, provider_id: str, model: str):
+    kind = provider_cfg.get("kind", "openai-compatible")
+    key = api_key_for(provider_id)
+    if kind == "anthropic":
+        return AnthropicAdapter(model or "claude-sonnet-4-6", api_key=key)
+    if kind == "google":
+        return GoogleAdapter(model or "gemini-2.5-pro", api_key=key)
+    if kind in ("openai", "openai-compatible"):
+        return OpenAIAdapter(
+            model or "gpt-5",
+            base_url=provider_cfg.get("base_url"),
+            api_key=key,
+        )
+    raise ValueError(f"agent_runtime.py does not handle provider kind: {kind!r}")
+
+
+def price_rates(provider_cfg: dict) -> tuple[float, float] | None:
+    """Optional per-provider pricing override (USD per Mtok)."""
+    if "price_in" in provider_cfg or "price_out" in provider_cfg:
+        return (float(provider_cfg.get("price_in", 0.0)),
+                float(provider_cfg.get("price_out", 0.0)))
+    return None
+
+
+def handle_message(db: Db, role: str, adapter, system_prompt: str,
+                   msg_row, rates: tuple[float, float] | None) -> None:
+    body = msg_row["body"]
+    task_id = msg_row["task_id"] or ""
+    # Reconstruct a readable prompt with header context for the model.
+    header = (f"FROM: {msg_row['from_role']} | TASK: {task_id or 'none'}\n"
+              f"Subject: {msg_row['subject'] or ''}\n\n")
+    messages: list[dict] = [{"role": "user", "content": header + body}]
     final_text = ""
     model = getattr(adapter, "model", "unknown")
     total_in = 0
     total_out = 0
     turns = 0
-    # Extract task ID from the inbox message header so cost logs are attributable
-    # per task. Empty string if message has no TASK: header.
-    task_match = re.search(r"TASK:\s*(T-\d+)", message)
-    task_id = task_match.group(1) if task_match else ""
-    task_field = f" task={task_id}" if task_id else ""
     for _ in range(MAX_TURNS):
         text, tool_calls, assistant_msg, usage = adapter.chat(messages, system_prompt)
         turns += 1
@@ -463,8 +631,9 @@ def handle_message(role: str, adapter, system_prompt: str, message: str) -> None
         out_t = int(usage.get("output", 0) or 0)
         total_in += in_t
         total_out += out_t
-        cost = estimate_cost_usd(model, in_t, out_t)
-        append_log(role, f"usage model={model} in={in_t} out={out_t} cost=${cost:.4f}{task_field}")
+        cost = estimate_cost_usd(model, in_t, out_t, rates)
+        db.add_usage(role=role, model=model, tokens_in=in_t, tokens_out=out_t,
+                     cost_usd=cost, task_id=task_id or None)
         if text:
             final_text = text
         if not tool_calls:
@@ -479,16 +648,19 @@ def handle_message(role: str, adapter, system_prompt: str, message: str) -> None
                 results.append(fn(**call["args"]))
             except Exception as e:
                 results.append(f"error: {type(e).__name__}: {e}")
-            append_log(role, f"tool_call {call['name']}")
+            db.add_log(role, f"tool_call {call['name']}")
         messages.append(assistant_msg)
         result_msg = adapter.tool_results_message(tool_calls, results)
         if isinstance(result_msg, list):
             messages.extend(result_msg)
         else:
             messages.append(result_msg)
-    archive_to_outbox(role, message)
-    total_cost = estimate_cost_usd(model, total_in, total_out)
-    append_log(role, f"message_done turns={turns} total_in={total_in} total_out={total_out} total_cost=${total_cost:.4f}{task_field}")
+
+    db.mark_processed(msg_row["id"])
+    total_cost = estimate_cost_usd(model, total_in, total_out, rates)
+    db.add_log(role, f"message_done turns={turns} total_in={total_in} "
+                     f"total_out={total_out} total_cost=${total_cost:.4f}"
+                     + (f" task={task_id}" if task_id else ""))
     if final_text:
         print(f"[{role}] response: {final_text[:240]}")
 
@@ -505,42 +677,47 @@ def main() -> None:
     os.chdir(agent_dir)
 
     cfg = json.loads((SHARED / "agents-config.json").read_text(encoding="utf-8"))
-    agent_cfg = cfg["agents"].get(role)
+    agent_cfg = cfg.get("agents", {}).get(role)
     if not agent_cfg:
         sys.exit(f"no config for role {role}")
-    backend = dict(agent_cfg.get("backend", {}))
-    if "model" not in backend and agent_cfg.get("model"):
-        backend["model"] = agent_cfg["model"]
 
-    adapter = build_adapter(backend)
+    provider_cfg, provider_id, model = resolve_provider(cfg, agent_cfg)
+    adapter = build_adapter(provider_cfg, provider_id, model)
+    rates = price_rates(provider_cfg)
 
     agent_md = agent_dir / "AGENT.md"
     if not agent_md.exists():
         sys.exit(f"AGENT.md missing in {agent_dir}")
-    system_prompt = agent_md.read_text(encoding="utf-8")
+    system_prompt = agent_md.read_text(encoding="utf-8") + PROTOCOL_APPENDIX.format(role=role)
 
-    print(f"[{role}] runtime started: backend={backend.get('kind')} model={backend.get('model')}")
-    append_log(role, f"runtime_start backend={backend.get('kind')} model={backend.get('model')}")
+    db = Db(SHARED)
+    _CTX["db"] = db
+    _CTX["role"] = role
 
-    inbox = SHARED / "inbox" / f"{role}.md"
-    last_offset = inbox.stat().st_size if inbox.exists() else 0
+    print(f"[{role}] runtime started: provider={provider_id} kind={provider_cfg.get('kind')} model={model}")
+    db.add_log(role, f"runtime_start provider={provider_id} model={model}")
 
     try:
         while True:
-            new_text, last_offset = read_new_inbox(role, last_offset)
-            if not new_text.strip():
+            unread = db.unread_messages(role)
+            if not unread:
                 time.sleep(POLL_INTERVAL)
                 continue
-            print(f"[{role}] new inbox content ({len(new_text)} chars)")
-            append_log(role, f"inbox_received {len(new_text)} chars")
-            try:
-                handle_message(role, adapter, system_prompt, new_text)
-            except Exception as e:
-                print(f"[{role}] error handling message: {e}", file=sys.stderr)
-                append_log(role, f"error {type(e).__name__}: {e}")
+            for msg_row in unread:
+                print(f"[{role}] processing message id={msg_row['id']}")
+                db.add_log(role, f"message_received id={msg_row['id']}")
+                try:
+                    handle_message(db, role, adapter, system_prompt, msg_row, rates)
+                except Exception as e:
+                    print(f"[{role}] error handling message: {e}", file=sys.stderr)
+                    db.add_log(role, f"error {type(e).__name__}: {e}")
+                    # Mark processed to avoid an infinite retry loop on a bad message.
+                    db.mark_processed(msg_row["id"])
     except KeyboardInterrupt:
         print(f"\n[{role}] runtime stopped")
-        append_log(role, "runtime_stop")
+        db.add_log(role, "runtime_stop")
+    finally:
+        db.close()
 
 
 if __name__ == "__main__":

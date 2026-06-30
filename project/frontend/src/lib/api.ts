@@ -68,46 +68,54 @@ export interface ModelOption {
   tier: string
 }
 
-export type BackendKind =
-  | 'claude-cli'
-  | 'codex-cli'
-  | 'gemini-cli'
-  | 'api-anthropic'
-  | 'api-google'
-  | 'api-openai'
-  | 'lm-studio'
+// API-only: providers are dynamic. A provider declares a `kind` and, for
+// OpenAI-compatible gateways (VietAPI, LM Studio, OpenRouter, ...), a base_url.
+export type ProviderKind = 'anthropic' | 'openai' | 'google' | 'openai-compatible'
 
-export type SecretProvider = 'anthropic' | 'google' | 'openai'
-
-export interface BackendBlock {
-  kind: BackendKind
+export interface ProviderBlock {
+  kind: ProviderKind
+  name?: string
   base_url?: string
-  model?: string
+  models?: string[]
+  price_in?: number
+  price_out?: number
 }
 
+// Secrets are keyed by provider id (any string).
+export type SecretProvider = string
+
 export interface AgentEntry {
-  backend?: BackendBlock
+  backend?: { mode?: string }
   provider?: string
   model?: string
 }
 
 export interface AgentsConfig {
+  providers?: Record<string, ProviderBlock>
   agents: Record<string, AgentEntry>
   available_models: ModelOption[]
 }
 
 export interface BackendSettings {
   agents: Record<string, AgentEntry>
+  providers: Record<string, ProviderBlock>
   available_models: ModelOption[]
-  keys: Record<SecretProvider, boolean>
+  keys: Record<string, boolean>
   safeStorageAvailable: boolean
 }
 
 export interface SetAgentBackendInput {
   agent: string
-  kind: BackendKind
+  provider: string
   model?: string
+}
+
+export interface SetProviderInput {
+  id: string
+  kind: ProviderKind
+  name?: string
   base_url?: string
+  models?: string[]
 }
 
 export interface SetProviderKeyInput {
@@ -115,30 +123,18 @@ export interface SetProviderKeyInput {
   apiKey: string
 }
 
-export const BACKEND_KIND_LABELS: Record<BackendKind, string> = {
-  'claude-cli':    'Claude Code (CLI)',
-  'codex-cli':     'Codex (CLI)',
-  'gemini-cli':    'Gemini (CLI)',
-  'api-anthropic': 'Anthropic API',
-  'api-google':    'Google API',
-  'api-openai':    'OpenAI API',
-  'lm-studio':     'LM Studio (local)',
+export const PROVIDER_KIND_LABELS: Record<ProviderKind, string> = {
+  'anthropic':         'Anthropic API',
+  'openai':            'OpenAI API',
+  'google':            'Google API',
+  'openai-compatible': 'OpenAI-compatible (custom)',
 }
 
-export function backendKindToProvider(kind: BackendKind): string {
-  switch (kind) {
-    case 'claude-cli':
-    case 'api-anthropic': return 'anthropic'
-    case 'codex-cli':
-    case 'api-openai':    return 'openai'
-    case 'gemini-cli':
-    case 'api-google':    return 'google'
-    case 'lm-studio':     return 'local'
-  }
-}
-
-export function backendNeedsKey(kind: BackendKind): boolean {
-  return kind === 'api-anthropic' || kind === 'api-google' || kind === 'api-openai'
+// Whether a provider kind requires an API key. Only local OpenAI-compatible
+// servers (LM Studio etc.) can run keyless.
+export function providerNeedsKey(kind: ProviderKind, baseUrl?: string): boolean {
+  if (kind === 'openai-compatible' && baseUrl && baseUrl.includes('localhost')) return false
+  return true
 }
 
 export interface ArtifactNode {
@@ -212,6 +208,8 @@ declare global {
       updateAgentModel(agent: string, provider: string, model: string): Promise<{ ok: boolean }>
       getBackendSettings(): Promise<BackendSettings>
       setAgentBackend(input: SetAgentBackendInput): Promise<{ ok: boolean }>
+      setProvider(input: SetProviderInput): Promise<{ ok: boolean; error?: string }>
+      deleteProvider(id: string): Promise<{ ok: boolean }>
       setProviderKey(input: SetProviderKeyInput): Promise<{ ok: boolean; error?: string }>
       clearProviderKey(provider: SecretProvider): Promise<{ ok: boolean }>
       updateTask(id: string, changes: UpdateTaskInput): Promise<{ ok: boolean }>
@@ -242,6 +240,13 @@ declare global {
       workspaceWriteFile(relPath: string, content: string): Promise<{ ok: boolean; error?: string }>
       workspaceGitStatus(): Promise<{ file: string; type: string }[]>
       workspaceGitShowHead(relPath: string): Promise<{ ok: boolean; content: string }>
+      aiInlineEdit(requestId: string, params: {
+        provider: string; model?: string; instruction: string; selection: string
+        language?: string; prefix?: string; suffix?: string
+      }): Promise<{ ok: boolean; error?: string }>
+      aiInlineCancel(requestId: string): Promise<{ ok: boolean }>
+      onAiInlineChunk(requestId: string, cb: (delta: string) => void): () => void
+      onAiInlineDone(requestId: string, cb: (info: { ok: boolean; text?: string; error?: string }) => void): () => void
     }
   }
 }

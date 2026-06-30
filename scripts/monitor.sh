@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# DEPRECATED (API-only): this terminal dashboard reads shared/inbox/*.md,
+# shared/logs/*.log and tasks.json, which no longer exist — state is in
+# shared/state.db and surfaced by the Electron UI. Kept for reference.
+#
 # monitor.sh — live dashboard hiển thị hoạt động của tất cả agent
 # Usage:
 #   ./scripts/monitor.sh           # Live mode (refresh 2s, dùng watch nếu có)

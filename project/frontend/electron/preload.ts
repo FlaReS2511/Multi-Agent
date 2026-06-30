@@ -34,11 +34,14 @@ const api = {
   updateAgentModel: (agent: string, provider: string, model: string) =>
     ipcRenderer.invoke('update-agent-model', agent, provider, model),
   getBackendSettings: () => ipcRenderer.invoke('get-backend-settings'),
-  setAgentBackend: (input: { agent: string; kind: string; model?: string; base_url?: string }) =>
+  setAgentBackend: (input: { agent: string; provider: string; model?: string }) =>
     ipcRenderer.invoke('set-agent-backend', input),
-  setProviderKey: (input: { provider: 'anthropic' | 'google' | 'openai'; apiKey: string }) =>
+  setProvider: (input: { id: string; kind: string; name?: string; base_url?: string; models?: string[] }) =>
+    ipcRenderer.invoke('set-provider', input),
+  deleteProvider: (id: string) => ipcRenderer.invoke('delete-provider', id),
+  setProviderKey: (input: { provider: string; apiKey: string }) =>
     ipcRenderer.invoke('set-provider-key', input),
-  clearProviderKey: (provider: 'anthropic' | 'google' | 'openai') =>
+  clearProviderKey: (provider: string) =>
     ipcRenderer.invoke('clear-provider-key', provider),
   getAllLogs: () => ipcRenderer.invoke('get-all-logs'),
   updateTask: (id: string, changes: { deps?: string[]; priority?: 'low' | 'medium' | 'high' }) =>
@@ -88,6 +91,25 @@ const api = {
   workspaceWriteFile: (relPath: string, content: string) => ipcRenderer.invoke('workspace-write-file', relPath, content),
   workspaceGitStatus: () => ipcRenderer.invoke('workspace-git-status'),
   workspaceGitShowHead: (relPath: string) => ipcRenderer.invoke('workspace-git-show-head', relPath),
+
+  // Inline AI edit (streaming)
+  aiInlineEdit: (requestId: string, params: {
+    provider: string; model?: string; instruction: string; selection: string
+    language?: string; prefix?: string; suffix?: string
+  }) => ipcRenderer.invoke('ai-inline-edit', requestId, params),
+  aiInlineCancel: (requestId: string) => ipcRenderer.invoke('ai-inline-cancel', requestId),
+  onAiInlineChunk: (requestId: string, cb: (delta: string) => void) => {
+    const channel = `ai-inline-chunk:${requestId}`
+    const listener = (_e: unknown, delta: string) => cb(delta)
+    ipcRenderer.on(channel, listener)
+    return () => ipcRenderer.removeListener(channel, listener)
+  },
+  onAiInlineDone: (requestId: string, cb: (info: { ok: boolean; text?: string; error?: string }) => void) => {
+    const channel = `ai-inline-done:${requestId}`
+    const listener = (_e: unknown, info: { ok: boolean; text?: string; error?: string }) => cb(info)
+    ipcRenderer.on(channel, listener)
+    return () => ipcRenderer.removeListener(channel, listener)
+  },
   setAutoTrigger: (enabled: boolean) => ipcRenderer.invoke('set-auto-trigger', enabled),
   getAutoTrigger: () => ipcRenderer.invoke('get-auto-trigger'),
   onAutoTrigger: (cb: (info: { agent: string }) => void) => {

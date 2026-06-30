@@ -43,8 +43,8 @@ export function TerminalsView({ config, onConfigChange }: Props) {
 
   const entry = config?.agents[active]
   const activeConfig = {
-    provider: entry?.provider ?? entry?.backend?.kind ?? 'anthropic',
-    model: entry?.model ?? entry?.backend?.model ?? 'unknown',
+    provider: entry?.provider ?? 'anthropic',
+    model: entry?.model ?? 'unknown',
   }
 
   const onModelChange = async (provider: string, model: string) => {

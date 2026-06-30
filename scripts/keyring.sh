@@ -1,4 +1,10 @@
 #!/usr/bin/env bash
+# DEPRECATED (API-only): keys are injected by the Electron app as
+# MULTIAGENT_KEY_<PROVIDER> env vars when it spawns agent_runtime.py, read from
+# the encrypted `secrets` table in shared/state.db. This tmux-oriented exporter
+# (and the missing keyring-decrypt.js it referenced) is no longer used. Kept for
+# CLI/tmux revival. See REDESIGN_PLAN.md "CLI removal — hồi sinh tương lai".
+#
 # keyring.sh — export API keys as env vars before launching agent runtimes.
 #
 # This is sourced by launch-tmux.sh before the agent panes are spawned, so that

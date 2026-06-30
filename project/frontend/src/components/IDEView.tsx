@@ -1,4 +1,5 @@
 import React, { useEffect, useState, useCallback, useRef } from 'react'
+import { AnimatePresence } from 'framer-motion'
 import Editor, { DiffEditor } from '@monaco-editor/react'
 import {
   FolderTree,
@@ -18,7 +19,10 @@ import {
 } from 'lucide-react'
 import { IDEFileTree } from './IDEFileTree'
 import { AgentTerminal } from './AgentTerminal'
-import { activeAgents, AgentsConfig, colorFor } from '../lib/api'
+import { InlineAIPrompt } from './InlineAIPrompt'
+import { InlineAICard } from './InlineAICard'
+import { useInlineAIEdit } from './useInlineAIEdit'
+import { activeAgents, AgentsConfig, colorFor, ModelOption } from '../lib/api'
 
 interface FileNode {
   name: string
@@ -92,6 +96,11 @@ export function IDEView() {
   const [agentLogs, setAgentLogs] = useState<Record<string, string[]>>({})
 
   const editorRef = useRef<any>(null)
+  const monacoRef = useRef<any>(null)
+  const [availableModels, setAvailableModels] = useState<ModelOption[]>([])
+
+  // Inline "Ask AI" edit controller, bound to the active file's language.
+  const inlineAI = useInlineAIEdit(editorRef, monacoRef, detectLanguage(activeTab || ''))
 
   // Scan workspace files
   const refreshWorkspace = useCallback(async () => {
@@ -114,7 +123,10 @@ export function IDEView() {
 
   // Load agents config to get the list of active agents
   useEffect(() => {
-    window.api.getAgentsConfig().then(setAgentsConfig)
+    window.api.getAgentsConfig().then((cfg) => {
+      setAgentsConfig(cfg)
+      setAvailableModels(cfg.available_models ?? [])
+    })
     refreshWorkspace()
   }, [refreshWorkspace])
 
@@ -260,6 +272,7 @@ export function IDEView() {
   // Custom theme initialization for Monaco
   const handleEditorDidMount = (editor: any, monaco: any) => {
     editorRef.current = editor
+    monacoRef.current = monaco
     // Set custom HSL dark theme values
     monaco.editor.defineTheme('vscode-dark-harmony', {
       base: 'vs-dark',
@@ -593,6 +606,24 @@ export function IDEView() {
                       insertSpaces: true,
                     }}
                   />
+                  <AnimatePresence>
+                    {inlineAI.state.open && (
+                      <InlineAIPrompt
+                        state={inlineAI.state}
+                        models={availableModels}
+                        onGenerate={inlineAI.generate}
+                        onReject={inlineAI.reject}
+                      />
+                    )}
+                    {(inlineAI.state.streaming || inlineAI.state.hasResult) && (
+                      <InlineAICard
+                        state={inlineAI.state}
+                        onAccept={inlineAI.accept}
+                        onArrived={inlineAI.finishMerge}
+                        onReject={inlineAI.reject}
+                      />
+                    )}
+                  </AnimatePresence>
                 </div>
               )}
             </div>
