@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import {
   Task, Priority, PRIORITY_STYLES, STATUS_STYLES, AGENT_COLORS,
+  isResidentRole,
 } from '../lib/api'
 
 interface Props {
@@ -19,11 +20,24 @@ export function TaskDetailPanel({
   const [depsText, setDepsText] = useState<string>(task.deps.join(', '))
   const [saving, setSaving] = useState(false)
   const [costForTask, setCostForTask] = useState<{ usd: number; tokens_in: number; tokens_out: number } | null>(null)
+  const [orchEnabled, setOrchEnabled] = useState<boolean | null>(null)
+  const [running, setRunning] = useState(false)
+  const [runMsg, setRunMsg] = useState<string>('')
 
   useEffect(() => {
     setPriority(task.priority ?? 'medium')
     setDepsText(task.deps.join(', '))
+    setRunMsg('')
   }, [task.id, task.priority, task.deps])
+
+  // Is the v2 group coordinator enabled? Gate the "Run with group" button on it.
+  useEffect(() => {
+    let cancelled = false
+    window.api.orchestrationGet().then((o) => {
+      if (!cancelled) setOrchEnabled(o.enabled)
+    })
+    return () => { cancelled = true }
+  }, [task.id])
 
   // Poll cost-per-task while panel open. The full message thread lives in the
   // middle Inbox column (TaskInboxPanel), so we no longer fetch it here.
@@ -60,6 +74,34 @@ export function TaskDetailPanel({
       onChanged()
     } finally {
       setSaving(false)
+    }
+  }
+
+  // The task owner must be a worker role (not a resident brain) to run as a
+  // group — the coordinator wires a reviewer to the worker's domain.
+  const ownerIsWorker = !isResidentRole(task.owner)
+  const runnable = task.status !== 'done' && task.status !== 'waiting_children' && ownerIsWorker
+
+  const runWithGroup = async () => {
+    if (running || !runnable) return
+    setRunning(true)
+    setRunMsg('')
+    try {
+      const res = await window.api.groupCreate({ task_id: task.id, worker_role: task.owner })
+      if (res.ok) {
+        setRunMsg(
+          orchEnabled
+            ? `Group ${res.group} created — watch it in the Agent Groups tab.`
+            : `Group ${res.group} queued. Enable orchestration in Settings to start it.`,
+        )
+        onChanged()
+      } else {
+        setRunMsg(`Failed: ${res.error ?? 'unknown error'}`)
+      }
+    } catch (e) {
+      setRunMsg(`Failed: ${(e as Error).message}`)
+    } finally {
+      setRunning(false)
     }
   }
 
@@ -223,6 +265,29 @@ export function TaskDetailPanel({
             <div className="uppercase tracking-wider text-zinc-500 mb-1">Updated</div>
             <div className="font-mono text-zinc-400">{task.updated_at}</div>
           </div>
+        </div>
+
+        <div className="space-y-1.5">
+          <button
+            onClick={runWithGroup}
+            disabled={!runnable || running}
+            title={
+              !ownerIsWorker
+                ? 'Only worker-owned tasks (engineers/reviewers) can run as a group'
+                : 'Spawn a worker + reviewer group for this task'
+            }
+            className="w-full px-3 py-1.5 text-xs font-semibold rounded transition-colors disabled:bg-zinc-900 disabled:text-zinc-600 disabled:border-zinc-800 border border-emerald-600/50 bg-emerald-600/15 hover:bg-emerald-600/25 text-emerald-300"
+          >
+            {running ? 'Creating group…' : '▶ Run with group'}
+          </button>
+          {orchEnabled === false && runnable && (
+            <div className="text-[10px] text-amber-400/80 px-0.5">
+              Orchestration is off — the group will queue until you enable it in Settings.
+            </div>
+          )}
+          {runMsg && (
+            <div className="text-[10px] text-zinc-400 px-0.5">{runMsg}</div>
+          )}
         </div>
 
         <button

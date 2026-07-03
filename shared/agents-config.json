@@ -1,4 +1,21 @@
 {
+  "orchestration": {
+    "enabled": true,
+    "max_concurrent_groups": 3,
+    "max_groups_per_task": 20,
+    "max_recursion_depth": 3,
+    "budget_per_task_usd": 5,
+    "budget_per_group_usd": 1,
+    "max_retries_per_group": 3,
+    "reviewer_level_offset": 1,
+    "review_policy": "on-demand",
+    "reviewer_for": {
+      "backend-engineer": "be-reviewer",
+      "frontend-engineer": "fe-reviewer",
+      "ai-engineer": "ai-reviewer"
+    },
+    "heartbeat_timeout_sec": 300
+  },
   "providers": {
     "vietapi": {
       "kind": "openai-compatible",
@@ -51,44 +68,60 @@
   },
   "agents": {
     "planner": {
-      "backend": { "mode": "api" },
+      "backend": {
+        "mode": "api"
+      },
       "provider": "vietapi",
       "model": "claude-opus-4.8"
     },
     "orchestrator": {
-      "backend": { "mode": "api" },
+      "backend": {
+        "mode": "api"
+      },
       "provider": "vietapi",
-      "model": "claude-opus-4.8"
+      "model": "claude-opus-4.8-thinking"
     },
     "backend-engineer": {
-      "backend": { "mode": "api" },
+      "backend": {
+        "mode": "api"
+      },
       "provider": "vietapi",
-      "model": "deepseek-v4-pro"
+      "model": "glm-5.2"
     },
     "frontend-engineer": {
-      "backend": { "mode": "api" },
+      "backend": {
+        "mode": "api"
+      },
       "provider": "vietapi",
-      "model": "claude-opus-4.7"
+      "model": "glm-5.2"
     },
     "ai-engineer": {
-      "backend": { "mode": "api" },
+      "backend": {
+        "mode": "api"
+      },
       "provider": "vietapi",
-      "model": "glm-5.2"
+      "model": "gpt-5.5-high"
     },
     "be-reviewer": {
-      "backend": { "mode": "api" },
+      "backend": {
+        "mode": "api"
+      },
       "provider": "vietapi",
-      "model": "deepseek-v4-flash"
+      "model": "gpt-5.5"
     },
     "fe-reviewer": {
-      "backend": { "mode": "api" },
+      "backend": {
+        "mode": "api"
+      },
       "provider": "vietapi",
-      "model": "deepseek-v4-flash"
+      "model": "gpt-5.5"
     },
     "ai-reviewer": {
-      "backend": { "mode": "api" },
+      "backend": {
+        "mode": "api"
+      },
       "provider": "vietapi",
-      "model": "glm-5.2"
+      "model": "claude-opus-4.8"
     }
   }
 }
