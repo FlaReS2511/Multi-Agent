@@ -1,6 +1,6 @@
 # stop.ps1 — stop the Multi-Agent IDE dev processes (Windows).
 # Kills the vite dev server on :5173, the Electron app, and any agent runtime
-# python processes spawned by the app.
+# child processes spawned by the app.
 
 $ErrorActionPreference = 'SilentlyContinue'
 
@@ -27,11 +27,13 @@ foreach ($p in $electrons) { Stop-Process -Id $p.ProcessId -Force -ErrorAction S
 if ($electrons) { Write-Host "[ok] Stopped Electron app" -ForegroundColor Green }
 else { Write-Host "[--] No Electron app running" -ForegroundColor DarkGray }
 
-# 3) Kill agent runtime python processes (agent_runtime.py).
-$pys = Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='py.exe'" -ErrorAction SilentlyContinue |
-  Where-Object { $_.CommandLine -and $_.CommandLine -like "*agent_runtime.py*" }
-foreach ($p in $pys) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }
-if ($pys) { Write-Host "[ok] Stopped agent runtimes" -ForegroundColor Green }
+# 3) Kill agent runtime child processes (agent-runtime.js runs via Electron's
+#    node with ELECTRON_RUN_AS_NODE). They usually die with the app above, but
+#    catch any that outlived it.
+$agents = Get-CimInstance Win32_Process -Filter "Name='electron.exe'" -ErrorAction SilentlyContinue |
+  Where-Object { $_.CommandLine -and $_.CommandLine -like "*agent-runtime.js*" }
+foreach ($p in $agents) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }
+if ($agents) { Write-Host "[ok] Stopped agent runtimes" -ForegroundColor Green }
 else { Write-Host "[--] No agent runtimes running" -ForegroundColor DarkGray }
 
 Write-Host ""

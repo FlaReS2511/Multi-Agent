@@ -44,7 +44,8 @@ if (Test-Path $dbPath) {
 
 # 2) Ensure Python API SDK is available (VietAPI = openai-compatible).
 if ($PYTHON) {
-  $hasOpenai = (& $PYTHON -c "import openai" 2>&1; $LASTEXITCODE -eq 0)
+  & $PYTHON -c "import openai" *> $null
+  $hasOpenai = ($LASTEXITCODE -eq 0)
   if (-not $hasOpenai) {
     Write-Step "Installing Python deps (openai)..."
     & $PYTHON -m pip install -r (Join-Path $ROOT 'scripts\requirements.txt') | Out-Null

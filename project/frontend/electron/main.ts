@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, safeStorage } from 'electron'
+import { app, BrowserWindow, ipcMain, safeStorage, dialog, Menu } from 'electron'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 import fs from 'node:fs/promises'
@@ -6,7 +6,8 @@ import fsSync from 'node:fs'
 import { execFile } from 'node:child_process'
 import { createRequire } from 'node:module'
 import * as db from './db'
-import { streamInlineEdit, stripCodeFence, InlineEditParams } from './ai-client'
+import { streamInlineEdit, stripCodeFence, streamChat, InlineEditParams, ChatParams } from './ai-client'
+import { GroupCoordinator, DEFAULT_ORCHESTRATION, OrchestrationConfig } from './group-coordinator'
 const require = createRequire(import.meta.url)
 // node-pty is a native module that must be rebuilt for Electron. If it failed
 // to build (e.g. missing VS Build Tools on Windows), load it lazily so the app
@@ -56,7 +57,9 @@ async function getRoles(): Promise<string[]> {
   return BASE_ROLES.slice()
 }
 const PLANNER_DRAFT_PATH = path.join(ROOT, 'agents', 'planner', 'workspace', 'current-draft.md')
-const AGENT_RUNTIME = path.join(ROOT, 'scripts', 'agent_runtime.py')
+// The agent runtime is now a Node/TS entry built alongside the main process.
+// It runs as a child process via Electron's own Node (ELECTRON_RUN_AS_NODE=1).
+const AGENT_RUNTIME = path.join(__dirname, 'agent-runtime.js')
 
 // Provider id is any string key under config.providers (e.g. 'vietapi',
 // 'anthropic'). Secrets are keyed by provider id.
@@ -72,30 +75,79 @@ const GC_INTERVAL_MS = 60 * 1000
 let mainWindow: BrowserWindow | null = null
 
 function createWindow() {
+  // Remove the default application menu (File/Edit/View/Window/Help) entirely.
+  Menu.setApplicationMenu(null)
+
+  // Window/taskbar icon. In dev, __dirname is dist-electron; the build/ folder
+  // sits next to it under project/frontend. Prefer .ico on Windows.
+  const iconName = process.platform === 'win32' ? 'icon.ico' : 'icon.png'
+  const iconPath = path.join(__dirname, '..', 'build', iconName)
+  const icon = fsSync.existsSync(iconPath) ? iconPath : undefined
+
   mainWindow = new BrowserWindow({
     width: 1280,
     height: 820,
     minWidth: 900,
     minHeight: 600,
     backgroundColor: '#09090b',
-    titleBarStyle: 'hiddenInset',
+    frame: false,
+    titleBarStyle: 'hidden',
+    autoHideMenuBar: true,
+    ...(icon ? { icon } : {}),
     webPreferences: {
       preload: path.join(__dirname, 'preload.mjs'),
       contextIsolation: true,
       nodeIntegration: false,
     },
   })
+  mainWindow.setMenuBarVisibility(false)
+
+  mainWindow.on('maximize', () => mainWindow?.webContents.send('window-maximized-changed', true))
+  mainWindow.on('unmaximize', () => mainWindow?.webContents.send('window-maximized-changed', false))
+
+  // Toggle DevTools on demand (F12 / Ctrl+Shift+I) since it no longer auto-opens.
+  mainWindow.webContents.on('before-input-event', (_e, input) => {
+    if (input.type !== 'keyDown') return
+    const f12 = input.key === 'F12'
+    const ctrlShiftI = (input.control || input.meta) && input.shift && input.key.toLowerCase() === 'i'
+    if (f12 || ctrlShiftI) {
+      mainWindow?.webContents.toggleDevTools()
+    }
+  })
 
   const devUrl = process.env.VITE_DEV_SERVER_URL
   if (devUrl) {
     mainWindow.loadURL(devUrl)
-    mainWindow.webContents.openDevTools({ mode: 'detach' })
+    // DevTools stays closed by default — when open, Chromium paints a
+    // viewport-size (px) overlay on every window resize. Set OPEN_DEVTOOLS=1
+    // to enable it (or press F12 / Ctrl+Shift+I at runtime).
+    if (process.env.OPEN_DEVTOOLS === '1') {
+      mainWindow.webContents.openDevTools({ mode: 'detach' })
+    }
   } else {
     mainWindow.loadFile(path.join(__dirname, '..', 'dist', 'index.html'))
   }
 }
 
 // ── IPC handlers ───────────────────────────────────────────────
+
+// Window controls (custom title bar)
+ipcMain.handle('window-minimize', () => {
+  mainWindow?.minimize()
+})
+ipcMain.handle('window-maximize-toggle', () => {
+  if (!mainWindow) return false
+  if (mainWindow.isMaximized()) {
+    mainWindow.unmaximize()
+    return false
+  }
+  mainWindow.maximize()
+  return true
+})
+ipcMain.handle('window-close', () => {
+  mainWindow?.close()
+})
+ipcMain.handle('window-is-maximized', () => mainWindow?.isMaximized() ?? false)
 
 ipcMain.handle('get-tasks', async () => {
   return db.getTasks()
@@ -439,6 +491,7 @@ interface FullConfig {
   providers?: Record<string, ProviderBlock>
   agents: Record<string, AgentEntry>
   available_models?: unknown[]
+  orchestration?: Partial<OrchestrationConfig>
 }
 
 // Build the flat model list the renderer expects from the providers map.
@@ -582,7 +635,7 @@ interface ProviderCfg {
   price_out?: number
 }
 
-// Env var name the Python runtime expects for a given provider id.
+// Env var name the agent runtime expects for a given provider id.
 //   'vietapi'   -> MULTIAGENT_KEY_VIETAPI
 //   'lm-studio' -> MULTIAGENT_KEY_LM_STUDIO
 function keyEnvName(providerId: string): string {
@@ -604,13 +657,6 @@ function resolveBin(name: string): string {
     }
   }
   return name
-}
-
-// Resolve the python executable name across platforms (python on Windows,
-// python3 elsewhere). Overridable via PYTHON_BIN.
-function resolvePython(): string {
-  if (process.env.PYTHON_BIN) return process.env.PYTHON_BIN
-  return resolveBin(process.platform === 'win32' ? 'python' : 'python3')
 }
 
 interface PtyCommand {
@@ -640,8 +686,101 @@ async function buildPtyCommand(agent: string): Promise<PtyCommand> {
     }
   }
 
-  return { cmd: resolvePython(), args: [AGENT_RUNTIME, '--role', agent], envExtra }
+  return {
+    cmd: process.execPath,
+    args: [AGENT_RUNTIME, '--role', agent],
+    envExtra: { ...envExtra, ELECTRON_RUN_AS_NODE: '1' },
+  }
 }
+
+// ── Group coordinator (v2 orchestration) ─────────────────────────
+// Reuses the same decrypted-key env logic as buildPtyCommand, but the
+// coordinator spawns headless one-shot group agents instead of PTY sessions.
+
+async function envForRole(role: string): Promise<Record<string, string>> {
+  const config = await readConfig()
+  const entry = config.agents[role] ?? {}
+  const providers: Record<string, ProviderCfg> =
+    (config as { providers?: Record<string, ProviderCfg> }).providers ?? {}
+  const providerId = (entry as { provider?: string }).provider ?? ''
+  const providerCfg = providers[providerId]
+  const env: Record<string, string> = {}
+  if (providerId) {
+    const enc = db.getSecret(providerId)
+    const decoded = enc ? decryptKey(enc) : ''
+    if (decoded) {
+      env[keyEnvName(providerId)] = decoded
+    } else if (providerCfg?.kind === 'openai-compatible' && providerCfg.base_url?.includes('localhost')) {
+      env[keyEnvName(providerId)] = 'no-key'
+    }
+  }
+  return env
+}
+
+async function readOrchestration(): Promise<OrchestrationConfig> {
+  const config = await readConfig()
+  return { ...DEFAULT_ORCHESTRATION, ...(config.orchestration ?? {}) }
+}
+
+async function modelForRole(role: string): Promise<string | null> {
+  const config = await readConfig()
+  return config.agents[role]?.model ?? null
+}
+
+const coordinator = new GroupCoordinator({
+  runtimePath: AGENT_RUNTIME,
+  execPath: process.execPath,
+  agentsDir: path.join(ROOT, 'agents'),
+  envForRole,
+  readOrchestration,
+  modelForRole,
+  notify: (event, payload) => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('coordinator-event', { event, payload })
+    }
+  },
+})
+
+// IPC: create a group for an existing task (UI / orchestrator-triggered).
+ipcMain.handle('group-create', async (_evt, input: { task_id: string; worker_role: string }) => {
+  try {
+    const id = await coordinator.createGroupForTask(input.task_id, input.worker_role)
+    return { ok: true, group: id }
+  } catch (e) {
+    return { ok: false, error: (e as Error).message }
+  }
+})
+
+// IPC: list groups (optionally by status) for the group panel (GĐ4).
+ipcMain.handle('group-list', () => {
+  const rows = db.getGroupsByStatus('pending', 'active', 'reviewing', 'passed', 'failed', 'killed')
+  return { ok: true, groups: rows }
+})
+
+// IPC: read orchestration settings.
+ipcMain.handle('orchestration-get', async () => {
+  return await readOrchestration()
+})
+
+// IPC: update orchestration settings (merged into agents-config.json).
+ipcMain.handle('orchestration-set', async (_evt, patch: Partial<OrchestrationConfig>) => {
+  const config = await readConfig()
+  const current = { ...DEFAULT_ORCHESTRATION, ...(config.orchestration ?? {}) }
+  config.orchestration = { ...current, ...patch }
+  await writeConfig(config)
+  return { ok: true, orchestration: config.orchestration }
+})
+
+// IPC: manually kill a group (GĐ4 panel action).
+ipcMain.handle('group-kill', (_evt, groupId: string) => {
+  coordinator.killGroupManual(groupId, 'killed by user')
+  return { ok: true }
+})
+
+// IPC: read a group's memory timeline (progress notes / review reports).
+ipcMain.handle('group-memory', (_evt, groupId: string) => {
+  return { ok: true, memory: db.allGroupMemory(groupId) }
+})
 
 // ── PTY: spawn an agent backend per role ───────────────────
 
@@ -723,7 +862,7 @@ async function doSpawn(agent: string): Promise<PtySession> {
   return s
 }
 
-// Ensure the agent's runtime process is running. The Python runtime polls the
+// Ensure the agent's runtime process is running. The runtime polls the
 // DB for unread messages on its own, so we no longer inject "check inbox" — we
 // just make sure the process exists. The auto-trigger event is kept so the UI
 // can flash which agent woke up.
@@ -907,6 +1046,79 @@ app.on('before-quit', () => {
       /* ignore */
     }
   }
+  for (const s of shellSessions.values()) {
+    try { s.proc.kill() } catch { /* ignore */ }
+  }
+})
+
+// ── Real shell terminals (for the user: npm/git/python) ──────
+// Separate from agent PTYs. Keyed by an arbitrary shell id from the renderer.
+// Spawns the platform shell in the current workspace root.
+
+interface ShellSession {
+  proc: import('node-pty').IPty
+  history: string
+}
+const shellSessions = new Map<string, ShellSession>()
+
+function shellCommand(): { cmd: string; args: string[] } {
+  if (process.platform === 'win32') {
+    // Prefer PowerShell 7 if present, else Windows PowerShell.
+    const pwsh = resolveBin('pwsh')
+    return { cmd: pwsh, args: [] }
+  }
+  return { cmd: process.env.SHELL || '/bin/bash', args: [] }
+}
+
+ipcMain.handle('shell-start', (_evt, id: string) => {
+  if (!pty) return { ok: false, error: 'node-pty unavailable' }
+  let s = shellSessions.get(id)
+  if (!s) {
+    const { cmd, args } = shellCommand()
+    const proc = pty.spawn(cmd, args, {
+      name: 'xterm-256color',
+      cols: 120,
+      rows: 24,
+      cwd: workspaceRoot,
+      env: { ...process.env, TERM: 'xterm-256color' },
+    })
+    s = { proc, history: '' }
+    shellSessions.set(id, s)
+    proc.onData((data) => {
+      s!.history += data
+      if (s!.history.length > HISTORY_MAX) s!.history = s!.history.slice(-HISTORY_MAX)
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send(`shell-data:${id}`, data)
+      }
+    })
+    proc.onExit(({ exitCode }) => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send(`shell-exit:${id}`, { exitCode })
+      }
+      shellSessions.delete(id)
+    })
+  }
+  return { ok: true, history: s.history }
+})
+
+ipcMain.handle('shell-write', (_evt, id: string, data: string) => {
+  const s = shellSessions.get(id)
+  if (!s) return { ok: false }
+  s.proc.write(data)
+  return { ok: true }
+})
+
+ipcMain.handle('shell-resize', (_evt, id: string, cols: number, rows: number) => {
+  const s = shellSessions.get(id)
+  if (!s) return { ok: false }
+  try { s.proc.resize(cols, rows) } catch { /* ignore */ }
+  return { ok: true }
+})
+
+ipcMain.handle('shell-kill', (_evt, id: string) => {
+  const s = shellSessions.get(id)
+  if (s) { try { s.proc.kill() } catch { /* ignore */ } shellSessions.delete(id) }
+  return { ok: true }
 })
 
 // ── Inbox watcher: auto-prompt agent when new message arrives ─
@@ -994,17 +1206,54 @@ ipcMain.handle('read-artifact-file', async (_evt, taskId: string, filename: stri
 
 // ── Workspace & Git IDE handlers ─────────────────────────────
 
+// The workspace root is dynamic: defaults to the project ROOT, but the user can
+// open any folder. Persisted in the DB (meta.workspace_root) + a recent list.
+let workspaceRoot: string = ROOT
+try {
+  const saved = db.getMeta('workspace_root')
+  if (saved && fsSync.existsSync(saved)) workspaceRoot = saved
+} catch { /* use ROOT */ }
+
+function getRecentWorkspaces(): string[] {
+  try {
+    const raw = db.getMeta('recent_workspaces')
+    const arr = raw ? JSON.parse(raw) : []
+    return Array.isArray(arr) ? arr : []
+  } catch {
+    return []
+  }
+}
+
+function pushRecentWorkspace(dir: string): void {
+  const recent = getRecentWorkspaces().filter((d) => d !== dir)
+  recent.unshift(dir)
+  db.setMeta('recent_workspaces', JSON.stringify(recent.slice(0, 10)))
+}
+
+function setWorkspaceRoot(dir: string): void {
+  workspaceRoot = dir
+  db.setMeta('workspace_root', dir)
+  pushRecentWorkspace(dir)
+}
+
+// Resolve a workspace-relative path to an absolute path, guarding against
+// escaping the workspace root.
+function resolveInWorkspace(relPath: string): string | null {
+  const abs = path.resolve(workspaceRoot, relPath)
+  if (abs !== workspaceRoot && !abs.startsWith(workspaceRoot + path.sep)) return null
+  return abs
+}
+
+const IGNORED_DIRS = new Set(['node_modules', 'dist', 'dist-electron', '.git', 'venv', '.venv', '__pycache__', '.vite'])
+
 async function scanDir(currentDir: string): Promise<any[]> {
   const entries = await fs.readdir(currentDir, { withFileTypes: true })
   const list: any[] = []
   for (const e of entries) {
     const name = e.name
-    // Exclude noise and hidden folders (except .gitignore or similar files if needed, but skip dot-folders)
-    if ((name.startsWith('.') && e.isDirectory()) || name === 'node_modules' || name === 'dist' || name === 'dist-electron' || name === 'outbox' || name === 'logs') {
-      continue
-    }
+    if (IGNORED_DIRS.has(name)) continue
     const fullPath = path.join(currentDir, name)
-    const relPath = path.relative(ROOT, fullPath)
+    const relPath = path.relative(workspaceRoot, fullPath)
     if (e.isDirectory()) {
       const children = await scanDir(fullPath)
       list.push({ name, relPath, isDir: true, children })
@@ -1012,7 +1261,6 @@ async function scanDir(currentDir: string): Promise<any[]> {
       list.push({ name, relPath, isDir: false })
     }
   }
-  // Sort folders first, then files alphabetically
   list.sort((a, b) => {
     if (a.isDir !== b.isDir) return a.isDir ? -1 : 1
     return a.name.localeCompare(b.name)
@@ -1020,9 +1268,33 @@ async function scanDir(currentDir: string): Promise<any[]> {
   return list
 }
 
+ipcMain.handle('workspace-get-root', () => ({
+  root: workspaceRoot,
+  name: path.basename(workspaceRoot),
+  recent: getRecentWorkspaces(),
+}))
+
+ipcMain.handle('workspace-open-dialog', async () => {
+  if (!mainWindow) return { ok: false }
+  const result = await dialog.showOpenDialog(mainWindow, {
+    title: 'Open Folder as Workspace',
+    properties: ['openDirectory'],
+    defaultPath: workspaceRoot,
+  })
+  if (result.canceled || result.filePaths.length === 0) return { ok: false }
+  setWorkspaceRoot(result.filePaths[0])
+  return { ok: true, root: workspaceRoot, name: path.basename(workspaceRoot) }
+})
+
+ipcMain.handle('workspace-set-root', async (_evt, dir: string) => {
+  if (!fsSync.existsSync(dir)) return { ok: false, error: 'folder not found' }
+  setWorkspaceRoot(dir)
+  return { ok: true, root: workspaceRoot, name: path.basename(workspaceRoot) }
+})
+
 ipcMain.handle('workspace-list-files', async () => {
   try {
-    return await scanDir(ROOT)
+    return await scanDir(workspaceRoot)
   } catch (err) {
     console.error('Failed to scan workspace:', err)
     return []
@@ -1030,10 +1302,8 @@ ipcMain.handle('workspace-list-files', async () => {
 })
 
 ipcMain.handle('workspace-read-file', async (_evt, relPath: string) => {
-  const absPath = path.resolve(ROOT, relPath)
-  if (!absPath.startsWith(ROOT + path.sep) && absPath !== ROOT) {
-    return { ok: false, content: 'Access denied: path is outside project root' }
-  }
+  const absPath = resolveInWorkspace(relPath)
+  if (!absPath) return { ok: false, content: 'Access denied: path is outside workspace root' }
   try {
     const content = await fs.readFile(absPath, 'utf-8')
     return { ok: true, content }
@@ -1043,10 +1313,8 @@ ipcMain.handle('workspace-read-file', async (_evt, relPath: string) => {
 })
 
 ipcMain.handle('workspace-write-file', async (_evt, relPath: string, content: string) => {
-  const absPath = path.resolve(ROOT, relPath)
-  if (!absPath.startsWith(ROOT + path.sep)) {
-    return { ok: false, error: 'Access denied: path is outside project root' }
-  }
+  const absPath = resolveInWorkspace(relPath)
+  if (!absPath) return { ok: false, error: 'Access denied: path is outside workspace root' }
   try {
     await fs.mkdir(path.dirname(absPath), { recursive: true })
     await fs.writeFile(absPath, content, 'utf-8')
@@ -1056,37 +1324,189 @@ ipcMain.handle('workspace-write-file', async (_evt, relPath: string, content: st
   }
 })
 
-ipcMain.handle('workspace-git-status', async () => {
-  return new Promise((resolve) => {
-    execFile('git', ['status', '--porcelain'], { cwd: ROOT }, (err, stdout) => {
-      if (err) {
-        resolve([])
+// ── File operations (create / rename / delete / mkdir) ───────
+
+ipcMain.handle('workspace-create-file', async (_evt, relPath: string) => {
+  const absPath = resolveInWorkspace(relPath)
+  if (!absPath) return { ok: false, error: 'path outside workspace' }
+  try {
+    if (fsSync.existsSync(absPath)) return { ok: false, error: 'file already exists' }
+    await fs.mkdir(path.dirname(absPath), { recursive: true })
+    await fs.writeFile(absPath, '', 'utf-8')
+    return { ok: true }
+  } catch (err: any) {
+    return { ok: false, error: err.message }
+  }
+})
+
+ipcMain.handle('workspace-create-folder', async (_evt, relPath: string) => {
+  const absPath = resolveInWorkspace(relPath)
+  if (!absPath) return { ok: false, error: 'path outside workspace' }
+  try {
+    await fs.mkdir(absPath, { recursive: true })
+    return { ok: true }
+  } catch (err: any) {
+    return { ok: false, error: err.message }
+  }
+})
+
+ipcMain.handle('workspace-rename', async (_evt, fromRel: string, toRel: string) => {
+  const from = resolveInWorkspace(fromRel)
+  const to = resolveInWorkspace(toRel)
+  if (!from || !to) return { ok: false, error: 'path outside workspace' }
+  try {
+    if (fsSync.existsSync(to)) return { ok: false, error: 'target already exists' }
+    await fs.mkdir(path.dirname(to), { recursive: true })
+    await fs.rename(from, to)
+    return { ok: true }
+  } catch (err: any) {
+    return { ok: false, error: err.message }
+  }
+})
+
+ipcMain.handle('workspace-delete', async (_evt, relPath: string) => {
+  const absPath = resolveInWorkspace(relPath)
+  if (!absPath || absPath === workspaceRoot) return { ok: false, error: 'invalid path' }
+  try {
+    await fs.rm(absPath, { recursive: true, force: true })
+    return { ok: true }
+  } catch (err: any) {
+    return { ok: false, error: err.message }
+  }
+})
+
+// ── Project-wide search (ripgrep with a JS fallback) ─────────
+
+interface SearchMatch { file: string; line: number; column: number; text: string }
+
+ipcMain.handle('workspace-search', async (_evt, query: string, opts?: { caseSensitive?: boolean; regex?: boolean; maxResults?: number }) => {
+  const max = opts?.maxResults ?? 500
+  if (!query) return { ok: true, matches: [] as SearchMatch[] }
+  return await new Promise((resolve) => {
+    const args = ['--no-heading', '--line-number', '--column', '--color', 'never']
+    if (!opts?.caseSensitive) args.push('-i')
+    if (!opts?.regex) args.push('--fixed-strings')
+    args.push('--max-count', '50', query, '.')
+    execFile('rg', args, { cwd: workspaceRoot, maxBuffer: 20 * 1024 * 1024 }, (err, stdout) => {
+      // rg exits 1 when no matches — not an error for us.
+      if (err && (err as any).code !== 1 && !stdout) {
+        // Fallback: no ripgrep. Return a hint; JS fallback is expensive, skip for now.
+        resolve({ ok: false, error: 'ripgrep (rg) not found', matches: [] })
         return
       }
-      const lines = stdout.trim().split('\n').filter(Boolean)
-      const changes = lines.map((line) => {
-        const type = line.slice(0, 2).trim() // e.g. 'M', 'A', '??', 'D'
-        // Git might quote filenames with special chars
-        const file = line.slice(3).trim().replace(/^"|"$/g, '')
-        return { file, type }
-      })
-      resolve(changes)
+      const matches: SearchMatch[] = []
+      for (const line of stdout.split('\n')) {
+        if (!line.trim()) continue
+        // format: relpath:line:col:text
+        const m = line.match(/^(.*?):(\d+):(\d+):(.*)$/)
+        if (!m) continue
+        matches.push({
+          file: m[1].replace(/\\/g, '/'),
+          line: parseInt(m[2], 10),
+          column: parseInt(m[3], 10),
+          text: m[4].slice(0, 400),
+        })
+        if (matches.length >= max) break
+      }
+      resolve({ ok: true, matches })
     })
   })
 })
 
-ipcMain.handle('workspace-git-show-head', async (_evt, relPath: string) => {
+// Replace all occurrences of `find` with `replace` in a single file.
+ipcMain.handle('workspace-replace-in-file', async (_evt, relPath: string, find: string, replace: string, opts?: { regex?: boolean; caseSensitive?: boolean }) => {
+  const absPath = resolveInWorkspace(relPath)
+  if (!absPath) return { ok: false, error: 'path outside workspace' }
+  try {
+    const content = await fs.readFile(absPath, 'utf-8')
+    let next: string
+    if (opts?.regex) {
+      const re = new RegExp(find, opts.caseSensitive ? 'g' : 'gi')
+      next = content.replace(re, replace)
+    } else if (opts?.caseSensitive) {
+      next = content.split(find).join(replace)
+    } else {
+      const re = new RegExp(find.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi')
+      next = content.replace(re, replace)
+    }
+    await fs.writeFile(absPath, next, 'utf-8')
+    return { ok: true }
+  } catch (err: any) {
+    return { ok: false, error: err.message }
+  }
+})
+
+// ── Git (status + diff base + stage/commit/branch/push/pull) ──
+
+function gitExec(args: string[]): Promise<{ ok: boolean; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
-    const gitPath = relPath.replace(/\\/g, '/')
-    execFile('git', ['show', `HEAD:${gitPath}`], { cwd: ROOT }, (err, stdout) => {
-      if (err) {
-        // Return empty content if file is not in HEAD (new untracked file)
-        resolve({ ok: true, content: '' })
-      } else {
-        resolve({ ok: true, content: stdout })
-      }
+    execFile('git', args, { cwd: workspaceRoot, maxBuffer: 20 * 1024 * 1024 }, (err, stdout, stderr) => {
+      resolve({ ok: !err, stdout: stdout || '', stderr: stderr || '' })
     })
   })
+}
+
+ipcMain.handle('workspace-git-status', async () => {
+  const { ok, stdout } = await gitExec(['status', '--porcelain'])
+  if (!ok) return []
+  const lines = stdout.trim().split('\n').filter(Boolean)
+  return lines.map((line) => {
+    const type = line.slice(0, 2).trim()
+    const file = line.slice(3).trim().replace(/^"|"$/g, '')
+    return { file, type, staged: line[0] !== ' ' && line[0] !== '?' }
+  })
+})
+
+ipcMain.handle('workspace-git-show-head', async (_evt, relPath: string) => {
+  const gitPath = relPath.replace(/\\/g, '/')
+  const { ok, stdout } = await gitExec(['show', `HEAD:${gitPath}`])
+  return { ok: true, content: ok ? stdout : '' }
+})
+
+ipcMain.handle('workspace-git-branch', async () => {
+  const cur = await gitExec(['rev-parse', '--abbrev-ref', 'HEAD'])
+  const all = await gitExec(['branch', '--format=%(refname:short)'])
+  return {
+    current: cur.ok ? cur.stdout.trim() : '',
+    branches: all.ok ? all.stdout.split('\n').map((s) => s.trim()).filter(Boolean) : [],
+  }
+})
+
+ipcMain.handle('workspace-git-stage', async (_evt, file: string) => {
+  const { ok, stderr } = await gitExec(['add', '--', file])
+  return { ok, error: ok ? undefined : stderr }
+})
+
+ipcMain.handle('workspace-git-unstage', async (_evt, file: string) => {
+  const { ok, stderr } = await gitExec(['restore', '--staged', '--', file])
+  return { ok, error: ok ? undefined : stderr }
+})
+
+ipcMain.handle('workspace-git-stage-all', async () => {
+  const { ok, stderr } = await gitExec(['add', '-A'])
+  return { ok, error: ok ? undefined : stderr }
+})
+
+ipcMain.handle('workspace-git-commit', async (_evt, message: string) => {
+  if (!message?.trim()) return { ok: false, error: 'commit message required' }
+  const { ok, stdout, stderr } = await gitExec(['commit', '-m', message])
+  return { ok, output: stdout, error: ok ? undefined : (stderr || stdout) }
+})
+
+ipcMain.handle('workspace-git-checkout', async (_evt, branch: string, create?: boolean) => {
+  const args = create ? ['checkout', '-b', branch] : ['checkout', branch]
+  const { ok, stderr } = await gitExec(args)
+  return { ok, error: ok ? undefined : stderr }
+})
+
+ipcMain.handle('workspace-git-push', async () => {
+  const { ok, stdout, stderr } = await gitExec(['push'])
+  return { ok, output: stdout + stderr }
+})
+
+ipcMain.handle('workspace-git-pull', async () => {
+  const { ok, stdout, stderr } = await gitExec(['pull'])
+  return { ok, output: stdout + stderr }
 })
 
 // ── Task update ─────────────────────────────────────────────────
@@ -1167,9 +1587,49 @@ ipcMain.handle('ai-inline-cancel', (_evt, requestId: string) => {
   return { ok: true }
 })
 
+// ── AI chat (streaming coding assistant) ─────────────────────
+// Same streaming contract as inline edit, keyed by requestId.
+
+const chatAborts = new Map<string, AbortController>()
+
+ipcMain.handle('ai-chat', async (_evt, requestId: string, params: ChatParams) => {
+  const ac = new AbortController()
+  chatAborts.set(requestId, ac)
+  const send = (channel: string, payload: unknown) => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send(channel, payload)
+    }
+  }
+  try {
+    const full = await streamChat(
+      SHARED,
+      params,
+      decryptKey,
+      (delta) => send(`ai-chat-chunk:${requestId}`, delta),
+      ac.signal,
+    )
+    send(`ai-chat-done:${requestId}`, { ok: true, text: full })
+    return { ok: true }
+  } catch (e) {
+    const msg = (e as Error).message || String(e)
+    send(`ai-chat-done:${requestId}`, { ok: false, error: msg })
+    return { ok: false, error: msg }
+  } finally {
+    chatAborts.delete(requestId)
+  }
+})
+
+ipcMain.handle('ai-chat-cancel', (_evt, requestId: string) => {
+  const ac = chatAborts.get(requestId)
+  if (ac) ac.abort()
+  chatAborts.delete(requestId)
+  return { ok: true }
+})
+
 // ── Lifecycle ───────────────────────────────────────────────
 
 app.whenReady().then(async () => {
+  if (process.platform === 'win32') app.setAppUserModelId('com.orqon.ide')
   createWindow()
   // Ensure the artifacts dir exists (gitignored; agents write task outputs here).
   // Coordination state (tasks/messages/usage/logs) lives in the DB, not files.
@@ -1194,6 +1654,10 @@ app.whenReady().then(async () => {
     }
   }
   startIdleGc()
+  // Group coordinator polls for group signals. It is a no-op each tick unless
+  // orchestration.enabled is true in agents-config.json, so this is safe to
+  // always start.
+  coordinator.start()
 })
 
 app.on('window-all-closed', () => {

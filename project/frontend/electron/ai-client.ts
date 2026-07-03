@@ -30,6 +30,27 @@ export interface InlineEditParams {
   suffix?: string // code after the selection (context)
 }
 
+export interface ChatMessage {
+  role: 'user' | 'assistant'
+  content: string
+}
+
+export interface ChatContextFile {
+  path: string
+  language?: string
+  content: string
+}
+
+export interface ChatParams {
+  provider: string
+  model?: string
+  messages: ChatMessage[]
+  // Optional file context (e.g. the file currently open in the editor).
+  contextFiles?: ChatContextFile[]
+  // Optional selected snippet the user is asking about.
+  selection?: string
+}
+
 async function loadProviders(sharedDir: string): Promise<Record<string, ProviderCfg>> {
   try {
     const raw = await fs.readFile(path.join(sharedDir, 'agents-config.json'), 'utf-8')
@@ -95,6 +116,54 @@ export async function streamInlineEdit(
   return streamOpenAI(pc, model, key, system, user, onChunk, signal)
 }
 
+// ── Chat (multi-turn coding assistant) ───────────────────────────
+// Reuses the same providers/keys as inline edit, but keeps full conversation
+// history and injects the open file(s) as context.
+
+function buildChatSystem(params: ChatParams): string {
+  let system =
+    'You are Orqon, an expert AI coding assistant embedded in an IDE. ' +
+    'Help the user understand, write, and improve code. Be concise and precise. ' +
+    'When you output code, always use fenced code blocks with a language tag. ' +
+    'Reference file names and line numbers when relevant.'
+
+  if (params.contextFiles && params.contextFiles.length > 0) {
+    system += '\n\nThe user is working in these files:\n'
+    for (const f of params.contextFiles) {
+      // Cap each file so a huge file cannot blow the context / cost budget.
+      const body = f.content.length > 12000 ? f.content.slice(0, 12000) + '\n… (truncated)' : f.content
+      system += `\n--- ${f.path} ---\n\`\`\`${f.language ?? ''}\n${body}\n\`\`\`\n`
+    }
+  }
+  if (params.selection && params.selection.trim()) {
+    system += `\n\nThe user has selected this snippet:\n\`\`\`\n${params.selection.slice(0, 4000)}\n\`\`\`\n`
+  }
+  return system
+}
+
+// Stream a chat completion. onChunk receives incremental text; resolves with
+// the full text when done. Throws on HTTP / config errors.
+export async function streamChat(
+  sharedDir: string,
+  params: ChatParams,
+  decrypt: (b64: string) => string,
+  onChunk: (delta: string) => void,
+  signal?: AbortSignal,
+): Promise<string> {
+  const providers = await loadProviders(sharedDir)
+  const pc = providers[params.provider]
+  if (!pc) throw new Error(`unknown provider: ${params.provider}`)
+  const key = decryptKeyFor(params.provider, decrypt)
+  const model = params.model || pc.models?.[0] || ''
+  if (!model) throw new Error(`no model for provider ${params.provider}`)
+  const system = buildChatSystem(params)
+
+  if (pc.kind === 'anthropic') {
+    return streamAnthropicChat(pc, model, key, system, params.messages, onChunk, signal)
+  }
+  return streamOpenAIChat(pc, model, key, system, params.messages, onChunk, signal)
+}
+
 async function streamOpenAI(
   pc: ProviderCfg, model: string, key: string,
   system: string, user: string,
@@ -157,6 +226,88 @@ async function streamAnthropic(
       max_tokens: 4096,
       system,
       messages: [{ role: 'user', content: user }],
+      stream: true,
+    }),
+    signal,
+  })
+  if (!resp.ok || !resp.body) {
+    const errText = await resp.text().catch(() => '')
+    throw new Error(`provider HTTP ${resp.status}: ${errText.slice(0, 300)}`)
+  }
+  let full = ''
+  await readSse(resp.body, (data) => {
+    try {
+      const json = JSON.parse(data)
+      if (json.type === 'content_block_delta' && json.delta?.text) {
+        full += json.delta.text
+        onChunk(json.delta.text)
+      }
+    } catch {
+      /* ignore */
+    }
+  })
+  return full
+}
+
+async function streamOpenAIChat(
+  pc: ProviderCfg, model: string, key: string,
+  system: string, messages: ChatMessage[],
+  onChunk: (d: string) => void, signal?: AbortSignal,
+): Promise<string> {
+  const base = (pc.base_url || 'https://api.openai.com/v1').replace(/\/$/, '')
+  const resp = await fetch(`${base}/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${key || 'no-key'}`,
+    },
+    body: JSON.stringify({
+      model,
+      messages: [{ role: 'system', content: system }, ...messages],
+      stream: true,
+      temperature: 0.3,
+    }),
+    signal,
+  })
+  if (!resp.ok || !resp.body) {
+    const errText = await resp.text().catch(() => '')
+    throw new Error(`provider HTTP ${resp.status}: ${errText.slice(0, 300)}`)
+  }
+  let full = ''
+  await readSse(resp.body, (data) => {
+    if (data === '[DONE]') return
+    try {
+      const json = JSON.parse(data)
+      const delta = json.choices?.[0]?.delta?.content
+      if (delta) {
+        full += delta
+        onChunk(delta)
+      }
+    } catch {
+      /* ignore keep-alive / partial */
+    }
+  })
+  return full
+}
+
+async function streamAnthropicChat(
+  pc: ProviderCfg, model: string, key: string,
+  system: string, messages: ChatMessage[],
+  onChunk: (d: string) => void, signal?: AbortSignal,
+): Promise<string> {
+  const base = (pc.base_url || 'https://api.anthropic.com').replace(/\/$/, '')
+  const resp = await fetch(`${base}/v1/messages`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': key,
+      'anthropic-version': '2023-06-01',
+    },
+    body: JSON.stringify({
+      model,
+      max_tokens: 4096,
+      system,
+      messages,
       stream: true,
     }),
     signal,

@@ -192,6 +192,63 @@ export interface TaskThreadEntry {
   source_file: string
 }
 
+export type GroupStatus = 'pending' | 'active' | 'reviewing' | 'passed' | 'failed' | 'killed'
+
+export interface GroupRow {
+  id: string
+  task_id: string
+  parent_group: string | null
+  depth: number
+  status: GroupStatus
+  worker_role: string | null
+  reviewer_role: string | null
+  worker_model: string | null
+  reviewer_model: string | null
+  level: number | null
+  budget_usd: number
+  spent_usd: number
+  retries: number
+  signal: string | null
+  worker_pid: number | null
+  reviewer_pid: number | null
+  heartbeat_at: string | null
+  created_at: string
+  updated_at: string
+}
+
+export interface GroupMemoryRow {
+  id: number
+  group_id: string
+  task_id: string | null
+  role: string | null
+  kind: string
+  content: string
+  ts: string
+}
+
+export interface OrchestrationConfig {
+  enabled: boolean
+  max_concurrent_groups: number
+  max_groups_per_task: number
+  max_recursion_depth: number
+  budget_per_task_usd: number
+  budget_per_group_usd: number
+  max_retries_per_group: number
+  reviewer_level_offset: number
+  review_policy: string
+  reviewer_for: Record<string, string>
+  heartbeat_timeout_sec: number
+}
+
+export const GROUP_STATUS_STYLES: Record<GroupStatus, { label: string; classes: string }> = {
+  pending:   { label: 'PENDING',   classes: 'bg-zinc-700/40 text-zinc-300 ring-zinc-600/40' },
+  active:    { label: 'ACTIVE',    classes: 'bg-blue-500/15 text-blue-300 ring-blue-500/30' },
+  reviewing: { label: 'REVIEWING', classes: 'bg-fuchsia-500/15 text-fuchsia-300 ring-fuchsia-500/30' },
+  passed:    { label: 'PASSED',    classes: 'bg-emerald-500/15 text-emerald-300 ring-emerald-500/30' },
+  failed:    { label: 'FAILED',    classes: 'bg-rose-500/15 text-rose-300 ring-rose-500/30' },
+  killed:    { label: 'KILLED',    classes: 'bg-rose-900/30 text-rose-400 ring-rose-800/40' },
+}
+
 declare global {
   interface Window {
     api: {
@@ -234,12 +291,40 @@ declare global {
       setAutoTrigger(enabled: boolean): Promise<{ ok: boolean; enabled: boolean }>
       getAutoTrigger(): Promise<{ enabled: boolean }>
       onAutoTrigger(cb: (info: { agent: string }) => void): () => void
+      windowMinimize(): Promise<void>
+      windowMaximizeToggle(): Promise<boolean>
+      windowClose(): Promise<void>
+      windowIsMaximized(): Promise<boolean>
+      onWindowMaximizedChanged(cb: (maximized: boolean) => void): () => void
       onAgentKilled(cb: (info: { agent: string; reason: string }) => void): () => void
       workspaceListFiles(): Promise<any[]>
       workspaceReadFile(relPath: string): Promise<{ ok: boolean; content: string }>
       workspaceWriteFile(relPath: string, content: string): Promise<{ ok: boolean; error?: string }>
-      workspaceGitStatus(): Promise<{ file: string; type: string }[]>
+      workspaceGitStatus(): Promise<{ file: string; type: string; staged?: boolean }[]>
       workspaceGitShowHead(relPath: string): Promise<{ ok: boolean; content: string }>
+      workspaceGetRoot(): Promise<{ root: string; name: string; recent: string[] }>
+      workspaceOpenDialog(): Promise<{ ok: boolean; root?: string; name?: string }>
+      workspaceSetRoot(dir: string): Promise<{ ok: boolean; root?: string; name?: string; error?: string }>
+      workspaceCreateFile(relPath: string): Promise<{ ok: boolean; error?: string }>
+      workspaceCreateFolder(relPath: string): Promise<{ ok: boolean; error?: string }>
+      workspaceRename(fromRel: string, toRel: string): Promise<{ ok: boolean; error?: string }>
+      workspaceDelete(relPath: string): Promise<{ ok: boolean; error?: string }>
+      workspaceSearch(query: string, opts?: { caseSensitive?: boolean; regex?: boolean; maxResults?: number }): Promise<{ ok: boolean; error?: string; matches: { file: string; line: number; column: number; text: string }[] }>
+      workspaceReplaceInFile(relPath: string, find: string, replace: string, opts?: { regex?: boolean; caseSensitive?: boolean }): Promise<{ ok: boolean; error?: string }>
+      workspaceGitBranch(): Promise<{ current: string; branches: string[] }>
+      workspaceGitStage(file: string): Promise<{ ok: boolean; error?: string }>
+      workspaceGitUnstage(file: string): Promise<{ ok: boolean; error?: string }>
+      workspaceGitStageAll(): Promise<{ ok: boolean; error?: string }>
+      workspaceGitCommit(message: string): Promise<{ ok: boolean; output?: string; error?: string }>
+      workspaceGitCheckout(branch: string, create?: boolean): Promise<{ ok: boolean; error?: string }>
+      workspaceGitPush(): Promise<{ ok: boolean; output?: string }>
+      workspaceGitPull(): Promise<{ ok: boolean; output?: string }>
+      shellStart(id: string): Promise<{ ok: boolean; history?: string; error?: string }>
+      shellWrite(id: string, data: string): Promise<{ ok: boolean }>
+      shellResize(id: string, cols: number, rows: number): Promise<{ ok: boolean }>
+      shellKill(id: string): Promise<{ ok: boolean }>
+      onShellData(id: string, cb: (data: string) => void): () => void
+      onShellExit(id: string, cb: (info: { exitCode: number }) => void): () => void
       aiInlineEdit(requestId: string, params: {
         provider: string; model?: string; instruction: string; selection: string
         language?: string; prefix?: string; suffix?: string
@@ -247,6 +332,22 @@ declare global {
       aiInlineCancel(requestId: string): Promise<{ ok: boolean }>
       onAiInlineChunk(requestId: string, cb: (delta: string) => void): () => void
       onAiInlineDone(requestId: string, cb: (info: { ok: boolean; text?: string; error?: string }) => void): () => void
+      aiChat(requestId: string, params: {
+        provider: string; model?: string
+        messages: { role: 'user' | 'assistant'; content: string }[]
+        contextFiles?: { path: string; language?: string; content: string }[]
+        selection?: string
+      }): Promise<{ ok: boolean; error?: string }>
+      aiChatCancel(requestId: string): Promise<{ ok: boolean }>
+      onAiChatChunk(requestId: string, cb: (delta: string) => void): () => void
+      onAiChatDone(requestId: string, cb: (info: { ok: boolean; text?: string; error?: string }) => void): () => void
+      groupCreate(input: { task_id: string; worker_role: string }): Promise<{ ok: boolean; group?: string; error?: string }>
+      groupList(): Promise<{ ok: boolean; groups: GroupRow[] }>
+      groupKill(groupId: string): Promise<{ ok: boolean }>
+      groupMemory(groupId: string): Promise<{ ok: boolean; memory: GroupMemoryRow[] }>
+      orchestrationGet(): Promise<OrchestrationConfig>
+      orchestrationSet(patch: Partial<OrchestrationConfig>): Promise<{ ok: boolean; orchestration: OrchestrationConfig }>
+      onCoordinatorEvent(cb: (info: { event: string; payload: unknown }) => void): () => void
     }
   }
 }
@@ -273,6 +374,18 @@ export const CLONABLE_ROLES = [
   'fe-reviewer',
   'ai-reviewer',
 ] as const
+
+// Resident agents are the always-on coordination brains (pre-warmed, inbox
+// driven). Everyone else (engineers, reviewers) runs as ephemeral group
+// worker/reviewer sessions under the v2 coordinator and is surfaced in the
+// Groups panel, not the AI Agents tab.
+export const RESIDENT_ROLES = ['planner', 'orchestrator'] as const
+
+// True for the two always-on coordination agents. Clones of workers are never
+// resident. Used to scope the AI Agents tab to just the resident brains.
+export function isResidentRole(agent: string): boolean {
+  return (RESIDENT_ROLES as readonly string[]).includes(baseRoleOf(agent))
+}
 
 // Backward-compat alias. Components that still hardcode the agent list use this.
 // New code should call activeAgents(config) for the runtime-derived set.

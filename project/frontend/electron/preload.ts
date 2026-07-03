@@ -86,11 +86,56 @@ const api = {
     ipcRenderer.on(channel, listener)
     return () => ipcRenderer.removeListener(channel, listener)
   },
+
+  // Real shell terminals (user shell in workspace root)
+  shellStart: (id: string) => ipcRenderer.invoke('shell-start', id),
+  shellWrite: (id: string, data: string) => ipcRenderer.invoke('shell-write', id, data),
+  shellResize: (id: string, cols: number, rows: number) => ipcRenderer.invoke('shell-resize', id, cols, rows),
+  shellKill: (id: string) => ipcRenderer.invoke('shell-kill', id),
+  onShellData: (id: string, cb: (data: string) => void) => {
+    const channel = `shell-data:${id}`
+    const listener = (_e: unknown, data: string) => cb(data)
+    ipcRenderer.on(channel, listener)
+    return () => ipcRenderer.removeListener(channel, listener)
+  },
+  onShellExit: (id: string, cb: (info: { exitCode: number }) => void) => {
+    const channel = `shell-exit:${id}`
+    const listener = (_e: unknown, info: { exitCode: number }) => cb(info)
+    ipcRenderer.on(channel, listener)
+    return () => ipcRenderer.removeListener(channel, listener)
+  },
   workspaceListFiles: () => ipcRenderer.invoke('workspace-list-files'),
   workspaceReadFile: (relPath: string) => ipcRenderer.invoke('workspace-read-file', relPath),
   workspaceWriteFile: (relPath: string, content: string) => ipcRenderer.invoke('workspace-write-file', relPath, content),
   workspaceGitStatus: () => ipcRenderer.invoke('workspace-git-status'),
   workspaceGitShowHead: (relPath: string) => ipcRenderer.invoke('workspace-git-show-head', relPath),
+
+  // Workspace root / folder selection
+  workspaceGetRoot: () => ipcRenderer.invoke('workspace-get-root'),
+  workspaceOpenDialog: () => ipcRenderer.invoke('workspace-open-dialog'),
+  workspaceSetRoot: (dir: string) => ipcRenderer.invoke('workspace-set-root', dir),
+
+  // File operations
+  workspaceCreateFile: (relPath: string) => ipcRenderer.invoke('workspace-create-file', relPath),
+  workspaceCreateFolder: (relPath: string) => ipcRenderer.invoke('workspace-create-folder', relPath),
+  workspaceRename: (fromRel: string, toRel: string) => ipcRenderer.invoke('workspace-rename', fromRel, toRel),
+  workspaceDelete: (relPath: string) => ipcRenderer.invoke('workspace-delete', relPath),
+
+  // Search
+  workspaceSearch: (query: string, opts?: { caseSensitive?: boolean; regex?: boolean; maxResults?: number }) =>
+    ipcRenderer.invoke('workspace-search', query, opts),
+  workspaceReplaceInFile: (relPath: string, find: string, replace: string, opts?: { regex?: boolean; caseSensitive?: boolean }) =>
+    ipcRenderer.invoke('workspace-replace-in-file', relPath, find, replace, opts),
+
+  // Git (full)
+  workspaceGitBranch: () => ipcRenderer.invoke('workspace-git-branch'),
+  workspaceGitStage: (file: string) => ipcRenderer.invoke('workspace-git-stage', file),
+  workspaceGitUnstage: (file: string) => ipcRenderer.invoke('workspace-git-unstage', file),
+  workspaceGitStageAll: () => ipcRenderer.invoke('workspace-git-stage-all'),
+  workspaceGitCommit: (message: string) => ipcRenderer.invoke('workspace-git-commit', message),
+  workspaceGitCheckout: (branch: string, create?: boolean) => ipcRenderer.invoke('workspace-git-checkout', branch, create),
+  workspaceGitPush: () => ipcRenderer.invoke('workspace-git-push'),
+  workspaceGitPull: () => ipcRenderer.invoke('workspace-git-pull'),
 
   // Inline AI edit (streaming)
   aiInlineEdit: (requestId: string, params: {
@@ -110,12 +155,58 @@ const api = {
     ipcRenderer.on(channel, listener)
     return () => ipcRenderer.removeListener(channel, listener)
   },
+
+  // AI chat (streaming coding assistant)
+  aiChat: (requestId: string, params: {
+    provider: string; model?: string
+    messages: { role: 'user' | 'assistant'; content: string }[]
+    contextFiles?: { path: string; language?: string; content: string }[]
+    selection?: string
+  }) => ipcRenderer.invoke('ai-chat', requestId, params),
+  aiChatCancel: (requestId: string) => ipcRenderer.invoke('ai-chat-cancel', requestId),
+  onAiChatChunk: (requestId: string, cb: (delta: string) => void) => {
+    const channel = `ai-chat-chunk:${requestId}`
+    const listener = (_e: unknown, delta: string) => cb(delta)
+    ipcRenderer.on(channel, listener)
+    return () => ipcRenderer.removeListener(channel, listener)
+  },
+  onAiChatDone: (requestId: string, cb: (info: { ok: boolean; text?: string; error?: string }) => void) => {
+    const channel = `ai-chat-done:${requestId}`
+    const listener = (_e: unknown, info: { ok: boolean; text?: string; error?: string }) => cb(info)
+    ipcRenderer.on(channel, listener)
+    return () => ipcRenderer.removeListener(channel, listener)
+  },
   setAutoTrigger: (enabled: boolean) => ipcRenderer.invoke('set-auto-trigger', enabled),
   getAutoTrigger: () => ipcRenderer.invoke('get-auto-trigger'),
   onAutoTrigger: (cb: (info: { agent: string }) => void) => {
     const listener = (_e: unknown, info: { agent: string }) => cb(info)
     ipcRenderer.on('auto-trigger', listener)
     return () => ipcRenderer.removeListener('auto-trigger', listener)
+  },
+
+  // Group orchestration (v2)
+  groupCreate: (input: { task_id: string; worker_role: string }) =>
+    ipcRenderer.invoke('group-create', input),
+  groupList: () => ipcRenderer.invoke('group-list'),
+  groupKill: (groupId: string) => ipcRenderer.invoke('group-kill', groupId),
+  groupMemory: (groupId: string) => ipcRenderer.invoke('group-memory', groupId),
+  orchestrationGet: () => ipcRenderer.invoke('orchestration-get'),
+  orchestrationSet: (patch: Record<string, unknown>) => ipcRenderer.invoke('orchestration-set', patch),
+  onCoordinatorEvent: (cb: (info: { event: string; payload: unknown }) => void) => {
+    const listener = (_e: unknown, info: { event: string; payload: unknown }) => cb(info)
+    ipcRenderer.on('coordinator-event', listener)
+    return () => ipcRenderer.removeListener('coordinator-event', listener)
+  },
+
+  // Window controls (custom title bar)
+  windowMinimize: () => ipcRenderer.invoke('window-minimize'),
+  windowMaximizeToggle: (): Promise<boolean> => ipcRenderer.invoke('window-maximize-toggle'),
+  windowClose: () => ipcRenderer.invoke('window-close'),
+  windowIsMaximized: (): Promise<boolean> => ipcRenderer.invoke('window-is-maximized'),
+  onWindowMaximizedChanged: (cb: (maximized: boolean) => void) => {
+    const listener = (_e: unknown, maximized: boolean) => cb(maximized)
+    ipcRenderer.on('window-maximized-changed', listener)
+    return () => ipcRenderer.removeListener('window-maximized-changed', listener)
   },
 }
 

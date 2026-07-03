@@ -1,9 +1,10 @@
-import React, { useEffect, useState, useCallback, useRef } from 'react'
-import { AnimatePresence } from 'framer-motion'
+import React, { useEffect, useState, useCallback, useRef, useMemo } from 'react'
+import { AnimatePresence, motion } from 'framer-motion'
 import Editor, { DiffEditor } from '@monaco-editor/react'
 import {
   FolderTree,
   GitBranch,
+  MessagesSquare,
   Terminal as TerminalIcon,
   Save,
   Split,
@@ -14,15 +15,27 @@ import {
   RefreshCw,
   Layout,
   Cpu,
-  Layers,
   ArrowRight,
+  Search as SearchIcon,
+  FolderOpen,
+  FilePlus,
+  FolderPlus,
+  Boxes,
 } from 'lucide-react'
 import { IDEFileTree } from './IDEFileTree'
 import { AgentTerminal } from './AgentTerminal'
+import { ShellTerminal } from './ShellTerminal'
 import { InlineAIPrompt } from './InlineAIPrompt'
 import { InlineAICard } from './InlineAICard'
+import { SearchPanel } from './SearchPanel'
+import { GitPanel } from './GitPanel'
+import { CommandPalette, Command } from './CommandPalette'
+import { ChatPanel } from './ChatPanel'
+import { GroupsPanel } from './GroupsPanel'
+import { OrqonLogo } from './OrqonLogo'
+import { useAnimationsEnabled } from '../lib/uiSettings'
 import { useInlineAIEdit } from './useInlineAIEdit'
-import { activeAgents, AgentsConfig, colorFor, ModelOption } from '../lib/api'
+import { activeAgents, AgentsConfig, colorFor, ModelOption, isResidentRole } from '../lib/api'
 
 interface FileNode {
   name: string
@@ -65,10 +78,30 @@ function detectLanguage(filename: string): string {
   }
 }
 
+// Wind-up: sidebar content sections rise/fade in after the panel slides open.
+const SIDEBAR_CONTAINER = {
+  hidden: {},
+  show: { transition: { delayChildren: 0.14, staggerChildren: 0.06 } },
+}
+const SIDEBAR_ITEM = {
+  hidden: { opacity: 0, y: 8 },
+  show: { opacity: 1, y: 0, transition: { duration: 0.26, ease: 'easeOut' } },
+}
+
 export function IDEView() {
   // Sidebar State
-  const [activeSidebar, setActiveSidebar] = useState<'explorer' | 'git' | 'agents'>('explorer')
+  const [activeSidebar, setActiveSidebar] = useState<'explorer' | 'search' | 'git' | 'agents' | 'groups'>('explorer')
   const [isSidebarOpen, setIsSidebarOpen] = useState(true)
+  const [chatOpen, setChatOpen] = useState(false)
+  const animationsOn = useAnimationsEnabled()
+  // Minimap is hidden while a side panel animates its width (it flickers on
+  // frame-by-frame relayout) and restored once the animation settles.
+  const [minimapOn, setMinimapOn] = useState(true)
+
+  // Workspace root
+  const [workspaceName, setWorkspaceName] = useState<string>('')
+  const [recentWorkspaces, setRecentWorkspaces] = useState<string[]>([])
+  const [showWorkspaceMenu, setShowWorkspaceMenu] = useState(false)
 
   // Files & Git State
   const [files, setFiles] = useState<FileNode[]>([])
@@ -90,7 +123,7 @@ export function IDEView() {
 
   // Bottom dock panel state
   const [isBottomOpen, setIsBottomOpen] = useState(true)
-  const [bottomTab, setBottomTab] = useState<'terminal' | 'logs'>('terminal')
+  const [bottomTab, setBottomTab] = useState<'terminal' | 'shell' | 'logs'>('terminal')
   const [selectedAgent, setSelectedAgent] = useState<string>('orchestrator')
   const [agentsConfig, setAgentsConfig] = useState<AgentsConfig | null>(null)
   const [agentLogs, setAgentLogs] = useState<Record<string, string[]>>({})
@@ -99,8 +132,94 @@ export function IDEView() {
   const monacoRef = useRef<any>(null)
   const [availableModels, setAvailableModels] = useState<ModelOption[]>([])
 
+  // Keep the editor sized in lockstep with the side-panel width animation, and
+  // fade the minimap out/in instead of hard-toggling it. The minimap is a
+  // Monaco-managed canvas, so we animate its DOM node's opacity directly, then
+  // actually remove/re-add it via the `minimapOn` option so it never repaints
+  // (flickers) mid-resize.
+  const layoutRaf = useRef<number | null>(null)
+  const minimapHideTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  const getMinimapNode = (): HTMLElement | null => {
+    try { return editorRef.current?.getDomNode()?.querySelector('.minimap') ?? null }
+    catch { return null }
+  }
+
+  const startLayoutSync = useCallback(() => {
+    // Fade the minimap out, then remove it.
+    if (minimapHideTimer.current) clearTimeout(minimapHideTimer.current)
+    const node = getMinimapNode()
+    if (node) {
+      // ease-out so opacity drops fast on the first frames — otherwise the
+      // minimap stays near-opaque while layout() resizes it → brief flicker.
+      node.style.transition = 'opacity 140ms ease-out'
+      node.style.opacity = '0'
+      node.style.pointerEvents = 'none'
+      minimapHideTimer.current = setTimeout(() => setMinimapOn(false), 140)
+    } else {
+      setMinimapOn(false)
+    }
+
+    if (layoutRaf.current != null) return
+    const tick = () => {
+      try { editorRef.current?.layout() } catch { /* ignore */ }
+      layoutRaf.current = requestAnimationFrame(tick)
+    }
+    layoutRaf.current = requestAnimationFrame(tick)
+  }, [])
+
+  const stopLayoutSync = useCallback(() => {
+    if (layoutRaf.current != null) { cancelAnimationFrame(layoutRaf.current); layoutRaf.current = null }
+    // One final layout to settle at the exact end width, then surface the minimap.
+    try { editorRef.current?.layout() } catch { /* ignore */ }
+    if (minimapHideTimer.current) { clearTimeout(minimapHideTimer.current); minimapHideTimer.current = null }
+    setMinimapOn(true)
+  }, [])
+
+  // When the minimap is re-enabled, Monaco recreates its node at rest; start it
+  // hidden and fade it back in on the next frame.
+  useEffect(() => {
+    if (!minimapOn) return
+    let raf1 = 0, raf2 = 0
+    raf1 = requestAnimationFrame(() => {
+      const node = getMinimapNode()
+      if (!node) return
+      node.style.transition = 'none'
+      node.style.opacity = '0'
+      // Force a reflow so the starting state sticks before we transition.
+      void node.offsetHeight
+      raf2 = requestAnimationFrame(() => {
+        node.style.transition = 'opacity 240ms ease-out'
+        node.style.opacity = '1'
+        node.style.pointerEvents = ''
+      })
+    })
+    return () => { cancelAnimationFrame(raf1); cancelAnimationFrame(raf2) }
+  }, [minimapOn])
+
   // Inline "Ask AI" edit controller, bound to the active file's language.
   const inlineAI = useInlineAIEdit(editorRef, monacoRef, detectLanguage(activeTab || ''))
+
+  // Snapshot of the current editor context for the chat panel (called fresh
+  // at send time so the model always sees the latest file + selection).
+  const getChatContext = useCallback(() => {
+    if (!activeTab) return null
+    const content = fileContents[activeTab] ?? ''
+    let selection: string | undefined
+    const editor = editorRef.current
+    if (editor) {
+      const sel = editor.getSelection()
+      if (sel && !sel.isEmpty()) {
+        selection = editor.getModel()?.getValueInRange(sel) || undefined
+      }
+    }
+    return {
+      path: activeTab,
+      language: detectLanguage(activeTab),
+      content,
+      selection,
+    }
+  }, [activeTab, fileContents])
 
   // Scan workspace files
   const refreshWorkspace = useCallback(async () => {
@@ -121,17 +240,46 @@ export function IDEView() {
     setGitChanges(changes)
   }
 
+  // Load workspace root info
+  const loadWorkspaceInfo = useCallback(async () => {
+    const info = await window.api.workspaceGetRoot()
+    setWorkspaceName(info.name)
+    setRecentWorkspaces(info.recent ?? [])
+  }, [])
+
+  // Switch to a different workspace folder, then reset editor state.
+  const switchWorkspace = useCallback(async (dir?: string) => {
+    const res = dir
+      ? await window.api.workspaceSetRoot(dir)
+      : await window.api.workspaceOpenDialog()
+    if (!res.ok) return
+    setShowWorkspaceMenu(false)
+    setOpenTabs([])
+    setActiveTab(null)
+    setFileContents({})
+    setOriginalContents({})
+    setDirtyFiles({})
+    await loadWorkspaceInfo()
+    await refreshWorkspace()
+  }, [loadWorkspaceInfo])
+
   // Load agents config to get the list of active agents
   useEffect(() => {
     window.api.getAgentsConfig().then((cfg) => {
       setAgentsConfig(cfg)
       setAvailableModels(cfg.available_models ?? [])
     })
+    loadWorkspaceInfo()
     refreshWorkspace()
-  }, [refreshWorkspace])
+  }, [refreshWorkspace, loadWorkspaceInfo])
 
   // Get active agents list
   const agentsList = activeAgents(agentsConfig)
+  // The AI Agents tab shows only resident coordination agents (planner,
+  // orchestrator). Engineers/reviewers run as ephemeral group sessions and live
+  // in the Groups panel instead. The bottom-dock PTY dropdown still uses the
+  // full agentsList so a resident agent's terminal stays reachable.
+  const residentAgents = agentsList.filter(isResidentRole)
 
   // Periodically refresh Git status and live logs
   useEffect(() => {
@@ -220,6 +368,38 @@ export function IDEView() {
     }
   }
 
+  // Open a file and jump the editor to a specific line/column (search results).
+  const openFileAtLine = useCallback(async (relPath: string, line: number, column: number) => {
+    setDiffMode(false)
+    await openFile(relPath)
+    // Give Monaco a tick to mount/switch models before revealing.
+    setTimeout(() => {
+      const editor = editorRef.current
+      if (!editor) return
+      editor.revealLineInCenter(line)
+      editor.setPosition({ lineNumber: line, column: Math.max(1, column) })
+      editor.focus()
+    }, 120)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [openTabs, gitChanges])
+
+  // Flatten the file tree into relative paths for quick-open.
+  const flatFiles = useMemo(() => {
+    const out: string[] = []
+    const walk = (nodes: FileNode[]) => {
+      for (const n of nodes) {
+        if (n.isDir) { if (n.children) walk(n.children) }
+        else out.push(n.relPath)
+      }
+    }
+    walk(files)
+    return out
+  }, [files])
+
+  // Command palette / quick-open state.
+  const [paletteOpen, setPaletteOpen] = useState(false)
+  const [paletteMode, setPaletteMode] = useState<'commands' | 'files'>('files')
+
   // Handle close tab
   const closeTab = (e: React.MouseEvent, relPath: string) => {
     e.stopPropagation()
@@ -257,17 +437,85 @@ export function IDEView() {
     }
   }
 
-  // Handle keyboard shortcut for Save (Cmd+S / Ctrl+S)
+  // ── File operations (create / rename / delete) ──────────────
+  const createFilePrompt = useCallback(async (parentDir: string) => {
+    const name = window.prompt(`New file name${parentDir ? ' in ' + parentDir : ''}:`)
+    if (!name) return
+    const rel = parentDir ? `${parentDir}/${name}` : name
+    const res = await window.api.workspaceCreateFile(rel)
+    if (!res.ok) { alert(res.error); return }
+    await refreshWorkspace()
+    openFile(rel)
+  }, [refreshWorkspace])
+
+  const createFolderPrompt = useCallback(async (parentDir: string) => {
+    const name = window.prompt(`New folder name${parentDir ? ' in ' + parentDir : ''}:`)
+    if (!name) return
+    const rel = parentDir ? `${parentDir}/${name}` : name
+    const res = await window.api.workspaceCreateFolder(rel)
+    if (!res.ok) { alert(res.error); return }
+    await refreshWorkspace()
+  }, [refreshWorkspace])
+
+  const renamePrompt = useCallback(async (relPath: string) => {
+    const parts = relPath.split('/')
+    const cur = parts[parts.length - 1]
+    const next = window.prompt('Rename to:', cur)
+    if (!next || next === cur) return
+    parts[parts.length - 1] = next
+    const toRel = parts.join('/')
+    const res = await window.api.workspaceRename(relPath, toRel)
+    if (!res.ok) { alert(res.error); return }
+    // Update any open tab pointing at the renamed file.
+    setOpenTabs((tabs) => tabs.map((t) => (t === relPath ? toRel : t)))
+    setActiveTab((t) => (t === relPath ? toRel : t))
+    await refreshWorkspace()
+  }, [refreshWorkspace])
+
+  const deletePrompt = useCallback(async (relPath: string) => {
+    if (!window.confirm(`Delete "${relPath}"? This cannot be undone.`)) return
+    const res = await window.api.workspaceDelete(relPath)
+    if (!res.ok) { alert(res.error); return }
+    setOpenTabs((tabs) => tabs.filter((t) => t !== relPath))
+    setActiveTab((t) => (t === relPath ? null : t))
+    await refreshWorkspace()
+  }, [refreshWorkspace])
+
+  // Handle keyboard shortcut for Save (Cmd+S / Ctrl+S) + palette shortcuts.
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === 's') {
+      const mod = e.metaKey || e.ctrlKey
+      if (mod && e.key === 's') {
         e.preventDefault()
         saveActiveFile()
+      } else if (mod && e.shiftKey && (e.key === 'P' || e.key === 'p')) {
+        e.preventDefault()
+        setPaletteMode('commands'); setPaletteOpen(true)
+      } else if (mod && !e.shiftKey && (e.key === 'p' || e.key === 'P')) {
+        e.preventDefault()
+        setPaletteMode('files'); setPaletteOpen(true)
+      } else if (mod && e.shiftKey && (e.key === 'F' || e.key === 'f')) {
+        e.preventDefault()
+        setActiveSidebar('search'); setIsSidebarOpen(true)
       }
     }
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
   }, [activeTab, fileContents, dirtyFiles])
+
+  // Commands for the palette.
+  const paletteCommands: Command[] = useMemo(() => [
+    { id: 'save', label: 'File: Save', hint: 'Ctrl+S', run: () => saveActiveFile() },
+    { id: 'newfile', label: 'File: New File', run: () => createFilePrompt('') },
+    { id: 'newfolder', label: 'File: New Folder', run: () => createFolderPrompt('') },
+    { id: 'openfolder', label: 'Workspace: Open Folder…', run: () => switchWorkspace() },
+    { id: 'search', label: 'Search: Find in Files', hint: 'Ctrl+Shift+F', run: () => { setActiveSidebar('search'); setIsSidebarOpen(true) } },
+    { id: 'git', label: 'View: Source Control', run: () => { setActiveSidebar('git'); setIsSidebarOpen(true) } },
+    { id: 'explorer', label: 'View: Explorer', run: () => { setActiveSidebar('explorer'); setIsSidebarOpen(true) } },
+    { id: 'refresh', label: 'Workspace: Refresh', run: () => refreshWorkspace() },
+    { id: 'quickopen', label: 'Go to File…', hint: 'Ctrl+P', run: () => { setPaletteMode('files'); setPaletteOpen(true) } },
+  ], [createFilePrompt, createFolderPrompt, switchWorkspace, refreshWorkspace])
+
 
   // Custom theme initialization for Monaco
   const handleEditorDidMount = (editor: any, monaco: any) => {
@@ -319,6 +567,19 @@ export function IDEView() {
           }}
         />
         <ActivityButton
+          icon={<SearchIcon size={20} />}
+          label="Search (Ctrl+Shift+F)"
+          active={activeSidebar === 'search' && isSidebarOpen}
+          onClick={() => {
+            if (activeSidebar === 'search' && isSidebarOpen) {
+              setIsSidebarOpen(false)
+            } else {
+              setActiveSidebar('search')
+              setIsSidebarOpen(true)
+            }
+          }}
+        />
+        <ActivityButton
           icon={
             <div className="relative">
               <GitBranch size={20} />
@@ -353,7 +614,26 @@ export function IDEView() {
             }
           }}
         />
+        <ActivityButton
+          icon={<Boxes size={20} />}
+          label="Agent Groups"
+          active={activeSidebar === 'groups' && isSidebarOpen}
+          onClick={() => {
+            if (activeSidebar === 'groups' && isSidebarOpen) {
+              setIsSidebarOpen(false)
+            } else {
+              setActiveSidebar('groups')
+              setIsSidebarOpen(true)
+            }
+          }}
+        />
         <div className="mt-auto flex flex-col gap-4">
+          <ActivityButton
+            icon={<MessagesSquare size={20} />}
+            label="AI Chat"
+            active={chatOpen}
+            onClick={() => setChatOpen((v) => !v)}
+          />
           <ActivityButton
             icon={<RefreshCw size={18} className={loadingWorkspace ? 'animate-spin text-blue-400' : ''} />}
             label="Refresh Workspace"
@@ -363,79 +643,140 @@ export function IDEView() {
         </div>
       </nav>
 
-      {/* 2. Expandable Sidebar Panel */}
-      {isSidebarOpen && (
-        <aside className="w-64 border-r border-zinc-800 bg-zinc-950/40 backdrop-blur-md flex flex-col flex-shrink-0 overflow-hidden transition-all duration-300">
-          {/* Header */}
-          <div className="h-10 px-3 border-b border-zinc-800 flex items-center justify-between text-xs font-semibold uppercase tracking-wider text-zinc-400">
-            <span>
-              {activeSidebar === 'explorer' && 'Workspace Explorer'}
-              {activeSidebar === 'git' && 'Source Control'}
-              {activeSidebar === 'agents' && 'AI Agents Cost & Status'}
-            </span>
-            <button
-              onClick={() => setIsSidebarOpen(false)}
-              className="text-zinc-500 hover:text-zinc-300 p-0.5 rounded transition-colors"
+      {/* 2. Expandable Sidebar Panel — animates its width so the editor shrinks
+          smoothly with it (no instant black gap). Inner content is fixed-width
+          and clipped by overflow-hidden, so it doesn't reflow during the width
+          animation. */}
+      <AnimatePresence>
+        {isSidebarOpen && (
+          <motion.aside
+            className="border-r border-zinc-800 bg-zinc-950/40 backdrop-blur-md flex-shrink-0 overflow-hidden"
+            initial={animationsOn ? { width: 0 } : false}
+            animate={{ width: 256 }}
+            exit={{ width: 0 }}
+            transition={{ duration: 0.26, ease: 'easeInOut' }}
+            onAnimationStart={startLayoutSync}
+            onAnimationComplete={stopLayoutSync}
+          >
+            <motion.div
+              key={activeSidebar}
+              className="w-64 h-full flex flex-col"
+              variants={animationsOn ? SIDEBAR_CONTAINER : undefined}
+              initial={animationsOn ? 'hidden' : false}
+              animate={animationsOn ? 'show' : false}
             >
-              <Layout size={14} />
+          {/* Workspace selector bar */}
+          <motion.div
+            variants={animationsOn ? SIDEBAR_ITEM : undefined}
+            initial={animationsOn ? 'hidden' : false}
+            animate={animationsOn ? 'show' : false}
+            className="relative h-8 px-2 border-b border-zinc-800 flex items-center gap-1 bg-zinc-950/60"
+          >
+            <button
+              onClick={() => setShowWorkspaceMenu((v) => !v)}
+              className="flex-1 min-w-0 flex items-center gap-1.5 text-left text-xs font-semibold text-zinc-200 hover:text-white truncate"
+              title={workspaceName}
+            >
+              <FolderOpen size={13} className="text-zinc-500 flex-shrink-0" />
+              <span className="truncate">{workspaceName || 'workspace'}</span>
+              <ChevronDown size={12} className="text-zinc-600 flex-shrink-0" />
             </button>
-          </div>
+            {showWorkspaceMenu && (
+              <div className="absolute z-30 left-2 top-8 w-60 bg-zinc-900 border border-zinc-700 rounded shadow-xl py-1">
+                <button
+                  onClick={() => switchWorkspace()}
+                  className="w-full text-left px-3 py-1.5 text-xs text-zinc-200 hover:bg-zinc-800 flex items-center gap-2"
+                >
+                  <FolderOpen size={12} /> Open Folder…
+                </button>
+                {recentWorkspaces.length > 0 && (
+                  <div className="border-t border-zinc-800 mt-1 pt-1">
+                    <div className="px-3 py-1 text-[9px] uppercase tracking-wider text-zinc-600">Recent</div>
+                    {recentWorkspaces.map((d) => (
+                      <button
+                        key={d}
+                        onClick={() => switchWorkspace(d)}
+                        className="w-full text-left px-3 py-1.5 text-xs text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200 truncate"
+                        title={d}
+                      >
+                        {d.split(/[\\/]/).pop()}
+                        <span className="text-zinc-600 ml-1 text-[10px]">{d}</span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </motion.div>
+
+          {/* Header */}
+          <motion.div
+            variants={animationsOn ? SIDEBAR_ITEM : undefined}
+            initial={animationsOn ? 'hidden' : false}
+            animate={animationsOn ? 'show' : false}
+            className="h-9 px-3 border-b border-zinc-800 flex items-center justify-between text-xs font-semibold uppercase tracking-wider text-zinc-400"
+          >
+            <span>
+              {activeSidebar === 'explorer' && 'Explorer'}
+              {activeSidebar === 'search' && 'Search'}
+              {activeSidebar === 'git' && 'Source Control'}
+              {activeSidebar === 'agents' && 'AI Agents'}
+              {activeSidebar === 'groups' && 'Agent Groups'}
+            </span>
+            <div className="flex items-center gap-1">
+              {activeSidebar === 'explorer' && (
+                <>
+                  <button onClick={() => createFilePrompt('')} title="New File" className="text-zinc-500 hover:text-zinc-200 p-0.5">
+                    <FilePlus size={13} />
+                  </button>
+                  <button onClick={() => createFolderPrompt('')} title="New Folder" className="text-zinc-500 hover:text-zinc-200 p-0.5">
+                    <FolderPlus size={13} />
+                  </button>
+                  <button onClick={refreshWorkspace} title="Refresh" className="text-zinc-500 hover:text-zinc-200 p-0.5">
+                    <RefreshCw size={12} className={loadingWorkspace ? 'animate-spin text-blue-400' : ''} />
+                  </button>
+                </>
+              )}
+              <button
+                onClick={() => setIsSidebarOpen(false)}
+                className="text-zinc-500 hover:text-zinc-300 p-0.5 rounded transition-colors"
+              >
+                <Layout size={14} />
+              </button>
+            </div>
+          </motion.div>
 
           {/* Content */}
-          <div className="flex-1 overflow-y-auto p-2 scrollbar-thin">
+          <motion.div
+            variants={animationsOn ? SIDEBAR_ITEM : undefined}
+            initial={animationsOn ? 'hidden' : false}
+            animate={animationsOn ? 'show' : false}
+            className={`flex-1 overflow-y-auto scrollbar-thin ${activeSidebar === 'search' || activeSidebar === 'git' ? '' : 'p-2'}`}
+          >
             {activeSidebar === 'explorer' && (
               <IDEFileTree
                 files={files}
                 selectedFile={activeTab}
                 onSelectFile={openFile}
                 gitChanges={gitChanges}
+                onRename={renamePrompt}
+                onDelete={deletePrompt}
+                onNewFile={createFilePrompt}
+                onNewFolder={createFolderPrompt}
               />
             )}
 
+            {activeSidebar === 'search' && (
+              <SearchPanel onOpenResult={openFileAtLine} />
+            )}
+
             {activeSidebar === 'git' && (
-              <div className="flex flex-col gap-2">
-                <div className="text-[10px] text-zinc-500 font-medium px-2 py-1 uppercase tracking-wider">
-                  Uncommitted Changes ({gitChanges.length})
-                </div>
-                {gitChanges.length === 0 ? (
-                  <div className="text-xs text-zinc-600 px-2 py-4 text-center italic">
-                    No files changed. Clean working tree.
-                  </div>
-                ) : (
-                  <div className="flex flex-col gap-0.5">
-                    {gitChanges.map((change) => {
-                      const isMod = change.type === 'M'
-                      return (
-                        <div
-                          key={change.file}
-                          onClick={() => openFile(change.file)}
-                          className={`flex items-center justify-between px-2 py-1.5 rounded cursor-pointer transition-all ${
-                            activeTab === change.file
-                              ? 'bg-zinc-800/80 text-white font-medium shadow-sm'
-                              : 'text-zinc-400 hover:bg-zinc-900/60 hover:text-zinc-200'
-                          }`}
-                        >
-                          <span className="text-xs truncate font-mono flex-1">{change.file}</span>
-                          <span
-                            className={`text-[9px] font-bold px-1.5 py-0.5 rounded-sm scale-90 ${
-                              isMod
-                                ? 'bg-amber-500/10 text-amber-400 border border-amber-500/20'
-                                : 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20'
-                            }`}
-                          >
-                            {change.type}
-                          </span>
-                        </div>
-                      )
-                    })}
-                  </div>
-                )}
-              </div>
+              <GitPanel onOpenFile={openFile} onChanged={refreshWorkspace} />
             )}
 
             {activeSidebar === 'agents' && (
               <div className="flex flex-col gap-3 p-1">
-                {agentsList.map((agent) => (
+                {residentAgents.map((agent) => (
                   <div
                     key={agent}
                     onClick={() => {
@@ -462,11 +803,22 @@ export function IDEView() {
                     </div>
                   </div>
                 ))}
+                <div className="mt-1 px-2 py-2 rounded-lg border border-dashed border-zinc-800/80 text-[10px] text-zinc-500 leading-relaxed">
+                  Engineers and reviewers now run as ephemeral worker/reviewer
+                  sessions. See the <span className="text-zinc-300">Agent Groups</span> tab
+                  to watch them work.
+                </div>
               </div>
             )}
-          </div>
-        </aside>
-      )}
+
+            {activeSidebar === 'groups' && (
+              <GroupsPanel windup={animationsOn} />
+            )}
+          </motion.div>
+            </motion.div>
+          </motion.aside>
+        )}
+      </AnimatePresence>
 
       {/* 3. Editor & Terminal Dashboard Workspace */}
       <section className="flex-1 flex flex-col overflow-hidden bg-zinc-950">
@@ -599,7 +951,7 @@ export function IDEView() {
                       fontSize: 13,
                       lineHeight: 1.5,
                       fontFamily: 'ui-monospace, SF Mono, JetBrains Mono, Consolas, monospace',
-                      minimap: { enabled: true },
+                      minimap: { enabled: minimapOn },
                       scrollBeyondLastLine: false,
                       wordWrap: 'on',
                       tabSize: 4,
@@ -628,21 +980,31 @@ export function IDEView() {
               )}
             </div>
           ) : (
-            <div className="flex-1 flex flex-col items-center justify-center text-zinc-500 select-none bg-zinc-950">
-              <Layers size={40} className="text-zinc-800 mb-3 animate-pulse" />
-              <p className="text-sm font-semibold">VSCode Workspace IDE View</p>
-              <p className="text-xs text-zinc-700 mt-1 max-w-xs text-center">
-                Select a file from the Explorer sidebar or view changes in the Source Control tab to open them in Monaco Editor with live AI-execution highlighting.
-              </p>
-              <div className="mt-5 grid grid-cols-2 gap-x-6 gap-y-2 max-w-sm text-zinc-600 text-[10px] font-mono border-t border-zinc-900 pt-4">
-                <span className="text-right">Open File:</span>
-                <span className="text-zinc-500">Click Explorer item</span>
-                <span className="text-right">Save Changes:</span>
-                <span className="text-zinc-500">Cmd + S</span>
-                <span className="text-right">Live Code Diff:</span>
-                <span className="text-zinc-500">Enable Diff View</span>
-                <span className="text-right">Active Agent Terminal:</span>
-                <span className="text-zinc-500">Click Agents sidebar</span>
+            <div className="relative flex-1 flex flex-col items-center justify-center text-zinc-500 select-none bg-zinc-950 overflow-hidden">
+              {/* Debossed logo watermark */}
+              <OrqonLogo
+                mono
+                size={275}
+                className="absolute text-zinc-700/45 pointer-events-none"
+                style={{ transform: 'translateY(52px)' }}
+              />
+
+              <div className="relative flex flex-col items-center px-10 py-8">
+                <p className="text-lg font-semibold tracking-wide text-zinc-300">Orqon</p>
+                <p className="text-xs text-zinc-600 mt-1 max-w-sm text-center leading-relaxed">
+                  Open a workspace to begin orchestrating AI agents across your codebase.
+                </p>
+
+                <div className="mt-8 grid grid-cols-[auto_auto] gap-x-4 gap-y-2 text-[11px] text-zinc-600 border-t border-zinc-800/70 pt-5">
+                  <span className="text-right text-zinc-500">Command Palette</span>
+                  <span><Kbd>Ctrl</Kbd> <Kbd>Shift</Kbd> <Kbd>P</Kbd></span>
+                  <span className="text-right text-zinc-500">Open File</span>
+                  <span><Kbd>Ctrl</Kbd> <Kbd>P</Kbd></span>
+                  <span className="text-right text-zinc-500">Search Workspace</span>
+                  <span><Kbd>Ctrl</Kbd> <Kbd>Shift</Kbd> <Kbd>F</Kbd></span>
+                  <span className="text-right text-zinc-500">Save Changes</span>
+                  <span><Kbd>Ctrl</Kbd> <Kbd>S</Kbd></span>
+                </div>
               </div>
             </div>
           )}
@@ -674,7 +1036,22 @@ export function IDEView() {
                   Agent Live Terminal ({selectedAgent})
                 </span>
               </button>
-              
+
+              <button
+                onClick={() => {
+                  setBottomTab('shell')
+                  setIsBottomOpen(true)
+                }}
+                className={`py-1 px-2 rounded-md transition-all ${
+                  bottomTab === 'shell' && isBottomOpen ? 'text-white bg-zinc-800 font-bold' : 'text-zinc-500 hover:text-zinc-300'
+                }`}
+              >
+                <span className="flex items-center gap-1">
+                  <TerminalIcon size={12} />
+                  Shell
+                </span>
+              </button>
+
               <button
                 onClick={() => {
                   setBottomTab('logs')
@@ -719,6 +1096,10 @@ export function IDEView() {
                 <div className="h-full w-full relative">
                   <AgentTerminal key={selectedAgent} agent={selectedAgent} active={isBottomOpen && bottomTab === 'terminal'} />
                 </div>
+              ) : bottomTab === 'shell' ? (
+                <div className="h-full w-full relative">
+                  <ShellTerminal id="main-shell" active={isBottomOpen && bottomTab === 'shell'} />
+                </div>
               ) : (
                 <div className="h-full w-full bg-zinc-950 p-2 overflow-y-auto font-mono text-[11px] text-zinc-400 select-text scrollbar-thin">
                   {agentLogs[selectedAgent] && agentLogs[selectedAgent].length > 0 ? (
@@ -739,6 +1120,37 @@ export function IDEView() {
         </div>
 
       </section>
+
+      {/* AI Chat side panel — animates its width so the editor (flex-1) shrinks
+          smoothly alongside it. The inner content keeps a fixed width and is
+          clipped by overflow-hidden, so it never reflows/repaints while the
+          outer width animates (that clipping is what stops Monaco flicker). */}
+      <AnimatePresence>
+        {chatOpen && (
+          <motion.aside
+            className="border-l border-zinc-800 bg-zinc-950 flex-shrink-0 overflow-hidden"
+            initial={animationsOn ? { width: 0 } : false}
+            animate={{ width: 360 }}
+            exit={animationsOn ? { width: 0 } : { width: 0 }}
+            transition={{ duration: 0.26, ease: 'easeInOut' }}
+            onAnimationStart={startLayoutSync}
+            onAnimationComplete={stopLayoutSync}
+          >
+            <div className="w-[360px] h-full">
+              <ChatPanel models={availableModels} getContext={getChatContext} windup={animationsOn} />
+            </div>
+          </motion.aside>
+        )}
+      </AnimatePresence>
+
+      <CommandPalette
+        open={paletteOpen}
+        mode={paletteMode}
+        commands={paletteCommands}
+        files={flatFiles}
+        onClose={() => setPaletteOpen(false)}
+        onOpenFile={openFile}
+      />
     </div>
   )
 }
@@ -763,5 +1175,13 @@ function ActivityButton({ icon, label, active, onClick }: ActivityButtonProps) {
     >
       {icon}
     </button>
+  )
+}
+
+function Kbd({ children }: { children: React.ReactNode }) {
+  return (
+    <kbd className="inline-block min-w-[20px] text-center px-1.5 py-0.5 rounded border border-zinc-700 bg-zinc-900 text-[10px] font-mono text-zinc-400">
+      {children}
+    </kbd>
   )
 }

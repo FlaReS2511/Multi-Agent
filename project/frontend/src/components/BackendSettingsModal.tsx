@@ -7,7 +7,9 @@ import {
   ProviderBlock,
   BackendSettings,
   providerNeedsKey,
+  OrchestrationConfig,
 } from '../lib/api'
+import { useAnimationsEnabled, setAnimationsEnabled } from '../lib/uiSettings'
 
 const PROVIDER_KINDS: ProviderKind[] = ['openai-compatible', 'anthropic', 'openai', 'google']
 
@@ -21,9 +23,12 @@ export function BackendSettingsModal({ open, onClose }: Props) {
   const [savingAgent, setSavingAgent] = useState<string | null>(null)
   const [savingKey, setSavingKey] = useState<string | null>(null)
   const [error, setError] = useState<string>('')
+  const animationsOn = useAnimationsEnabled()
+  const [orch, setOrch] = useState<OrchestrationConfig | null>(null)
 
   const refresh = useCallback(async () => {
     setSettings(await window.api.getBackendSettings())
+    setOrch(await window.api.orchestrationGet())
   }, [])
 
   useEffect(() => { if (open) refresh() }, [open, refresh])
@@ -160,8 +165,159 @@ export function BackendSettingsModal({ open, onClose }: Props) {
             }}
           />
         </section>
+
+        {/* Orchestration (v2 group coordinator) */}
+        {orch && (
+          <OrchestrationSection
+            orch={orch}
+            onChange={async (patch) => {
+              const res = await window.api.orchestrationSet(patch)
+              if (res.ok) setOrch(res.orchestration)
+            }}
+          />
+        )}
+
+        {/* Interface */}
+        <section className="px-5 pb-6 border-t border-zinc-800 pt-5">
+          <h3 className="text-[11px] uppercase tracking-wider text-zinc-500 mb-3">Interface</h3>
+          <label className="flex items-center justify-between gap-4 cursor-pointer group">
+            <div>
+              <div className="text-xs text-zinc-200 font-medium">Animations</div>
+              <div className="text-[11px] text-zinc-500 mt-0.5">
+                Panel slide-in and content wind-up effects. Turn off for instant, motion-free transitions.
+              </div>
+            </div>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={animationsOn}
+              onClick={() => setAnimationsEnabled(!animationsOn)}
+              className={`relative w-10 h-5 rounded-full flex-shrink-0 p-0.5 flex items-center transition-colors ${
+                animationsOn ? 'bg-blue-600' : 'bg-zinc-700'
+              }`}
+            >
+              <span
+                className={`size-4 rounded-full bg-white shadow-sm transition-transform will-change-transform ${
+                  animationsOn ? 'translate-x-5' : 'translate-x-0'
+                }`}
+              />
+            </button>
+          </label>
+        </section>
       </div>
     </div>
+  )
+}
+
+// ── Orchestration (v2 group coordinator) settings ──────────────
+
+interface OrchestrationSectionProps {
+  orch: OrchestrationConfig
+  onChange: (patch: Partial<OrchestrationConfig>) => Promise<void>
+}
+
+const ORCH_NUM_FIELDS: { key: keyof OrchestrationConfig; label: string; hint: string }[] = [
+  { key: 'max_concurrent_groups', label: 'Max concurrent groups', hint: 'Groups running at once' },
+  { key: 'max_groups_per_task', label: 'Max groups per task', hint: 'Total incl. sub-groups' },
+  { key: 'max_recursion_depth', label: 'Max recursion depth', hint: 'How deep sub-groups nest' },
+  { key: 'budget_per_task_usd', label: 'Budget per task ($)', hint: 'Hard cap; task stops if exceeded' },
+  { key: 'budget_per_group_usd', label: 'Budget per group ($)', hint: 'Hard cap per group' },
+  { key: 'max_retries_per_group', label: 'Max retries per group', hint: 'worker→review→worker rounds' },
+  { key: 'heartbeat_timeout_sec', label: 'Heartbeat timeout (s)', hint: 'Hung group → respawn/fail' },
+]
+
+function OrchestrationSection({ orch, onChange }: OrchestrationSectionProps) {
+  return (
+    <section className="px-5 pb-5 border-t border-zinc-800 pt-5">
+      <h3 className="text-[11px] uppercase tracking-wider text-zinc-500 mb-3">
+        Agent Orchestration (v2)
+      </h3>
+
+      <label className="flex items-center justify-between gap-4 cursor-pointer mb-4">
+        <div>
+          <div className="text-xs text-zinc-200 font-medium">Enable group coordinator</div>
+          <div className="text-[11px] text-zinc-500 mt-0.5">
+            Spawns worker + on-demand reviewer groups per task, with hard budget and
+            concurrency caps. Off by default — the classic inbox flow keeps working.
+          </div>
+        </div>
+        <button
+          type="button"
+          role="switch"
+          aria-checked={orch.enabled}
+          onClick={() => onChange({ enabled: !orch.enabled })}
+          className={`relative w-10 h-5 rounded-full flex-shrink-0 p-0.5 flex items-center transition-colors ${
+            orch.enabled ? 'bg-blue-600' : 'bg-zinc-700'
+          }`}
+        >
+          <span
+            className={`size-4 rounded-full bg-white shadow-sm transition-transform will-change-transform ${
+              orch.enabled ? 'translate-x-5' : 'translate-x-0'
+            }`}
+          />
+        </button>
+      </label>
+
+      <div className={`grid grid-cols-2 gap-x-4 gap-y-3 ${orch.enabled ? '' : 'opacity-50 pointer-events-none'}`}>
+        {ORCH_NUM_FIELDS.map((f) => (
+          <NumberField
+            key={f.key}
+            label={f.label}
+            hint={f.hint}
+            value={Number(orch[f.key])}
+            step={f.key.includes('usd') ? 0.5 : 1}
+            onCommit={(v) => onChange({ [f.key]: v } as Partial<OrchestrationConfig>)}
+          />
+        ))}
+      </div>
+
+      <div className={`mt-4 ${orch.enabled ? '' : 'opacity-50 pointer-events-none'}`}>
+        <div className="text-xs text-zinc-200 font-medium mb-1">Review policy</div>
+        <select
+          value={orch.review_policy}
+          onChange={(e) => onChange({ review_policy: e.target.value })}
+          className="px-2 py-1 bg-zinc-950 border border-zinc-700 rounded text-xs text-zinc-100"
+        >
+          <option value="on-demand">On-demand (worker requests review)</option>
+          <option value="always">Always (review every group)</option>
+          <option value="never">Never (skip review, trust worker)</option>
+        </select>
+      </div>
+    </section>
+  )
+}
+
+interface NumberFieldProps {
+  label: string
+  hint: string
+  value: number
+  step: number
+  onCommit: (v: number) => void
+}
+
+function NumberField({ label, hint, value, step, onCommit }: NumberFieldProps) {
+  const [local, setLocal] = useState(String(value))
+  useEffect(() => { setLocal(String(value)) }, [value])
+  const commit = () => {
+    const n = Number(local)
+    if (!Number.isNaN(n) && n !== value) onCommit(n)
+    else setLocal(String(value))
+  }
+  return (
+    <label className="flex flex-col gap-1">
+      <span className="text-[11px] text-zinc-300 font-medium">{label}</span>
+      <input
+        type="number"
+        step={step}
+        min={0}
+        value={local}
+        onChange={(e) => setLocal(e.target.value)}
+        onBlur={commit}
+        onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur() }}
+        className="px-2 py-1 bg-zinc-950 border border-zinc-700 rounded text-xs text-zinc-100 w-full"
+      />
+      <span className="text-[10px] text-zinc-600">{hint}</span>
+    </label>
   )
 }
 
@@ -174,8 +330,7 @@ interface AgentRowProps {
   onSave: (provider: string, model?: string) => Promise<void>
 }
 
-function AgentRow({ agent, providerId, model, providers, saving, onSave }: AgentRowProps) {
-  const [prov, setProv] = useState(providerId)
+function AgentRow({ agent, providerId, model, providers, saving, onSave }: AgentRowProps) {  const [prov, setProv] = useState(providerId)
   const [mdl, setMdl] = useState(model)
 
   useEffect(() => { setProv(providerId); setMdl(model) }, [providerId, model])
