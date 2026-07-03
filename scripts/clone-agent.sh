@@ -72,11 +72,9 @@ mkdir -p "$DST_DIR/workspace"
 cp "$SRC_DIR/AGENT.md" "$DST_DIR/AGENT.md"
 echo "$BASE" > "$DST_DIR/.clone-of"
 
-# Ensure inbox file exists
-mkdir -p "$ROOT/shared/inbox"
-touch "$ROOT/shared/inbox/$INSTANCE.md"
-
-# Sync per-CLI context filenames (CLAUDE.md / GEMINI.md / AGENTS.md)
-"$ROOT/scripts/sync-agent-md.sh" >/dev/null 2>&1 || true
+# API-only: inboxes live in the DB (shared/state.db), keyed by role name, so no
+# inbox file is created. The runtime polls the DB for this instance's messages.
+# CLI-REVIVE: to support CLI agents again, recreate shared/inbox/$INSTANCE.md and
+# run scripts/sync-agent-md.sh here (see REDESIGN_PLAN.md).
 
 echo "$INSTANCE"

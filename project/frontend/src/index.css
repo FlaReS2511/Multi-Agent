@@ -26,3 +26,13 @@ html, body, #root {
 ::-webkit-scrollbar-thumb:hover {
   background: #52525b;
 }
+
+/* Inline AI edit: fading green highlight on freshly merged lines. */
+.inline-ai-accepted-line {
+  background: rgba(16, 185, 129, 0.18);
+  animation: inline-ai-fade 1.6s ease forwards;
+}
+@keyframes inline-ai-fade {
+  0% { background: rgba(16, 185, 129, 0.32); }
+  100% { background: rgba(16, 185, 129, 0); }
+}

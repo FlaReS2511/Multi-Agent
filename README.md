@@ -57,8 +57,8 @@
   - Code owns lifecycle, budgets, retries, concurrency, spawn/kill, and heartbeat checks.
   - LLM agents own implementation, review judgment, and task-specific reasoning.
 
-  A typical group flow:
-
+  A typical group flow:  
+  
   task
   -> worker group agent
   -> RequestReview

@@ -1,29 +1,22 @@
-import { app, BrowserWindow, ipcMain, safeStorage } from 'electron'
+import { app, BrowserWindow, ipcMain, safeStorage, dialog, Menu } from 'electron'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 import fs from 'node:fs/promises'
 import fsSync from 'node:fs'
 import { execFile } from 'node:child_process'
 import { createRequire } from 'node:module'
+import * as db from './db'
+import { streamInlineEdit, stripCodeFence, streamChat, InlineEditParams, ChatParams } from './ai-client'
+import { GroupCoordinator, DEFAULT_ORCHESTRATION, OrchestrationConfig } from './group-coordinator'
 const require = createRequire(import.meta.url)
-const pty = require('node-pty') as typeof import('node-pty')
-
-const TMUX_SESSION = 'multi-agent'
-
-function tmuxNotifyPlanner(): void {
-  // Best-effort: if tmux session "multi-agent" exists with a Planner pane,
-  // send "check inbox\r" so the tmux-side Planner agent picks up the new
-  // inbox message immediately. Silent failure if tmux not running.
-  execFile('tmux', ['list-panes', '-t', TMUX_SESSION, '-F', '#{pane_id} #{pane_current_path}'], (err, stdout) => {
-    if (err) return
-    const line = stdout.split('\n').find((l) => l.includes('agents/planner'))
-    if (!line) return
-    const paneId = line.split(' ')[0]
-    if (!paneId) return
-    execFile('tmux', ['send-keys', '-t', paneId, 'check inbox', 'Enter'], () => {
-      /* ignore */
-    })
-  })
+// node-pty is a native module that must be rebuilt for Electron. If it failed
+// to build (e.g. missing VS Build Tools on Windows), load it lazily so the app
+// still boots — only agent-terminal spawning is disabled until it's available.
+let pty: typeof import('node-pty') | null = null
+try {
+  pty = require('node-pty') as typeof import('node-pty')
+} catch (err) {
+  console.error('[node-pty] native module unavailable — agent terminals disabled:', err)
 }
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -32,6 +25,11 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 // dist-electron is at project/frontend/dist-electron, root is /Users/tom/Downloads/multi-agent
 const ROOT = path.resolve(__dirname, '..', '..', '..')
 const SHARED = path.join(ROOT, 'shared')
+
+// Initialize the SQLite source of truth (shared/state.db). All dynamic state
+// (tasks, messages, usage, secrets) lives here; agents-config.json stays a file.
+db.initDb(SHARED)
+
 // Base roles fixed at codebase level. Runtime set may include cloned instances
 // like `backend-engineer-2` whose names are runtime-only. Read via getRoles().
 const BASE_ROLES = [
@@ -59,12 +57,13 @@ async function getRoles(): Promise<string[]> {
   return BASE_ROLES.slice()
 }
 const PLANNER_DRAFT_PATH = path.join(ROOT, 'agents', 'planner', 'workspace', 'current-draft.md')
-const SECRETS_PATH = path.join(SHARED, '.secrets.json')
-const AGENT_RUNTIME = path.join(ROOT, 'scripts', 'agent_runtime.py')
+// The agent runtime is now a Node/TS entry built alongside the main process.
+// It runs as a child process via Electron's own Node (ELECTRON_RUN_AS_NODE=1).
+const AGENT_RUNTIME = path.join(__dirname, 'agent-runtime.js')
 
-type BackendKind = 'claude-cli' | 'codex-cli' | 'gemini-cli' | 'api-anthropic' | 'api-google' | 'api-openai' | 'lm-studio'
-type SecretProvider = 'anthropic' | 'google' | 'openai'
-const SECRET_PROVIDERS: SecretProvider[] = ['anthropic', 'google', 'openai']
+// Provider id is any string key under config.providers (e.g. 'vietapi',
+// 'anthropic'). Secrets are keyed by provider id.
+type SecretProvider = string
 
 // Lazy-spawn policy: pre-warm orchestrator + planner; spawn the rest on demand.
 const PRE_WARMED_AGENTS: readonly AgentName[] = ['orchestrator', 'planner'] as const
@@ -72,31 +71,59 @@ const PRE_WARMED_AGENTS: readonly AgentName[] = ['orchestrator', 'planner'] as c
 const IDLE_KILL_MS = 15 * 60 * 1000
 // How often the GC sweep runs.
 const GC_INTERVAL_MS = 60 * 1000
-// After a fresh spawn, wait this long before injecting "check inbox" so the CLI
-// has time to load context (CLAUDE.md/AGENT.md) and reach an interactive prompt.
-const CLI_WARMUP_MS = 5000
 
 let mainWindow: BrowserWindow | null = null
 
 function createWindow() {
+  // Remove the default application menu (File/Edit/View/Window/Help) entirely.
+  Menu.setApplicationMenu(null)
+
+  // Window/taskbar icon. In dev, __dirname is dist-electron; the build/ folder
+  // sits next to it under project/frontend. Prefer .ico on Windows.
+  const iconName = process.platform === 'win32' ? 'icon.ico' : 'icon.png'
+  const iconPath = path.join(__dirname, '..', 'build', iconName)
+  const icon = fsSync.existsSync(iconPath) ? iconPath : undefined
+
   mainWindow = new BrowserWindow({
     width: 1280,
     height: 820,
     minWidth: 900,
     minHeight: 600,
     backgroundColor: '#09090b',
-    titleBarStyle: 'hiddenInset',
+    frame: false,
+    titleBarStyle: 'hidden',
+    autoHideMenuBar: true,
+    ...(icon ? { icon } : {}),
     webPreferences: {
       preload: path.join(__dirname, 'preload.mjs'),
       contextIsolation: true,
       nodeIntegration: false,
     },
   })
+  mainWindow.setMenuBarVisibility(false)
+
+  mainWindow.on('maximize', () => mainWindow?.webContents.send('window-maximized-changed', true))
+  mainWindow.on('unmaximize', () => mainWindow?.webContents.send('window-maximized-changed', false))
+
+  // Toggle DevTools on demand (F12 / Ctrl+Shift+I) since it no longer auto-opens.
+  mainWindow.webContents.on('before-input-event', (_e, input) => {
+    if (input.type !== 'keyDown') return
+    const f12 = input.key === 'F12'
+    const ctrlShiftI = (input.control || input.meta) && input.shift && input.key.toLowerCase() === 'i'
+    if (f12 || ctrlShiftI) {
+      mainWindow?.webContents.toggleDevTools()
+    }
+  })
 
   const devUrl = process.env.VITE_DEV_SERVER_URL
   if (devUrl) {
     mainWindow.loadURL(devUrl)
-    mainWindow.webContents.openDevTools({ mode: 'detach' })
+    // DevTools stays closed by default — when open, Chromium paints a
+    // viewport-size (px) overlay on every window resize. Set OPEN_DEVTOOLS=1
+    // to enable it (or press F12 / Ctrl+Shift+I at runtime).
+    if (process.env.OPEN_DEVTOOLS === '1') {
+      mainWindow.webContents.openDevTools({ mode: 'detach' })
+    }
   } else {
     mainWindow.loadFile(path.join(__dirname, '..', 'dist', 'index.html'))
   }
@@ -104,56 +131,68 @@ function createWindow() {
 
 // ── IPC handlers ───────────────────────────────────────────────
 
-ipcMain.handle('get-tasks', async () => {
-  try {
-    const raw = await fs.readFile(path.join(SHARED, 'tasks.json'), 'utf-8')
-    return JSON.parse(raw)
-  } catch {
-    return { tasks: [], next_id: 1 }
+// Window controls (custom title bar)
+ipcMain.handle('window-minimize', () => {
+  mainWindow?.minimize()
+})
+ipcMain.handle('window-maximize-toggle', () => {
+  if (!mainWindow) return false
+  if (mainWindow.isMaximized()) {
+    mainWindow.unmaximize()
+    return false
   }
+  mainWindow.maximize()
+  return true
+})
+ipcMain.handle('window-close', () => {
+  mainWindow?.close()
+})
+ipcMain.handle('window-is-maximized', () => mainWindow?.isMaximized() ?? false)
+
+ipcMain.handle('get-tasks', async () => {
+  return db.getTasks()
 })
 
 ipcMain.handle('get-inbox-summary', async () => {
   const result: { agent: string; count: number; preview: string }[] = []
   for (const agent of await getRoles()) {
-    try {
-      const file = path.join(SHARED, 'inbox', `${agent}.md`)
-      const content = await fs.readFile(file, 'utf-8')
-      const count = (content.match(/^---$/gm) || []).length
-      const preview = content.slice(0, 400)
-      result.push({ agent, count, preview })
-    } catch {
-      result.push({ agent, count: 0, preview: '' })
-    }
+    const msgs = db.getUnreadFor(agent)
+    const preview = msgs.length > 0 ? msgs[0].body.slice(0, 400) : ''
+    result.push({ agent, count: msgs.length, preview })
   }
   return result
 })
 
 ipcMain.handle('get-inbox-content', async (_evt, agent: string) => {
-  try {
-    const file = path.join(SHARED, 'inbox', `${agent}.md`)
-    return await fs.readFile(file, 'utf-8')
-  } catch {
-    return ''
-  }
+  // Render unread messages back into the legacy markdown shape so existing
+  // renderer components keep working without changes.
+  const msgs = db.getUnreadFor(agent)
+  return msgs.map(messageToMarkdown).join('\n')
 })
 
 ipcMain.handle('get-logs', async () => {
   const result: { agent: string; lines: string[] }[] = []
   for (const agent of await getRoles()) {
-    try {
-      const file = path.join(SHARED, 'logs', `${agent}.log`)
-      const content = await fs.readFile(file, 'utf-8')
-      const lines = content.trim().split('\n').slice(-15).filter(Boolean)
-      result.push({ agent, lines })
-    } catch {
-      result.push({ agent, lines: [] })
-    }
+    result.push({ agent, lines: db.recentLogs(agent, 15) })
   }
   return result
 })
 
 ipcMain.handle('get-root', () => ROOT)
+
+// Render a DB message row back into the legacy markdown block shape, so that
+// renderer components built around the old inbox format keep working unchanged.
+function messageToMarkdown(m: db.MessageRow): string {
+  const lines = [
+    '',
+    `## [${m.ts}] FROM: ${m.from_role} | TO: ${m.to_role} | TASK: ${m.task_id || 'T-000'}`,
+  ]
+  if (m.subject) lines.push(`**Subject:** ${m.subject}`)
+  if (m.priority) lines.push(`**Priority:** ${m.priority}`)
+  if (m.deps) lines.push(`**Deps:** ${m.deps}`)
+  lines.push('', m.body, '', '---', '')
+  return lines.join('\n')
+}
 
 // ── Write handlers ──────────────────────────────────────────
 
@@ -172,24 +211,10 @@ interface CreateTaskInput {
   parent_id?: string | null
 }
 
-interface TaskRecord {
-  id: string
-  title: string
-  owner: string
-  status: string
-  deps: string[]
-  priority?: 'low' | 'medium' | 'high'
-  created_at: string
-  updated_at: string
-  artifact?: string
-  parent_id?: string | null
-  children?: string[]
-}
-
 const HTN_MAX_DEPTH = 2
 
-function validateParentForChild(tasks: TaskRecord[], parent_id: string): TaskRecord {
-  const parent = tasks.find((t) => t.id === parent_id)
+function validateParentForChild(parent_id: string): db.TaskRow {
+  const parent = db.getTask(parent_id)
   if (!parent) throw new Error(`parent task ${parent_id} not found`)
   if (parent.parent_id) {
     throw new Error(
@@ -199,72 +224,59 @@ function validateParentForChild(tasks: TaskRecord[], parent_id: string): TaskRec
   return parent
 }
 
-function buildInboxBlock(ts: string, owner: string, id: string, title: string,
-                         priority: string, deps: string[], description: string,
-                         parent_id?: string | null): string {
-  return [
-    '',
-    `## [${ts}] FROM: ui | TO: ${owner} | TASK: ${id}` + (parent_id ? `  (child of ${parent_id})` : ''),
-    `**Subject:** ${title}`,
-    `**Priority:** ${priority}`,
-    `**Deps:** ${deps.length > 0 ? deps.join(', ') : 'none'}`,
-    parent_id ? `**Parent:** ${parent_id}` : '',
-    '',
-    description || '(no description)',
-    '',
-    '---',
-    '',
-  ].filter((line) => line !== '').concat(['']).join('\n')
-}
-
 ipcMain.handle('create-task', async (_evt, input: CreateTaskInput) => {
-  const tasksPath = path.join(SHARED, 'tasks.json')
-  const raw = await fs.readFile(tasksPath, 'utf-8').catch(() => '{"tasks":[],"next_id":1}')
-  const data: { tasks: TaskRecord[]; next_id: number } = JSON.parse(raw)
-
-  // Depth=2 enforcement: child of a child is rejected
-  if (input.parent_id) {
-    validateParentForChild(data.tasks, input.parent_id)
-  }
-
-  const id = `T-${String(data.next_id).padStart(3, '0')}`
   const ts = nowStamp()
-  const task: TaskRecord = {
-    id,
-    title: input.title,
-    owner: input.owner,
-    status: 'todo',
-    deps: input.deps,
-    priority: input.priority,
-    created_at: ts,
-    updated_at: ts,
-    parent_id: input.parent_id ?? null,
-    children: [],
-  }
-  data.tasks.push(task)
-  data.next_id += 1
+  const result = db.transaction(() => {
+    if (input.parent_id) validateParentForChild(input.parent_id)
 
-  // Wire child into parent.children
-  if (input.parent_id) {
-    const parent = data.tasks.find((t) => t.id === input.parent_id)!
-    parent.children = [...(parent.children ?? []), id]
-    parent.updated_at = ts
-  }
+    const nextId = db.getNextId()
+    const id = `T-${String(nextId).padStart(3, '0')}`
+    const task: db.TaskRow = {
+      id,
+      title: input.title,
+      owner: input.owner,
+      status: 'todo',
+      deps: input.deps,
+      priority: input.priority,
+      created_at: ts,
+      updated_at: ts,
+      parent_id: input.parent_id ?? null,
+      children: [],
+    }
+    db.insertTask(task)
+    db.setNextId(nextId + 1)
 
-  await fs.writeFile(tasksPath, JSON.stringify(data, null, 2) + '\n')
+    // Wire child into parent.children
+    if (input.parent_id) {
+      const parent = db.getTask(input.parent_id)!
+      db.updateTaskFields(input.parent_id, {
+        children: [...(parent.children ?? []), id],
+        updated_at: ts,
+      })
+    }
 
-  const inboxPath = path.join(SHARED, 'inbox', `${input.owner}.md`)
-  const block = buildInboxBlock(ts, input.owner, id, input.title,
-    input.priority, input.deps, input.description, input.parent_id)
-  await fs.appendFile(inboxPath, block)
+    // Message to the owner (replaces inbox markdown append)
+    db.addMessage({
+      ts,
+      from_role: 'ui',
+      to_role: input.owner,
+      task_id: id,
+      subject: input.title,
+      priority: input.priority,
+      deps: input.deps.length > 0 ? input.deps.join(', ') : 'none',
+      body: input.description || '(no description)',
+      status: 'unread',
+    })
 
-  await fs.appendFile(
-    path.join(SHARED, 'logs', 'orchestrator.log'),
-    `[${ts}] ui created ${id} owner=${input.owner} priority=${input.priority}` +
-    (input.parent_id ? ` parent=${input.parent_id}` : '') + '\n'
-  )
-
-  return { id, task }
+    db.addLog(
+      'orchestrator',
+      `ui created ${id} owner=${input.owner} priority=${input.priority}` +
+        (input.parent_id ? ` parent=${input.parent_id}` : ''),
+      ts
+    )
+    return { id, task }
+  })
+  return result
 })
 
 interface SplitSubtask {
@@ -284,52 +296,55 @@ ipcMain.handle('split-task', async (_evt, input: SplitTaskInput) => {
   if (!input.subtasks || input.subtasks.length === 0) {
     throw new Error('split-task requires at least one subtask')
   }
-  const tasksPath = path.join(SHARED, 'tasks.json')
-  const raw = await fs.readFile(tasksPath, 'utf-8').catch(() => '{"tasks":[],"next_id":1}')
-  const data: { tasks: TaskRecord[]; next_id: number } = JSON.parse(raw)
-  const parent = validateParentForChild(data.tasks, input.parent_id)
-
   const ts = nowStamp()
-  const created: TaskRecord[] = []
-  for (const sub of input.subtasks) {
-    const id = `T-${String(data.next_id).padStart(3, '0')}`
-    data.next_id += 1
-    const child: TaskRecord = {
-      id,
-      title: sub.title,
-      owner: sub.owner,
-      status: 'todo',
-      deps: sub.deps ?? [],
-      priority: sub.priority ?? 'medium',
-      created_at: ts,
-      updated_at: ts,
-      parent_id: parent.id,
-      children: [],
+  return db.transaction(() => {
+    const parent = validateParentForChild(input.parent_id)
+
+    const created: db.TaskRow[] = []
+    for (const sub of input.subtasks) {
+      const nextId = db.getNextId()
+      const id = `T-${String(nextId).padStart(3, '0')}`
+      db.setNextId(nextId + 1)
+      const child: db.TaskRow = {
+        id,
+        title: sub.title,
+        owner: sub.owner,
+        status: 'todo',
+        deps: sub.deps ?? [],
+        priority: sub.priority ?? 'medium',
+        created_at: ts,
+        updated_at: ts,
+        parent_id: parent.id,
+        children: [],
+      }
+      db.insertTask(child)
+      created.push(child)
     }
-    data.tasks.push(child)
-    created.push(child)
-  }
 
-  parent.children = [...(parent.children ?? []), ...created.map((c) => c.id)]
-  parent.status = 'waiting_children'
-  parent.updated_at = ts
+    db.updateTaskFields(parent.id, {
+      children: [...(parent.children ?? []), ...created.map((c) => c.id)],
+      status: 'waiting_children',
+      updated_at: ts,
+    })
 
-  await fs.writeFile(tasksPath, JSON.stringify(data, null, 2) + '\n')
+    for (const c of created) {
+      const desc = input.subtasks.find((s) => s.title === c.title)?.description ?? ''
+      db.addMessage({
+        ts,
+        from_role: 'ui',
+        to_role: c.owner,
+        task_id: c.id,
+        subject: c.title,
+        priority: c.priority ?? 'medium',
+        deps: (c.deps ?? []).length > 0 ? c.deps!.join(', ') : 'none',
+        body: desc || '(no description)',
+        status: 'unread',
+      })
+    }
+    db.addLog('orchestrator', `split ${parent.id} into ${created.map((c) => c.id).join(',')}`, ts)
 
-  // Inbox + log per child
-  for (const c of created) {
-    const inboxPath = path.join(SHARED, 'inbox', `${c.owner}.md`)
-    const desc = input.subtasks.find((s) => s.title === c.title)?.description ?? ''
-    const block = buildInboxBlock(ts, c.owner, c.id, c.title,
-      c.priority ?? 'medium', c.deps, desc, parent.id)
-    await fs.appendFile(inboxPath, block)
-  }
-  await fs.appendFile(
-    path.join(SHARED, 'logs', 'orchestrator.log'),
-    `[${ts}] split ${parent.id} into ${created.map((c) => c.id).join(',')}\n`
-  )
-
-  return { ok: true, parent_id: parent.id, children: created }
+    return { ok: true, parent_id: parent.id, children: created }
+  })
 })
 
 interface SendMessageInput {
@@ -341,17 +356,14 @@ interface SendMessageInput {
 
 ipcMain.handle('send-message', async (_evt, input: SendMessageInput) => {
   const ts = nowStamp()
-  const inboxPath = path.join(SHARED, 'inbox', `${input.to}.md`)
-  const block = [
-    '',
-    `## [${ts}] FROM: ${input.from} | TO: ${input.to} | TASK: ${input.taskId || 'T-000'}`,
-    '',
-    input.body,
-    '',
-    '---',
-    '',
-  ].join('\n')
-  await fs.appendFile(inboxPath, block)
+  db.addMessage({
+    ts,
+    from_role: input.from,
+    to_role: input.to,
+    task_id: input.taskId || null,
+    body: input.body,
+    status: 'unread',
+  })
   return { ok: true }
 })
 
@@ -384,28 +396,16 @@ ipcMain.handle('send-to-planner', async (_evt, message: string) => {
   const text = (message || '').trim()
   if (!text) throw new Error('Empty message')
   const ts = nowStamp()
-  const block = [
-    '',
-    `## [${ts}] FROM: ui | TO: planner | TASK: T-000`,
-    `**Subject:** plan request from user`,
-    '',
-    text,
-    '',
-    '---',
-    '',
-  ].join('\n')
-  const inboxPath = path.join(SHARED, 'inbox', 'planner.md')
-  const cur = await fs.readFile(inboxPath, 'utf-8').catch(() => '')
-  const tmp = inboxPath + '.tmp'
-  await fs.writeFile(tmp, cur + block)
-  await fs.rename(tmp, inboxPath)
-  await fs.appendFile(
-    path.join(SHARED, 'logs', 'planner.log'),
-    `[${ts}] ui sent prompt to planner; len=${text.length}\n`
-  ).catch(() => {})
-
-  // Best-effort tmux notify (no-op when running Electron-only)
-  tmuxNotifyPlanner()
+  db.addMessage({
+    ts,
+    from_role: 'ui',
+    to_role: 'planner',
+    task_id: null,
+    subject: 'plan request from user',
+    body: text,
+    status: 'unread',
+  })
+  db.addLog('planner', `ui sent prompt to planner; len=${text.length}`, ts)
 
   // Explicit user intent → always wake planner regardless of the auto-trigger
   // toggle. spawnAndPing is idempotent and handles cold-spawn warm-up.
@@ -428,25 +428,17 @@ ipcMain.handle('approve-plan', async (_evt, input: ApprovePlanInput) => {
   if (!body) throw new Error('Body is required')
 
   const ts = nowStamp()
-  const block = [
-    '',
-    `## [${ts}] FROM: planner | TO: orchestrator | TASK: T-000`,
-    `**Subject:** ${title}`,
-    `**Priority:** medium`,
-    `**Deps:** none`,
-    '',
+  db.addMessage({
+    ts,
+    from_role: 'planner',
+    to_role: 'orchestrator',
+    task_id: null,
+    subject: title,
+    priority: 'medium',
+    deps: 'none',
     body,
-    '',
-    '---',
-    '',
-  ].join('\n')
-
-  // Atomic-ish append: read, concat, write tmp, rename
-  const inboxPath = path.join(SHARED, 'inbox', 'orchestrator.md')
-  const cur = await fs.readFile(inboxPath, 'utf-8').catch(() => '')
-  const tmp = inboxPath + '.tmp'
-  await fs.writeFile(tmp, cur + block)
-  await fs.rename(tmp, inboxPath)
+    status: 'unread',
+  })
 
   // Clear draft (write empty)
   await fs.writeFile(PLANNER_DRAFT_PATH, '').catch(async () => {
@@ -455,11 +447,7 @@ ipcMain.handle('approve-plan', async (_evt, input: ApprovePlanInput) => {
     await fs.writeFile(PLANNER_DRAFT_PATH, '')
   })
 
-  // Log
-  await fs.appendFile(
-    path.join(SHARED, 'logs', 'planner.log'),
-    `[${ts}] planner approved-by-user → orchestrator inbox; subject="${title}"\n`
-  ).catch(() => {})
+  db.addLog('planner', `planner approved-by-user → orchestrator inbox; subject="${title}"`, ts)
 
   // Wake orchestrator immediately on user approval, independent of auto-trigger.
   spawnAndPing('orchestrator').catch((err) =>
@@ -470,63 +458,73 @@ ipcMain.handle('approve-plan', async (_evt, input: ApprovePlanInput) => {
 })
 
 ipcMain.handle('get-agents-config', async () => {
-  const configPath = path.join(SHARED, 'agents-config.json')
-  try {
-    const raw = await fs.readFile(configPath, 'utf-8')
-    return JSON.parse(raw)
-  } catch {
-    return { agents: {}, available_models: [] }
-  }
+  const config = await readConfig()
+  // Synthesize available_models from the dynamic providers map so existing
+  // renderer code (model pickers) keeps working.
+  return { ...config, available_models: deriveAvailableModels(config) }
 })
 
 ipcMain.handle('update-agent-model', async (_evt, agent: string, provider: string, model: string) => {
-  // Legacy handler — keeps root provider/model in sync with backend.model
-  const configPath = path.join(SHARED, 'agents-config.json')
-  const raw = await fs.readFile(configPath, 'utf-8')
-  const config = JSON.parse(raw)
+  const config = await readConfig()
   const existing = config.agents[agent] ?? {}
-  const backend = existing.backend ? { ...existing.backend, model } : { kind: 'claude-cli', model }
-  config.agents[agent] = { ...existing, backend, provider, model }
-  await fs.writeFile(configPath, JSON.stringify(config, null, 2) + '\n')
+  config.agents[agent] = { ...existing, backend: { mode: 'api' }, provider, model }
+  await writeConfig(config)
   return { ok: true }
 })
 
-// ── Backend settings (per-agent backend kind + per-provider keys) ────────
+// ── Backend settings (per-agent provider/model + per-provider keys) ──────
 
-async function readConfig(): Promise<{ agents: Record<string, AgentEntry>, available_models: unknown[] }> {
-  try {
-    return JSON.parse(await fs.readFile(path.join(SHARED, 'agents-config.json'), 'utf-8'))
-  } catch {
-    return { agents: {}, available_models: [] }
-  }
-}
-
-interface BackendBlock {
-  kind: BackendKind
+interface ProviderBlock {
+  kind: string
+  name?: string
   base_url?: string
-  model?: string
+  models?: string[]
+  price_in?: number
+  price_out?: number
 }
 interface AgentEntry {
-  backend?: BackendBlock
+  backend?: { mode?: string }
   provider?: string
   model?: string
 }
+interface FullConfig {
+  providers?: Record<string, ProviderBlock>
+  agents: Record<string, AgentEntry>
+  available_models?: unknown[]
+  orchestration?: Partial<OrchestrationConfig>
+}
 
-async function writeConfig(config: { agents: Record<string, AgentEntry>; available_models: unknown[] }) {
+// Build the flat model list the renderer expects from the providers map.
+function deriveAvailableModels(config: FullConfig): { provider: string; id: string; label: string; tier: string }[] {
+  const out: { provider: string; id: string; label: string; tier: string }[] = []
+  for (const [pid, p] of Object.entries(config.providers ?? {})) {
+    for (const m of p.models ?? []) {
+      out.push({ provider: pid, id: m, label: m, tier: p.name ?? pid })
+    }
+  }
+  return out
+}
+
+async function readConfig(): Promise<FullConfig> {
+  try {
+    return JSON.parse(await fs.readFile(path.join(SHARED, 'agents-config.json'), 'utf-8'))
+  } catch {
+    return { agents: {}, providers: {} }
+  }
+}
+
+async function writeConfig(config: FullConfig) {
   await fs.writeFile(path.join(SHARED, 'agents-config.json'), JSON.stringify(config, null, 2) + '\n')
 }
 
 async function readSecrets(): Promise<Record<string, string>> {
-  try {
-    return JSON.parse(await fs.readFile(SECRETS_PATH, 'utf-8'))
-  } catch {
-    return {}
+  // Secrets live in the DB (secrets table), keyed by provider id.
+  const out: Record<string, string> = {}
+  for (const p of db.listSecretProviders()) {
+    const v = db.getSecret(p)
+    if (v) out[p] = v
   }
-}
-
-async function writeSecrets(obj: Record<string, string>): Promise<void> {
-  await fs.mkdir(path.dirname(SECRETS_PATH), { recursive: true })
-  await fs.writeFile(SECRETS_PATH, JSON.stringify(obj, null, 2) + '\n')
+  return out
 }
 
 function decryptKey(b64: string): string {
@@ -541,36 +539,66 @@ function decryptKey(b64: string): string {
 ipcMain.handle('get-backend-settings', async () => {
   const config = await readConfig()
   const secrets = await readSecrets()
-  const keys = SECRET_PROVIDERS.reduce((acc, p) => {
-    acc[p] = Boolean(secrets[p])
-    return acc
-  }, {} as Record<SecretProvider, boolean>)
+  // One boolean per provider id: does an API key exist?
+  const keys: Record<string, boolean> = {}
+  for (const pid of Object.keys(config.providers ?? {})) {
+    keys[pid] = Boolean(secrets[pid])
+  }
   return {
     agents: config.agents,
-    available_models: config.available_models,
+    providers: config.providers ?? {},
+    available_models: deriveAvailableModels(config),
     keys,
     safeStorageAvailable: safeStorage.isEncryptionAvailable(),
   }
 })
 
+// Set an agent's provider + model (API-only). base_url lives on the provider,
+// not the agent, so it's not accepted here anymore.
 ipcMain.handle('set-agent-backend', async (_evt, input: {
   agent: string
-  kind: BackendKind
+  provider: string
   model?: string
-  base_url?: string
 }) => {
-  const { agent, kind, model, base_url } = input
+  const { agent, provider, model } = input
   const config = await readConfig()
   const existing = config.agents[agent] ?? {}
-  const backend: BackendBlock = { kind }
-  if (base_url) backend.base_url = base_url
-  if (model) backend.model = model
-  // Mirror provider/model at the root for legacy consumers (InboxPanel etc).
-  const provider = providerForBackend(kind)
-  const next: AgentEntry = { ...existing, backend, provider }
+  const next: AgentEntry = { ...existing, backend: { mode: 'api' }, provider }
   if (model) next.model = model
   config.agents[agent] = next
   await writeConfig(config)
+  return { ok: true }
+})
+
+// Add or update a provider definition (custom OpenAI-compatible gateways, etc).
+ipcMain.handle('set-provider', async (_evt, input: {
+  id: string
+  kind: string
+  name?: string
+  base_url?: string
+  models?: string[]
+}) => {
+  const { id, kind, name, base_url, models } = input
+  if (!id) return { ok: false, error: 'provider id required' }
+  const config = await readConfig()
+  config.providers = config.providers ?? {}
+  const existing = config.providers[id] ?? { kind }
+  config.providers[id] = {
+    ...existing,
+    kind,
+    name: name ?? existing.name,
+    base_url: base_url ?? existing.base_url,
+    models: models ?? existing.models ?? [],
+  }
+  await writeConfig(config)
+  return { ok: true }
+})
+
+ipcMain.handle('delete-provider', async (_evt, id: string) => {
+  const config = await readConfig()
+  if (config.providers) delete config.providers[id]
+  await writeConfig(config)
+  db.deleteSecret(id)
   return { ok: true }
 })
 
@@ -578,45 +606,40 @@ ipcMain.handle('set-provider-key', async (_evt, input: { provider: SecretProvide
   if (!safeStorage.isEncryptionAvailable()) {
     return { ok: false, error: 'safeStorage encryption not available on this platform' }
   }
-  const secrets = await readSecrets()
   if (!input.apiKey) {
-    delete secrets[input.provider]
+    db.deleteSecret(input.provider)
   } else {
     const encrypted = safeStorage.encryptString(input.apiKey)
-    secrets[input.provider] = encrypted.toString('base64')
+    db.setSecret(input.provider, encrypted.toString('base64'))
   }
-  await writeSecrets(secrets)
   return { ok: true }
 })
 
 ipcMain.handle('clear-provider-key', async (_evt, provider: SecretProvider) => {
-  const secrets = await readSecrets()
-  delete secrets[provider]
-  await writeSecrets(secrets)
+  db.deleteSecret(provider)
   return { ok: true }
 })
 
-// Helpers for PTY dispatch
-function providerForBackend(kind: BackendKind): string {
-  switch (kind) {
-    case 'claude-cli':
-    case 'api-anthropic': return 'anthropic'
-    case 'codex-cli':
-    case 'api-openai':    return 'openai'
-    case 'gemini-cli':
-    case 'api-google':    return 'google'
-    case 'lm-studio':     return 'local'
-  }
+// ── PTY dispatch (API-only) ─────────────────────────────────
+// CLI-REVIVE: CLI backends (claude/codex/gemini) were removed for the API-only
+// phase. To bring them back, restore the kind-based branch in buildPtyCommand,
+// the providerForBackend/envVarForBackend helpers, and resolveBin('claude'|...).
+// See REDESIGN_PLAN.md "CLI removal — hồi sinh tương lai".
+
+interface ProviderCfg {
+  kind: string
+  name?: string
+  base_url?: string
+  models?: string[]
+  price_in?: number
+  price_out?: number
 }
 
-function envVarForBackend(kind: BackendKind): string | null {
-  switch (kind) {
-    case 'api-anthropic': return 'ANTHROPIC_API_KEY'
-    case 'api-google':    return 'GOOGLE_API_KEY'
-    case 'api-openai':
-    case 'lm-studio':     return 'OPENAI_API_KEY'
-    default:              return null
-  }
+// Env var name the agent runtime expects for a given provider id.
+//   'vietapi'   -> MULTIAGENT_KEY_VIETAPI
+//   'lm-studio' -> MULTIAGENT_KEY_LM_STUDIO
+function keyEnvName(providerId: string): string {
+  return 'MULTIAGENT_KEY_' + providerId.replace(/[^A-Za-z0-9]/g, '_').toUpperCase()
 }
 
 function resolveBin(name: string): string {
@@ -624,7 +647,7 @@ function resolveBin(name: string): string {
   const override = process.env[overrideKey]
   if (override) return override
   if (process.platform !== 'win32') return name
-  // Windows: try common extensions in PATH order. claude is .exe, npm shims are .cmd.
+  // Windows: try common extensions in PATH order.
   const exts = (process.env.PATHEXT || '.COM;.EXE;.BAT;.CMD').split(';')
   const dirs = (process.env.PATH || '').split(path.delimiter)
   for (const dir of dirs) {
@@ -633,7 +656,7 @@ function resolveBin(name: string): string {
       if (fsSync.existsSync(candidate)) return candidate
     }
   }
-  return name + '.cmd' // fallback
+  return name
 }
 
 interface PtyCommand {
@@ -645,43 +668,119 @@ interface PtyCommand {
 async function buildPtyCommand(agent: string): Promise<PtyCommand> {
   const config = await readConfig()
   const entry = config.agents[agent] ?? {}
-  const backend = entry.backend ?? { kind: 'claude-cli' as BackendKind }
-  const kind = backend.kind
-  const model = backend.model ?? entry.model
+  const providers: Record<string, ProviderCfg> =
+    (config as { providers?: Record<string, ProviderCfg> }).providers ?? {}
+  const providerId = (entry as { provider?: string }).provider ?? ''
+  const providerCfg = providers[providerId]
 
-  // Provide API key via env for runtimes that need it
+  // Inject the decrypted API key for this provider as MULTIAGENT_KEY_<PROVIDER>.
   const envExtra: Record<string, string> = {}
-  const envName = envVarForBackend(kind)
-  if (envName) {
-    const provider = providerForBackend(kind)
-    if (provider !== 'local') {
-      const secrets = await readSecrets()
-      const decoded = decryptKey(secrets[provider] ?? '')
-      if (decoded) envExtra[envName] = decoded
-    } else {
-      // LM Studio: SDK requires non-empty key, server doesn't validate by default
-      envExtra[envName] = 'lm-studio'
+  if (providerId) {
+    const enc = db.getSecret(providerId)
+    const decoded = enc ? decryptKey(enc) : ''
+    if (decoded) {
+      envExtra[keyEnvName(providerId)] = decoded
+    } else if (providerCfg?.kind === 'openai-compatible' && providerCfg.base_url?.includes('localhost')) {
+      // Local server (LM Studio): SDK needs a non-empty key, server ignores it.
+      envExtra[keyEnvName(providerId)] = 'no-key'
     }
   }
 
-  switch (kind) {
-    case 'claude-cli':
-      return {
-        cmd: resolveBin('claude'),
-        args: ['--dangerously-skip-permissions', ...(model ? ['--model', model] : [])],
-        envExtra,
-      }
-    case 'codex-cli':
-      return { cmd: resolveBin('codex'), args: model ? ['--model', model] : [], envExtra }
-    case 'gemini-cli':
-      return { cmd: resolveBin('gemini'), args: ['--yolo', ...(model ? ['--model', model] : [])], envExtra }
-    case 'api-anthropic':
-    case 'api-google':
-    case 'api-openai':
-    case 'lm-studio':
-      return { cmd: resolveBin('python3'), args: [AGENT_RUNTIME, '--role', agent], envExtra }
+  return {
+    cmd: process.execPath,
+    args: [AGENT_RUNTIME, '--role', agent],
+    envExtra: { ...envExtra, ELECTRON_RUN_AS_NODE: '1' },
   }
 }
+
+// ── Group coordinator (v2 orchestration) ─────────────────────────
+// Reuses the same decrypted-key env logic as buildPtyCommand, but the
+// coordinator spawns headless one-shot group agents instead of PTY sessions.
+
+async function envForRole(role: string): Promise<Record<string, string>> {
+  const config = await readConfig()
+  const entry = config.agents[role] ?? {}
+  const providers: Record<string, ProviderCfg> =
+    (config as { providers?: Record<string, ProviderCfg> }).providers ?? {}
+  const providerId = (entry as { provider?: string }).provider ?? ''
+  const providerCfg = providers[providerId]
+  const env: Record<string, string> = {}
+  if (providerId) {
+    const enc = db.getSecret(providerId)
+    const decoded = enc ? decryptKey(enc) : ''
+    if (decoded) {
+      env[keyEnvName(providerId)] = decoded
+    } else if (providerCfg?.kind === 'openai-compatible' && providerCfg.base_url?.includes('localhost')) {
+      env[keyEnvName(providerId)] = 'no-key'
+    }
+  }
+  return env
+}
+
+async function readOrchestration(): Promise<OrchestrationConfig> {
+  const config = await readConfig()
+  return { ...DEFAULT_ORCHESTRATION, ...(config.orchestration ?? {}) }
+}
+
+async function modelForRole(role: string): Promise<string | null> {
+  const config = await readConfig()
+  return config.agents[role]?.model ?? null
+}
+
+const coordinator = new GroupCoordinator({
+  runtimePath: AGENT_RUNTIME,
+  execPath: process.execPath,
+  agentsDir: path.join(ROOT, 'agents'),
+  envForRole,
+  readOrchestration,
+  modelForRole,
+  notify: (event, payload) => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('coordinator-event', { event, payload })
+    }
+  },
+})
+
+// IPC: create a group for an existing task (UI / orchestrator-triggered).
+ipcMain.handle('group-create', async (_evt, input: { task_id: string; worker_role: string }) => {
+  try {
+    const id = await coordinator.createGroupForTask(input.task_id, input.worker_role)
+    return { ok: true, group: id }
+  } catch (e) {
+    return { ok: false, error: (e as Error).message }
+  }
+})
+
+// IPC: list groups (optionally by status) for the group panel (GĐ4).
+ipcMain.handle('group-list', () => {
+  const rows = db.getGroupsByStatus('pending', 'active', 'reviewing', 'passed', 'failed', 'killed')
+  return { ok: true, groups: rows }
+})
+
+// IPC: read orchestration settings.
+ipcMain.handle('orchestration-get', async () => {
+  return await readOrchestration()
+})
+
+// IPC: update orchestration settings (merged into agents-config.json).
+ipcMain.handle('orchestration-set', async (_evt, patch: Partial<OrchestrationConfig>) => {
+  const config = await readConfig()
+  const current = { ...DEFAULT_ORCHESTRATION, ...(config.orchestration ?? {}) }
+  config.orchestration = { ...current, ...patch }
+  await writeConfig(config)
+  return { ok: true, orchestration: config.orchestration }
+})
+
+// IPC: manually kill a group (GĐ4 panel action).
+ipcMain.handle('group-kill', (_evt, groupId: string) => {
+  coordinator.killGroupManual(groupId, 'killed by user')
+  return { ok: true }
+})
+
+// IPC: read a group's memory timeline (progress notes / review reports).
+ipcMain.handle('group-memory', (_evt, groupId: string) => {
+  return { ok: true, memory: db.allGroupMemory(groupId) }
+})
 
 // ── PTY: spawn an agent backend per role ───────────────────
 
@@ -716,8 +815,9 @@ async function ensurePty(agent: string): Promise<PtySession> {
 async function doSpawn(agent: string): Promise<PtySession> {
   const cwd = path.join(ROOT, 'agents', agent)
 
-  // Make sure CLI-specific copies of AGENT.md exist before spawning the CLI
-  syncAgentMdSafe(agent)
+  if (!pty) {
+    throw new Error('node-pty unavailable — cannot spawn agent runtime. Rebuild node-pty for Electron.')
+  }
 
   const { cmd, args, envExtra } = await buildPtyCommand(agent)
 
@@ -762,17 +862,12 @@ async function doSpawn(agent: string): Promise<PtySession> {
   return s
 }
 
-// Spawn-if-needed and inject "check inbox" once the CLI is past warm-up. Used
-// by the inbox watcher when a new message arrives for an agent that may not be
-// running yet.
+// Ensure the agent's runtime process is running. The runtime polls the
+// DB for unread messages on its own, so we no longer inject "check inbox" — we
+// just make sure the process exists. The auto-trigger event is kept so the UI
+// can flash which agent woke up.
 async function spawnAndPing(agent: string): Promise<void> {
-  const wasRunning = ptySessions.has(agent)
-  const s = await ensurePty(agent)
-  if (!wasRunning) {
-    await new Promise((r) => setTimeout(r, CLI_WARMUP_MS))
-  }
-  s.proc.write('check inbox\r')
-  s.lastActivityAt = Date.now()
+  await ensurePty(agent)
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('auto-trigger', { agent })
   }
@@ -796,20 +891,6 @@ function startIdleGc() {
   }, GC_INTERVAL_MS)
 }
 
-// Copy agents/<role>/AGENT.md to CLAUDE.md / GEMINI.md / AGENTS.md so that whichever
-// CLI we launch can auto-load its expected context filename. Silent on failure.
-function syncAgentMdSafe(agent: string): void {
-  try {
-    const dir = path.join(ROOT, 'agents', agent)
-    const src = path.join(dir, 'AGENT.md')
-    if (!fsSync.existsSync(src)) return
-    const buf = fsSync.readFileSync(src)
-    for (const name of ['CLAUDE.md', 'GEMINI.md', 'AGENTS.md']) {
-      try { fsSync.writeFileSync(path.join(dir, name), buf) } catch { /* ignore */ }
-    }
-  } catch { /* ignore */ }
-}
-
 ipcMain.handle('pty-start', async (_evt, agent: string) => {
   const s = await ensurePty(agent)
   return { ok: true, history: s.history }
@@ -824,7 +905,7 @@ ipcMain.handle('pty-attach', (_evt, agent: string) => {
   return { alive: true, history: s.history }
 })
 
-// ── Cost summary (parsed from shared/logs/*.log) ─────────────
+// ── Cost summary (aggregated from the usage table) ───────────
 
 interface CostBucket {
   usd: number
@@ -840,8 +921,6 @@ interface CostSummary {
   pricing_as_of: string
 }
 
-const COST_LINE_RE = /^\[(\d{4}-\d{2}-\d{2}) (\d{2}):(\d{2})\]\s+(\S+)\s+usage\s+model=\S+\s+in=(\d+)\s+out=(\d+)\s+cost=\$([\d.]+)(?:\s+task=(\S+))?/
-
 ipcMain.handle('get-cost-summary', async (): Promise<CostSummary> => {
   const today = new Date()
   const todayStr = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`
@@ -855,47 +934,27 @@ ipcMain.handle('get-cost-summary', async (): Promise<CostSummary> => {
   }
   const byAgent = new Map<string, CostBucket>()
   const byTask = new Map<string, CostBucket>()
-  const logsDir = path.join(SHARED, 'logs')
-  let entries: string[] = []
-  try {
-    entries = (await fs.readdir(logsDir)).filter((f) => f.endsWith('.log'))
-  } catch {
-    return summary
-  }
-  for (const filename of entries) {
-    let content: string
-    try {
-      content = await fs.readFile(path.join(logsDir, filename), 'utf-8')
-    } catch {
-      continue
-    }
-    // Tail the last 1MB only, in case logs grow large
-    if (content.length > 1_000_000) content = content.slice(-1_000_000)
-    for (const raw of content.split('\n')) {
-      const m = COST_LINE_RE.exec(raw)
-      if (!m) continue
-      const [, date, hh, , agent, inS, outS, costS, taskId] = m
-      if (date !== todayStr) continue
-      const tIn = parseInt(inS, 10) || 0
-      const tOut = parseInt(outS, 10) || 0
-      const usd = parseFloat(costS) || 0
-      summary.today.usd += usd
-      summary.today.tokens_in += tIn
-      summary.today.tokens_out += tOut
-      const hour = parseInt(hh, 10) || 0
-      summary.by_hour_today[hour].usd += usd
-      const agentBucket = byAgent.get(agent) ?? { usd: 0, tokens_in: 0, tokens_out: 0 }
-      agentBucket.usd += usd
-      agentBucket.tokens_in += tIn
-      agentBucket.tokens_out += tOut
-      byAgent.set(agent, agentBucket)
-      if (taskId) {
-        const taskBucket = byTask.get(taskId) ?? { usd: 0, tokens_in: 0, tokens_out: 0 }
-        taskBucket.usd += usd
-        taskBucket.tokens_in += tIn
-        taskBucket.tokens_out += tOut
-        byTask.set(taskId, taskBucket)
-      }
+  for (const u of db.usageForDay(todayStr)) {
+    const tIn = u.tokens_in || 0
+    const tOut = u.tokens_out || 0
+    const usd = u.cost_usd || 0
+    summary.today.usd += usd
+    summary.today.tokens_in += tIn
+    summary.today.tokens_out += tOut
+    // ts shape: "YYYY-MM-DD HH:MM"
+    const hour = parseInt(u.ts.slice(11, 13), 10) || 0
+    if (summary.by_hour_today[hour]) summary.by_hour_today[hour].usd += usd
+    const agentBucket = byAgent.get(u.role) ?? { usd: 0, tokens_in: 0, tokens_out: 0 }
+    agentBucket.usd += usd
+    agentBucket.tokens_in += tIn
+    agentBucket.tokens_out += tOut
+    byAgent.set(u.role, agentBucket)
+    if (u.task_id) {
+      const taskBucket = byTask.get(u.task_id) ?? { usd: 0, tokens_in: 0, tokens_out: 0 }
+      taskBucket.usd += usd
+      taskBucket.tokens_in += tIn
+      taskBucket.tokens_out += tOut
+      byTask.set(u.task_id, taskBucket)
     }
   }
   summary.by_agent = Array.from(byAgent.entries())
@@ -907,7 +966,7 @@ ipcMain.handle('get-cost-summary', async (): Promise<CostSummary> => {
   return summary
 })
 
-// ── Task thread (inbox + outbox messages filtered by task ID) ──
+// ── Task thread (messages filtered by task ID) ──
 
 interface TaskThreadEntry {
   ts: string
@@ -920,56 +979,18 @@ interface TaskThreadEntry {
   source_file: string
 }
 
-const MSG_HEADER_RE = /^##\s*\[([^\]]+)\]\s+FROM:\s*(\S+)\s*\|\s*TO:\s*(\S+)\s*\|\s*TASK:\s*([^\s(]+)/
-
-function parseMessageBlocks(content: string, source: 'inbox' | 'outbox', sourceFile: string, taskId: string): TaskThreadEntry[] {
-  const out: TaskThreadEntry[] = []
-  const blocks = content.split(/^---\s*$/m)
-  for (const raw of blocks) {
-    const trimmed = raw.trim()
-    if (!trimmed) continue
-    const lines = trimmed.split('\n')
-    const headerIdx = lines.findIndex((l) => MSG_HEADER_RE.test(l))
-    if (headerIdx === -1) continue
-    const m = MSG_HEADER_RE.exec(lines[headerIdx])
-    if (!m) continue
-    const [, ts, from, to, blockTaskId] = m
-    if (blockTaskId !== taskId) continue
-    let subject: string | undefined
-    const subjectLine = lines.slice(headerIdx + 1, headerIdx + 6).find((l) => /^\*\*Subject:\*\*/i.test(l))
-    if (subjectLine) {
-      subject = subjectLine.replace(/^\*\*Subject:\*\*\s*/i, '').trim()
-    }
-    // Body = everything after the metadata block (Subject/Priority/Deps lines)
-    let bodyStart = headerIdx + 1
-    while (bodyStart < lines.length && /^\*\*\w+:\*\*/.test(lines[bodyStart])) bodyStart++
-    while (bodyStart < lines.length && lines[bodyStart].trim() === '') bodyStart++
-    const body = lines.slice(bodyStart).join('\n').trim()
-    out.push({ ts, from, to, task_id: blockTaskId, subject, body, source, source_file: sourceFile })
-  }
-  return out
-}
-
 ipcMain.handle('get-task-thread', async (_evt, taskId: string): Promise<TaskThreadEntry[]> => {
-  const out: TaskThreadEntry[] = []
-  for (const dir of ['inbox', 'outbox'] as const) {
-    const dirPath = path.join(SHARED, dir)
-    let entries: string[]
-    try {
-      entries = (await fs.readdir(dirPath)).filter((f) => f.endsWith('.md'))
-    } catch {
-      continue
-    }
-    for (const filename of entries) {
-      let content: string
-      try {
-        content = await fs.readFile(path.join(dirPath, filename), 'utf-8')
-      } catch {
-        continue
-      }
-      out.push(...parseMessageBlocks(content, dir, filename, taskId))
-    }
-  }
+  // unread → inbox, processed → outbox, preserving the renderer's source labels.
+  const out: TaskThreadEntry[] = db.getThread(taskId).map((m) => ({
+    ts: m.ts,
+    from: m.from_role,
+    to: m.to_role,
+    task_id: m.task_id ?? taskId,
+    subject: m.subject ?? undefined,
+    body: m.body,
+    source: (m.status === 'processed' ? 'outbox' : 'inbox') as 'inbox' | 'outbox',
+    source_file: `${m.to_role}.md`,
+  }))
   out.sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0))
   return out
 })
@@ -1025,70 +1046,119 @@ app.on('before-quit', () => {
       /* ignore */
     }
   }
+  for (const s of shellSessions.values()) {
+    try { s.proc.kill() } catch { /* ignore */ }
+  }
+})
+
+// ── Real shell terminals (for the user: npm/git/python) ──────
+// Separate from agent PTYs. Keyed by an arbitrary shell id from the renderer.
+// Spawns the platform shell in the current workspace root.
+
+interface ShellSession {
+  proc: import('node-pty').IPty
+  history: string
+}
+const shellSessions = new Map<string, ShellSession>()
+
+function shellCommand(): { cmd: string; args: string[] } {
+  if (process.platform === 'win32') {
+    // Prefer PowerShell 7 if present, else Windows PowerShell.
+    const pwsh = resolveBin('pwsh')
+    return { cmd: pwsh, args: [] }
+  }
+  return { cmd: process.env.SHELL || '/bin/bash', args: [] }
+}
+
+ipcMain.handle('shell-start', (_evt, id: string) => {
+  if (!pty) return { ok: false, error: 'node-pty unavailable' }
+  let s = shellSessions.get(id)
+  if (!s) {
+    const { cmd, args } = shellCommand()
+    const proc = pty.spawn(cmd, args, {
+      name: 'xterm-256color',
+      cols: 120,
+      rows: 24,
+      cwd: workspaceRoot,
+      env: { ...process.env, TERM: 'xterm-256color' },
+    })
+    s = { proc, history: '' }
+    shellSessions.set(id, s)
+    proc.onData((data) => {
+      s!.history += data
+      if (s!.history.length > HISTORY_MAX) s!.history = s!.history.slice(-HISTORY_MAX)
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send(`shell-data:${id}`, data)
+      }
+    })
+    proc.onExit(({ exitCode }) => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send(`shell-exit:${id}`, { exitCode })
+      }
+      shellSessions.delete(id)
+    })
+  }
+  return { ok: true, history: s.history }
+})
+
+ipcMain.handle('shell-write', (_evt, id: string, data: string) => {
+  const s = shellSessions.get(id)
+  if (!s) return { ok: false }
+  s.proc.write(data)
+  return { ok: true }
+})
+
+ipcMain.handle('shell-resize', (_evt, id: string, cols: number, rows: number) => {
+  const s = shellSessions.get(id)
+  if (!s) return { ok: false }
+  try { s.proc.resize(cols, rows) } catch { /* ignore */ }
+  return { ok: true }
+})
+
+ipcMain.handle('shell-kill', (_evt, id: string) => {
+  const s = shellSessions.get(id)
+  if (s) { try { s.proc.kill() } catch { /* ignore */ } shellSessions.delete(id) }
+  return { ok: true }
 })
 
 // ── Inbox watcher: auto-prompt agent when new message arrives ─
+//
+// API-only: messages live in the DB, not markdown files. We poll unread counts
+// per agent; when an agent's unread count grows, lazily spawn its runtime and
+// ping it. This replaces the old fsSync.watch on shared/inbox/*.md.
 
-interface InboxState {
-  size: number
-  sepCount: number
-}
-const inboxState = new Map<string, InboxState>()
-const debounceTimers = new Map<string, NodeJS.Timeout>()
+const unreadBaseline = new Map<string, number>()
 let autoTriggerEnabled = true
-
-function readInboxState(agent: string): InboxState {
-  try {
-    const file = path.join(SHARED, 'inbox', `${agent}.md`)
-    const content = fsSync.readFileSync(file, 'utf-8')
-    const sepCount = (content.match(/^---$/gm) || []).length
-    return { size: content.length, sepCount }
-  } catch {
-    return { size: 0, sepCount: 0 }
-  }
-}
+const INBOX_POLL_MS = 1500
 
 async function watchInboxes() {
-  const inboxDir = path.join(SHARED, 'inbox')
-
-  // Initialize baseline state for each currently-configured agent. New clones
-  // added later will simply have an implicit baseline of {size:0, sepCount:0}.
+  // Seed baselines for currently-configured agents so we only react to growth.
   for (const agent of await getRoles()) {
-    inboxState.set(agent, readInboxState(agent))
+    unreadBaseline.set(agent, db.unreadCount(agent))
   }
 
-  fsSync.watch(inboxDir, (_event, filename) => {
-    if (!filename || !filename.endsWith('.md')) return
-    const agent = filename.replace('.md', '')
-    // Permissive: accept any <agent>.md filename. Clones spawned by the
-    // orchestrator add new files here that the static role list doesn't know about.
-
-    // Debounce: file watcher fires multiple times for one write
-    const existing = debounceTimers.get(agent)
-    if (existing) clearTimeout(existing)
-    debounceTimers.set(
-      agent,
-      setTimeout(() => {
-        debounceTimers.delete(agent)
-        const newState = readInboxState(agent)
-        const prev = inboxState.get(agent) ?? { size: 0, sepCount: 0 }
-        inboxState.set(agent, newState)
-
-        // Only trigger when a NEW message was added (size + separator count both grew)
-        const isNewMessage =
-          newState.size > prev.size && newState.sepCount > prev.sepCount
-
-        if (!isNewMessage || !autoTriggerEnabled) return
-
-        // Lazy-spawn: ensures the PTY exists, waits for warm-up if newly spawned,
-        // then injects "check inbox". Errors are swallowed so a missing CLI for one
-        // agent does not break the watcher for others.
+  setInterval(async () => {
+    if (!autoTriggerEnabled) return
+    let roles: string[]
+    try {
+      roles = await getRoles()
+    } catch {
+      return
+    }
+    // Include any role that already has unread messages even if not in config
+    // (e.g. clones), via the DB's recipient list.
+    const allRoles = new Set<string>([...roles, ...db.distinctRecipients()])
+    for (const agent of allRoles) {
+      const count = db.unreadCount(agent)
+      const prev = unreadBaseline.get(agent) ?? 0
+      unreadBaseline.set(agent, count)
+      if (count > prev) {
         spawnAndPing(agent).catch((err) => {
           console.error(`[inbox-watch] spawnAndPing(${agent}) failed:`, err)
         })
-      }, 300)
-    )
-  })
+      }
+    }
+  }, INBOX_POLL_MS)
 }
 
 ipcMain.handle('set-auto-trigger', (_evt, enabled: boolean) => {
@@ -1136,17 +1206,54 @@ ipcMain.handle('read-artifact-file', async (_evt, taskId: string, filename: stri
 
 // ── Workspace & Git IDE handlers ─────────────────────────────
 
+// The workspace root is dynamic: defaults to the project ROOT, but the user can
+// open any folder. Persisted in the DB (meta.workspace_root) + a recent list.
+let workspaceRoot: string = ROOT
+try {
+  const saved = db.getMeta('workspace_root')
+  if (saved && fsSync.existsSync(saved)) workspaceRoot = saved
+} catch { /* use ROOT */ }
+
+function getRecentWorkspaces(): string[] {
+  try {
+    const raw = db.getMeta('recent_workspaces')
+    const arr = raw ? JSON.parse(raw) : []
+    return Array.isArray(arr) ? arr : []
+  } catch {
+    return []
+  }
+}
+
+function pushRecentWorkspace(dir: string): void {
+  const recent = getRecentWorkspaces().filter((d) => d !== dir)
+  recent.unshift(dir)
+  db.setMeta('recent_workspaces', JSON.stringify(recent.slice(0, 10)))
+}
+
+function setWorkspaceRoot(dir: string): void {
+  workspaceRoot = dir
+  db.setMeta('workspace_root', dir)
+  pushRecentWorkspace(dir)
+}
+
+// Resolve a workspace-relative path to an absolute path, guarding against
+// escaping the workspace root.
+function resolveInWorkspace(relPath: string): string | null {
+  const abs = path.resolve(workspaceRoot, relPath)
+  if (abs !== workspaceRoot && !abs.startsWith(workspaceRoot + path.sep)) return null
+  return abs
+}
+
+const IGNORED_DIRS = new Set(['node_modules', 'dist', 'dist-electron', '.git', 'venv', '.venv', '__pycache__', '.vite'])
+
 async function scanDir(currentDir: string): Promise<any[]> {
   const entries = await fs.readdir(currentDir, { withFileTypes: true })
   const list: any[] = []
   for (const e of entries) {
     const name = e.name
-    // Exclude noise and hidden folders (except .gitignore or similar files if needed, but skip dot-folders)
-    if ((name.startsWith('.') && e.isDirectory()) || name === 'node_modules' || name === 'dist' || name === 'dist-electron' || name === 'outbox' || name === 'logs') {
-      continue
-    }
+    if (IGNORED_DIRS.has(name)) continue
     const fullPath = path.join(currentDir, name)
-    const relPath = path.relative(ROOT, fullPath)
+    const relPath = path.relative(workspaceRoot, fullPath)
     if (e.isDirectory()) {
       const children = await scanDir(fullPath)
       list.push({ name, relPath, isDir: true, children })
@@ -1154,7 +1261,6 @@ async function scanDir(currentDir: string): Promise<any[]> {
       list.push({ name, relPath, isDir: false })
     }
   }
-  // Sort folders first, then files alphabetically
   list.sort((a, b) => {
     if (a.isDir !== b.isDir) return a.isDir ? -1 : 1
     return a.name.localeCompare(b.name)
@@ -1162,9 +1268,33 @@ async function scanDir(currentDir: string): Promise<any[]> {
   return list
 }
 
+ipcMain.handle('workspace-get-root', () => ({
+  root: workspaceRoot,
+  name: path.basename(workspaceRoot),
+  recent: getRecentWorkspaces(),
+}))
+
+ipcMain.handle('workspace-open-dialog', async () => {
+  if (!mainWindow) return { ok: false }
+  const result = await dialog.showOpenDialog(mainWindow, {
+    title: 'Open Folder as Workspace',
+    properties: ['openDirectory'],
+    defaultPath: workspaceRoot,
+  })
+  if (result.canceled || result.filePaths.length === 0) return { ok: false }
+  setWorkspaceRoot(result.filePaths[0])
+  return { ok: true, root: workspaceRoot, name: path.basename(workspaceRoot) }
+})
+
+ipcMain.handle('workspace-set-root', async (_evt, dir: string) => {
+  if (!fsSync.existsSync(dir)) return { ok: false, error: 'folder not found' }
+  setWorkspaceRoot(dir)
+  return { ok: true, root: workspaceRoot, name: path.basename(workspaceRoot) }
+})
+
 ipcMain.handle('workspace-list-files', async () => {
   try {
-    return await scanDir(ROOT)
+    return await scanDir(workspaceRoot)
   } catch (err) {
     console.error('Failed to scan workspace:', err)
     return []
@@ -1172,10 +1302,8 @@ ipcMain.handle('workspace-list-files', async () => {
 })
 
 ipcMain.handle('workspace-read-file', async (_evt, relPath: string) => {
-  const absPath = path.resolve(ROOT, relPath)
-  if (!absPath.startsWith(ROOT + path.sep) && absPath !== ROOT) {
-    return { ok: false, content: 'Access denied: path is outside project root' }
-  }
+  const absPath = resolveInWorkspace(relPath)
+  if (!absPath) return { ok: false, content: 'Access denied: path is outside workspace root' }
   try {
     const content = await fs.readFile(absPath, 'utf-8')
     return { ok: true, content }
@@ -1185,10 +1313,8 @@ ipcMain.handle('workspace-read-file', async (_evt, relPath: string) => {
 })
 
 ipcMain.handle('workspace-write-file', async (_evt, relPath: string, content: string) => {
-  const absPath = path.resolve(ROOT, relPath)
-  if (!absPath.startsWith(ROOT + path.sep)) {
-    return { ok: false, error: 'Access denied: path is outside project root' }
-  }
+  const absPath = resolveInWorkspace(relPath)
+  if (!absPath) return { ok: false, error: 'Access denied: path is outside workspace root' }
   try {
     await fs.mkdir(path.dirname(absPath), { recursive: true })
     await fs.writeFile(absPath, content, 'utf-8')
@@ -1198,57 +1324,203 @@ ipcMain.handle('workspace-write-file', async (_evt, relPath: string, content: st
   }
 })
 
-ipcMain.handle('workspace-git-status', async () => {
-  return new Promise((resolve) => {
-    execFile('git', ['status', '--porcelain'], { cwd: ROOT }, (err, stdout) => {
-      if (err) {
-        resolve([])
+// ── File operations (create / rename / delete / mkdir) ───────
+
+ipcMain.handle('workspace-create-file', async (_evt, relPath: string) => {
+  const absPath = resolveInWorkspace(relPath)
+  if (!absPath) return { ok: false, error: 'path outside workspace' }
+  try {
+    if (fsSync.existsSync(absPath)) return { ok: false, error: 'file already exists' }
+    await fs.mkdir(path.dirname(absPath), { recursive: true })
+    await fs.writeFile(absPath, '', 'utf-8')
+    return { ok: true }
+  } catch (err: any) {
+    return { ok: false, error: err.message }
+  }
+})
+
+ipcMain.handle('workspace-create-folder', async (_evt, relPath: string) => {
+  const absPath = resolveInWorkspace(relPath)
+  if (!absPath) return { ok: false, error: 'path outside workspace' }
+  try {
+    await fs.mkdir(absPath, { recursive: true })
+    return { ok: true }
+  } catch (err: any) {
+    return { ok: false, error: err.message }
+  }
+})
+
+ipcMain.handle('workspace-rename', async (_evt, fromRel: string, toRel: string) => {
+  const from = resolveInWorkspace(fromRel)
+  const to = resolveInWorkspace(toRel)
+  if (!from || !to) return { ok: false, error: 'path outside workspace' }
+  try {
+    if (fsSync.existsSync(to)) return { ok: false, error: 'target already exists' }
+    await fs.mkdir(path.dirname(to), { recursive: true })
+    await fs.rename(from, to)
+    return { ok: true }
+  } catch (err: any) {
+    return { ok: false, error: err.message }
+  }
+})
+
+ipcMain.handle('workspace-delete', async (_evt, relPath: string) => {
+  const absPath = resolveInWorkspace(relPath)
+  if (!absPath || absPath === workspaceRoot) return { ok: false, error: 'invalid path' }
+  try {
+    await fs.rm(absPath, { recursive: true, force: true })
+    return { ok: true }
+  } catch (err: any) {
+    return { ok: false, error: err.message }
+  }
+})
+
+// ── Project-wide search (ripgrep with a JS fallback) ─────────
+
+interface SearchMatch { file: string; line: number; column: number; text: string }
+
+ipcMain.handle('workspace-search', async (_evt, query: string, opts?: { caseSensitive?: boolean; regex?: boolean; maxResults?: number }) => {
+  const max = opts?.maxResults ?? 500
+  if (!query) return { ok: true, matches: [] as SearchMatch[] }
+  return await new Promise((resolve) => {
+    const args = ['--no-heading', '--line-number', '--column', '--color', 'never']
+    if (!opts?.caseSensitive) args.push('-i')
+    if (!opts?.regex) args.push('--fixed-strings')
+    args.push('--max-count', '50', query, '.')
+    execFile('rg', args, { cwd: workspaceRoot, maxBuffer: 20 * 1024 * 1024 }, (err, stdout) => {
+      // rg exits 1 when no matches — not an error for us.
+      if (err && (err as any).code !== 1 && !stdout) {
+        // Fallback: no ripgrep. Return a hint; JS fallback is expensive, skip for now.
+        resolve({ ok: false, error: 'ripgrep (rg) not found', matches: [] })
         return
       }
-      const lines = stdout.trim().split('\n').filter(Boolean)
-      const changes = lines.map((line) => {
-        const type = line.slice(0, 2).trim() // e.g. 'M', 'A', '??', 'D'
-        // Git might quote filenames with special chars
-        const file = line.slice(3).trim().replace(/^"|"$/g, '')
-        return { file, type }
-      })
-      resolve(changes)
+      const matches: SearchMatch[] = []
+      for (const line of stdout.split('\n')) {
+        if (!line.trim()) continue
+        // format: relpath:line:col:text
+        const m = line.match(/^(.*?):(\d+):(\d+):(.*)$/)
+        if (!m) continue
+        matches.push({
+          file: m[1].replace(/\\/g, '/'),
+          line: parseInt(m[2], 10),
+          column: parseInt(m[3], 10),
+          text: m[4].slice(0, 400),
+        })
+        if (matches.length >= max) break
+      }
+      resolve({ ok: true, matches })
     })
   })
 })
 
-ipcMain.handle('workspace-git-show-head', async (_evt, relPath: string) => {
+// Replace all occurrences of `find` with `replace` in a single file.
+ipcMain.handle('workspace-replace-in-file', async (_evt, relPath: string, find: string, replace: string, opts?: { regex?: boolean; caseSensitive?: boolean }) => {
+  const absPath = resolveInWorkspace(relPath)
+  if (!absPath) return { ok: false, error: 'path outside workspace' }
+  try {
+    const content = await fs.readFile(absPath, 'utf-8')
+    let next: string
+    if (opts?.regex) {
+      const re = new RegExp(find, opts.caseSensitive ? 'g' : 'gi')
+      next = content.replace(re, replace)
+    } else if (opts?.caseSensitive) {
+      next = content.split(find).join(replace)
+    } else {
+      const re = new RegExp(find.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi')
+      next = content.replace(re, replace)
+    }
+    await fs.writeFile(absPath, next, 'utf-8')
+    return { ok: true }
+  } catch (err: any) {
+    return { ok: false, error: err.message }
+  }
+})
+
+// ── Git (status + diff base + stage/commit/branch/push/pull) ──
+
+function gitExec(args: string[]): Promise<{ ok: boolean; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
-    const gitPath = relPath.replace(/\\/g, '/')
-    execFile('git', ['show', `HEAD:${gitPath}`], { cwd: ROOT }, (err, stdout) => {
-      if (err) {
-        // Return empty content if file is not in HEAD (new untracked file)
-        resolve({ ok: true, content: '' })
-      } else {
-        resolve({ ok: true, content: stdout })
-      }
+    execFile('git', args, { cwd: workspaceRoot, maxBuffer: 20 * 1024 * 1024 }, (err, stdout, stderr) => {
+      resolve({ ok: !err, stdout: stdout || '', stderr: stderr || '' })
     })
   })
+}
+
+ipcMain.handle('workspace-git-status', async () => {
+  const { ok, stdout } = await gitExec(['status', '--porcelain'])
+  if (!ok) return []
+  const lines = stdout.trim().split('\n').filter(Boolean)
+  return lines.map((line) => {
+    const type = line.slice(0, 2).trim()
+    const file = line.slice(3).trim().replace(/^"|"$/g, '')
+    return { file, type, staged: line[0] !== ' ' && line[0] !== '?' }
+  })
+})
+
+ipcMain.handle('workspace-git-show-head', async (_evt, relPath: string) => {
+  const gitPath = relPath.replace(/\\/g, '/')
+  const { ok, stdout } = await gitExec(['show', `HEAD:${gitPath}`])
+  return { ok: true, content: ok ? stdout : '' }
+})
+
+ipcMain.handle('workspace-git-branch', async () => {
+  const cur = await gitExec(['rev-parse', '--abbrev-ref', 'HEAD'])
+  const all = await gitExec(['branch', '--format=%(refname:short)'])
+  return {
+    current: cur.ok ? cur.stdout.trim() : '',
+    branches: all.ok ? all.stdout.split('\n').map((s) => s.trim()).filter(Boolean) : [],
+  }
+})
+
+ipcMain.handle('workspace-git-stage', async (_evt, file: string) => {
+  const { ok, stderr } = await gitExec(['add', '--', file])
+  return { ok, error: ok ? undefined : stderr }
+})
+
+ipcMain.handle('workspace-git-unstage', async (_evt, file: string) => {
+  const { ok, stderr } = await gitExec(['restore', '--staged', '--', file])
+  return { ok, error: ok ? undefined : stderr }
+})
+
+ipcMain.handle('workspace-git-stage-all', async () => {
+  const { ok, stderr } = await gitExec(['add', '-A'])
+  return { ok, error: ok ? undefined : stderr }
+})
+
+ipcMain.handle('workspace-git-commit', async (_evt, message: string) => {
+  if (!message?.trim()) return { ok: false, error: 'commit message required' }
+  const { ok, stdout, stderr } = await gitExec(['commit', '-m', message])
+  return { ok, output: stdout, error: ok ? undefined : (stderr || stdout) }
+})
+
+ipcMain.handle('workspace-git-checkout', async (_evt, branch: string, create?: boolean) => {
+  const args = create ? ['checkout', '-b', branch] : ['checkout', branch]
+  const { ok, stderr } = await gitExec(args)
+  return { ok, error: ok ? undefined : stderr }
+})
+
+ipcMain.handle('workspace-git-push', async () => {
+  const { ok, stdout, stderr } = await gitExec(['push'])
+  return { ok, output: stdout + stderr }
+})
+
+ipcMain.handle('workspace-git-pull', async () => {
+  const { ok, stdout, stderr } = await gitExec(['pull'])
+  return { ok, output: stdout + stderr }
 })
 
 // ── Task update ─────────────────────────────────────────────────
 
 
 ipcMain.handle('update-task', async (_evt, id: string, changes: { deps?: string[]; priority?: 'low' | 'medium' | 'high' }) => {
-  const tasksPath = path.join(SHARED, 'tasks.json')
-  try {
-    const raw = await fs.readFile(tasksPath, 'utf-8')
-    const data = JSON.parse(raw)
-    const task = data.tasks.find((t: { id: string }) => t.id === id)
-    if (!task) return { ok: false }
-    if (changes.deps !== undefined) task.deps = changes.deps
-    if (changes.priority !== undefined) task.priority = changes.priority
-    task.updated_at = nowStamp()
-    await fs.writeFile(tasksPath, JSON.stringify(data, null, 2) + '\n')
-    return { ok: true }
-  } catch {
-    return { ok: false }
-  }
+  const task = db.getTask(id)
+  if (!task) return { ok: false }
+  db.updateTaskFields(id, {
+    deps: changes.deps !== undefined ? changes.deps : undefined,
+    priority: changes.priority !== undefined ? changes.priority : undefined,
+    updated_at: nowStamp(),
+  })
+  return { ok: true }
 })
 
 // ── All logs (no line limit) ────────────────────────────────────
@@ -1256,14 +1528,7 @@ ipcMain.handle('update-task', async (_evt, id: string, changes: { deps?: string[
 ipcMain.handle('get-all-logs', async () => {
   const result: { agent: string; lines: string[] }[] = []
   for (const agent of await getRoles()) {
-    try {
-      const file = path.join(SHARED, 'logs', `${agent}.log`)
-      const content = await fs.readFile(file, 'utf-8')
-      const lines = content.trim().split('\n').filter(Boolean)
-      result.push({ agent, lines })
-    } catch {
-      result.push({ agent, lines: [] })
-    }
+    result.push({ agent, lines: db.allLogs(agent) })
   }
   return result
 })
@@ -1281,19 +1546,97 @@ ipcMain.handle('pty-restart', async (_evt, agent: string) => {
   return { ok: true }
 })
 
+// ── Inline AI edit (streaming) ───────────────────────────────
+// Renderer calls 'ai-inline-edit' with a requestId; deltas stream back on
+// 'ai-inline-chunk:<requestId>' and the final/err arrives on
+// 'ai-inline-done:<requestId>'. 'ai-inline-cancel' aborts an in-flight request.
+
+const inlineEditAborts = new Map<string, AbortController>()
+
+ipcMain.handle('ai-inline-edit', async (_evt, requestId: string, params: InlineEditParams) => {
+  const ac = new AbortController()
+  inlineEditAborts.set(requestId, ac)
+  const send = (channel: string, payload: unknown) => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send(channel, payload)
+    }
+  }
+  try {
+    const full = await streamInlineEdit(
+      SHARED,
+      params,
+      decryptKey,
+      (delta) => send(`ai-inline-chunk:${requestId}`, delta),
+      ac.signal,
+    )
+    send(`ai-inline-done:${requestId}`, { ok: true, text: stripCodeFence(full) })
+    return { ok: true }
+  } catch (e) {
+    const msg = (e as Error).message || String(e)
+    send(`ai-inline-done:${requestId}`, { ok: false, error: msg })
+    return { ok: false, error: msg }
+  } finally {
+    inlineEditAborts.delete(requestId)
+  }
+})
+
+ipcMain.handle('ai-inline-cancel', (_evt, requestId: string) => {
+  const ac = inlineEditAborts.get(requestId)
+  if (ac) ac.abort()
+  inlineEditAborts.delete(requestId)
+  return { ok: true }
+})
+
+// ── AI chat (streaming coding assistant) ─────────────────────
+// Same streaming contract as inline edit, keyed by requestId.
+
+const chatAborts = new Map<string, AbortController>()
+
+ipcMain.handle('ai-chat', async (_evt, requestId: string, params: ChatParams) => {
+  const ac = new AbortController()
+  chatAborts.set(requestId, ac)
+  const send = (channel: string, payload: unknown) => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send(channel, payload)
+    }
+  }
+  try {
+    const full = await streamChat(
+      SHARED,
+      params,
+      decryptKey,
+      (delta) => send(`ai-chat-chunk:${requestId}`, delta),
+      ac.signal,
+    )
+    send(`ai-chat-done:${requestId}`, { ok: true, text: full })
+    return { ok: true }
+  } catch (e) {
+    const msg = (e as Error).message || String(e)
+    send(`ai-chat-done:${requestId}`, { ok: false, error: msg })
+    return { ok: false, error: msg }
+  } finally {
+    chatAborts.delete(requestId)
+  }
+})
+
+ipcMain.handle('ai-chat-cancel', (_evt, requestId: string) => {
+  const ac = chatAborts.get(requestId)
+  if (ac) ac.abort()
+  chatAborts.delete(requestId)
+  return { ok: true }
+})
+
 // ── Lifecycle ───────────────────────────────────────────────
 
 app.whenReady().then(async () => {
+  if (process.platform === 'win32') app.setAppUserModelId('com.orqon.ide')
   createWindow()
-  // Ensure runtime directories exist (gitignored, may not be present on fresh checkout
-  // or after scripts/reset.sh). Without these, fsSync.watch() in watchInboxes() throws
-  // ENOENT and aborts the rest of this handler — meaning no pre-warm and no idle GC.
-  for (const sub of ['inbox', 'outbox', 'logs', 'artifacts']) {
-    try {
-      await fs.mkdir(path.join(SHARED, sub), { recursive: true })
-    } catch (err) {
-      console.error(`Failed to mkdir shared/${sub}:`, err)
-    }
+  // Ensure the artifacts dir exists (gitignored; agents write task outputs here).
+  // Coordination state (tasks/messages/usage/logs) lives in the DB, not files.
+  try {
+    await fs.mkdir(path.join(SHARED, 'artifacts'), { recursive: true })
+  } catch (err) {
+    console.error('Failed to mkdir shared/artifacts:', err)
   }
   try {
     await watchInboxes()
@@ -1311,6 +1654,10 @@ app.whenReady().then(async () => {
     }
   }
   startIdleGc()
+  // Group coordinator polls for group signals. It is a no-op each tick unless
+  // orchestration.enabled is true in agents-config.json, so this is safe to
+  // always start.
+  coordinator.start()
 })
 
 app.on('window-all-closed', () => {

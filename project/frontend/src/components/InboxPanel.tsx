@@ -35,7 +35,7 @@ export function InboxPanel({ summary, config, onConfigChange }: Props) {
   const entry = config?.agents[selected]
   const currentAgentConfig = {
     provider: entry?.provider ?? 'anthropic',
-    model: entry?.model ?? entry?.backend?.model ?? 'unknown',
+    model: entry?.model ?? 'unknown',
   }
 
   return (

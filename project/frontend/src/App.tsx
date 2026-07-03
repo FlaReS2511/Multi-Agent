@@ -1,32 +1,42 @@
 import { useEffect, useState, useCallback } from 'react'
+import { AnimatePresence, motion } from 'framer-motion'
+import { ListTodo, ClipboardList, Package, X, Minus, Square, Copy } from 'lucide-react'
 import { TasksPanel } from './components/TasksPanel'
 import { TaskInboxPanel } from './components/TaskInboxPanel'
-import { LogsPanel } from './components/LogsPanel'
 import { NewTaskDialog } from './components/NewTaskDialog'
-import { TerminalsView } from './components/TerminalsView'
 import { ArtifactViewer } from './components/ArtifactViewer'
 import { PlanComposer } from './components/PlanComposer'
 import { BackendSettingsModal } from './components/BackendSettingsModal'
 import { CostBadge } from './components/CostBadge'
 import { CostDashboardModal } from './components/CostDashboardModal'
 import { IDEView } from './components/IDEView'
-import { Task, InboxSummary, AgentLogs, AgentsConfig, activeAgents } from './lib/api'
+import { OrqonLogo } from './components/OrqonLogo'
+import { useAnimationsEnabled } from './lib/uiSettings'
+import { Task, InboxSummary, AgentsConfig, activeAgents } from './lib/api'
 
-type View = 'dashboard' | 'plan' | 'terminals' | 'artifacts' | 'ide'
+// IDE-first shell: the IDE is always the base layer. Multi-agent functions
+// (Tasks, Plan, Artifacts) open as a right-side slide-in panel so switching
+// between them never unmounts the editor or loses its state.
+type AgentPanel = 'tasks' | 'plan' | 'artifacts' | null
 
 const POLL_MS = 2000
+
+// Wind-up: panel content elements rise/fade in after the panel slides open.
+const PANEL_ITEM = {
+  hidden: { opacity: 0, y: 10 },
+  show: { opacity: 1, y: 0, transition: { duration: 0.3, ease: 'easeOut' } },
+}
 
 export default function App() {
   const [tasks, setTasks] = useState<Task[]>([])
   const [inbox, setInbox] = useState<InboxSummary[]>([])
-  const [logs, setLogs] = useState<AgentLogs[]>([])
   const [config, setConfig] = useState<AgentsConfig | null>(null)
-  const [, setRoot] = useState<string>('')
   const [lastUpdate, setLastUpdate] = useState<Date>(new Date())
   const [showNewTask, setShowNewTask] = useState(false)
   const [showBackendSettings, setShowBackendSettings] = useState(false)
   const [showCostDashboard, setShowCostDashboard] = useState(false)
-  const [view, setView] = useState<View>('dashboard')
+  const [panel, setPanel] = useState<AgentPanel>(null)
+  const animationsOn = useAnimationsEnabled()
   const [autoTrigger, setAutoTrigger] = useState(true)
   const [lastTriggered, setLastTriggered] = useState<{ agent: string; ts: number } | null>(null)
   const [artifactTaskId, setArtifactTaskId] = useState<string | null>(null)
@@ -44,27 +54,19 @@ export default function App() {
   const flash =
     lastTriggered && Date.now() - lastTriggered.ts < 3000 ? lastTriggered : null
 
-  useEffect(() => {
-    window.api.getRoot().then(setRoot)
-  }, [])
-
   const refreshConfig = useCallback(() => {
     window.api.getAgentsConfig().then(setConfig)
   }, [])
 
-  useEffect(() => {
-    refreshConfig()
-  }, [refreshConfig])
+  useEffect(() => { refreshConfig() }, [refreshConfig])
 
   const refreshAll = useCallback(async () => {
-    const [t, i, l] = await Promise.all([
+    const [t, i] = await Promise.all([
       window.api.getTasks(),
       window.api.getInboxSummary(),
-      window.api.getLogs(),
     ])
     setTasks(t.tasks)
     setInbox(i)
-    setLogs(l)
     setLastUpdate(new Date())
   }, [])
 
@@ -88,28 +90,28 @@ export default function App() {
 
   const openArtifact = (taskId: string) => {
     setArtifactTaskId(taskId)
-    setView('artifacts')
+    setPanel('artifacts')
   }
+
+  const togglePanel = (p: Exclude<AgentPanel, null>) =>
+    setPanel((cur) => (cur === p ? null : p))
 
   return (
     <div className="h-screen flex flex-col bg-zinc-950 text-zinc-200">
-      {/* Header / titlebar */}
+      {/* Slim header / titlebar */}
       <header
-        className="h-11 flex items-center justify-between px-4 border-b border-zinc-800 bg-zinc-950/80 backdrop-blur"
+        className="h-11 flex items-center justify-between px-4 border-b border-zinc-800 bg-zinc-950/80 backdrop-blur flex-shrink-0"
         style={{ WebkitAppRegion: 'drag' } as React.CSSProperties}
       >
-        <div className="flex items-center gap-3 pl-16">
-          <div className="size-2 rounded-full bg-emerald-400 shadow-[0_0_8px_#34d399]" />
-          <h1 className="text-sm font-semibold tracking-wide">Multi-Agent Monitor</h1>
+        <div className="flex items-center gap-2.5">
+          <OrqonLogo size={22} />
           <div
             className="ml-2 flex items-center bg-zinc-900 border border-zinc-800 rounded p-0.5"
             style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
           >
-            <ViewTab label="Dashboard" active={view === 'dashboard'} onClick={() => setView('dashboard')} />
-            <ViewTab label="Plan" active={view === 'plan'} onClick={() => setView('plan')} />
-            <ViewTab label="Artifacts" active={view === 'artifacts'} onClick={() => setView('artifacts')} />
-            <ViewTab label="IDE" active={view === 'ide'} onClick={() => setView('ide')} />
-            <ViewTab label="Terminals" active={view === 'terminals'} onClick={() => setView('terminals')} />
+            <PanelTab label="Tasks" icon={<ListTodo size={13} />} active={panel === 'tasks'} onClick={() => togglePanel('tasks')} badge={totalInbox} />
+            <PanelTab label="Plan" icon={<ClipboardList size={13} />} active={panel === 'plan'} onClick={() => togglePanel('plan')} />
+            <PanelTab label="Artifacts" icon={<Package size={13} />} active={panel === 'artifacts'} onClick={() => togglePanel('artifacts')} />
           </div>
         </div>
         <div
@@ -120,12 +122,10 @@ export default function App() {
           <Stat label="Inbox" value={totalInbox} color="text-amber-300" />
           {blockedCount > 0 && <Stat label="Blocked" value={blockedCount} color="text-rose-300" />}
           <CostBadge onClick={() => setShowCostDashboard(true)} />
-          <span className="text-zinc-600 font-mono">
-            {lastUpdate.toLocaleTimeString()}
-          </span>
+          <span className="text-zinc-600 font-mono">{lastUpdate.toLocaleTimeString()}</span>
           {flash && (
             <span className="px-2 py-0.5 text-[10px] font-medium rounded bg-emerald-500/20 text-emerald-300 animate-pulse">
-              ⚡ triggered {flash.agent}
+              ⚡ {flash.agent}
             </span>
           )}
           <button
@@ -133,11 +133,7 @@ export default function App() {
               const next = !autoTrigger
               window.api.setAutoTrigger(next).then((r) => setAutoTrigger(r.enabled))
             }}
-            title={
-              autoTrigger
-                ? 'Auto-trigger ON — agent tự "check inbox" khi có message mới'
-                : 'Auto-trigger OFF — phải gõ "check inbox" thủ công'
-            }
+            title={autoTrigger ? 'Auto-trigger ON' : 'Auto-trigger OFF'}
             className={`px-2 py-1 text-[10px] font-medium rounded border transition-colors flex items-center gap-1.5 ${
               autoTrigger
                 ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300'
@@ -145,11 +141,11 @@ export default function App() {
             }`}
           >
             <span className={`size-1.5 rounded-full ${autoTrigger ? 'bg-emerald-400' : 'bg-zinc-600'}`} />
-            Auto-trigger {autoTrigger ? 'ON' : 'OFF'}
+            Auto {autoTrigger ? 'ON' : 'OFF'}
           </button>
           <button
             onClick={() => setShowBackendSettings(true)}
-            title="Backend settings — switch each agent between Claude Code, Codex, Gemini, direct API, or LM Studio"
+            title="Backend settings — providers, models, API keys"
             className="px-2 py-1 text-[11px] font-medium rounded border border-zinc-700 bg-zinc-900 text-zinc-400 hover:text-zinc-200 hover:border-zinc-600 transition-colors"
           >
             ⚙
@@ -160,54 +156,87 @@ export default function App() {
           >
             <span className="text-base leading-none">+</span> New Task
           </button>
+          <WindowControls />
         </div>
       </header>
 
-      {/* Main view */}
-      {view === 'dashboard' && (
-        <main className="flex-1 grid grid-cols-12 gap-px bg-zinc-800 overflow-hidden">
-          <section className="col-span-5 bg-zinc-950 overflow-hidden">
-            <TasksPanel
-              tasks={tasks}
-              onChanged={refreshAll}
-              onOpenArtifact={openArtifact}
-              selectedId={selectedTaskId}
-              onSelectTask={setSelectedTaskId}
-            />
-          </section>
-          <section className="col-span-4 bg-zinc-950 overflow-hidden">
-            <TaskInboxPanel taskId={selectedTaskId} task={selectedTask} />
-          </section>
-          <section className="col-span-3 bg-zinc-950 overflow-hidden">
-            <LogsPanel logs={logs} agents={agents} />
-          </section>
-        </main>
-      )}
-      {view === 'plan' && (
-        <main className="flex-1 overflow-hidden">
-          <PlanComposer />
-        </main>
-      )}
-      {view === 'artifacts' && (
-        <main className="flex-1 overflow-hidden">
-          <ArtifactViewer initialTaskId={artifactTaskId} />
-        </main>
-      )}
-      {view === 'ide' && (
-        <main className="flex-1 overflow-hidden">
+      {/* Body: IDE base layer + slide-in agent panel */}
+      <div className="flex-1 min-h-0 relative overflow-hidden">
+        {/* IDE always mounted */}
+        <div className="absolute inset-0">
           <IDEView />
-        </main>
-      )}
-      {view === 'terminals' && (
-        <main className="flex-1 overflow-hidden">
-          <TerminalsView config={config} onConfigChange={refreshConfig} />
-        </main>
-      )}
+        </div>
+
+        {/* Right-side agent panel */}
+        <AnimatePresence>
+          {panel && (
+            <>
+              <motion.div
+                className="absolute inset-0 bg-black/40 z-20"
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                transition={{ duration: animationsOn ? 0.15 : 0 }}
+                onClick={() => setPanel(null)}
+              />
+              <motion.aside
+                className="absolute top-0 right-0 bottom-0 w-[680px] max-w-[92vw] z-30 bg-zinc-950 border-l border-zinc-800 shadow-2xl flex flex-col"
+                initial={animationsOn ? { x: '100%' } : false}
+                animate={{ x: 0 }}
+                exit={animationsOn ? { x: '100%' } : { opacity: 0 }}
+                transition={{ type: 'spring', stiffness: 320, damping: 34 }}
+                variants={animationsOn ? { hidden: {}, show: { transition: { delayChildren: 0.18, staggerChildren: 0.08 } } } : undefined}
+              >
+                <motion.div
+                  variants={animationsOn ? PANEL_ITEM : undefined}
+                  initial={animationsOn ? 'hidden' : false}
+                  animate={animationsOn ? 'show' : false}
+                  className="h-10 flex items-center justify-between px-4 border-b border-zinc-800 flex-shrink-0"
+                >
+                  <span className="text-xs font-semibold uppercase tracking-wider text-zinc-300">
+                    {panel === 'tasks' && 'Tasks'}
+                    {panel === 'plan' && 'Plan Composer'}
+                    {panel === 'artifacts' && 'Artifacts'}
+                  </span>
+                  <button onClick={() => setPanel(null)} className="text-zinc-500 hover:text-zinc-200">
+                    <X size={16} />
+                  </button>
+                </motion.div>
+                <motion.div
+                  variants={animationsOn ? PANEL_ITEM : undefined}
+                  initial={animationsOn ? 'hidden' : false}
+                  animate={animationsOn ? 'show' : false}
+                  className="flex-1 min-h-0 overflow-hidden"
+                >
+                  {panel === 'tasks' && (
+                    <div className="h-full flex flex-col">
+                      <div className="flex-1 min-h-0 overflow-hidden">
+                        <TasksPanel
+                          tasks={tasks}
+                          onChanged={refreshAll}
+                          onOpenArtifact={openArtifact}
+                          selectedId={selectedTaskId}
+                          onSelectTask={setSelectedTaskId}
+                        />
+                      </div>
+                      <div className="h-[45%] min-h-0 border-t border-zinc-800 overflow-hidden">
+                        <TaskInboxPanel taskId={selectedTaskId} task={selectedTask} />
+                      </div>
+                    </div>
+                  )}
+                  {panel === 'plan' && <PlanComposer />}
+                  {panel === 'artifacts' && <ArtifactViewer initialTaskId={artifactTaskId} />}
+                </motion.div>
+              </motion.aside>
+            </>
+          )}
+        </AnimatePresence>
+      </div>
 
       {/* Footer */}
-      <footer className="h-6 px-3 border-t border-zinc-800 flex items-center justify-between text-[10px] text-zinc-600 bg-zinc-950">
-        <span>Polling every {POLL_MS}ms</span>
-        <span>Multi-Agent Dashboard v0.3</span>
+      <footer className="h-6 px-3 border-t border-zinc-800 flex items-center justify-between text-[10px] text-zinc-600 bg-zinc-950 flex-shrink-0">
+        <span>API-only · SQLite state · polling {POLL_MS}ms</span>
+        <span>Orqon v0.4</span>
       </footer>
 
       <NewTaskDialog
@@ -217,12 +246,10 @@ export default function App() {
         existingTasks={tasks}
         agents={agents}
       />
-
       <BackendSettingsModal
         open={showBackendSettings}
         onClose={() => { setShowBackendSettings(false); refreshConfig() }}
       />
-
       <CostDashboardModal
         open={showCostDashboard}
         onClose={() => setShowCostDashboard(false)}
@@ -231,15 +258,23 @@ export default function App() {
   )
 }
 
-function ViewTab({ label, active, onClick }: { label: string; active: boolean; onClick: () => void }) {
+function PanelTab({ label, icon, active, onClick, badge }: {
+  label: string; icon: React.ReactNode; active: boolean; onClick: () => void; badge?: number
+}) {
   return (
     <button
       onClick={onClick}
-      className={`px-2.5 py-1 text-xs font-medium rounded transition-colors ${
+      className={`px-2.5 py-1 text-xs font-medium rounded transition-colors flex items-center gap-1.5 relative ${
         active ? 'bg-zinc-700 text-white' : 'text-zinc-400 hover:text-zinc-200'
       }`}
     >
+      {icon}
       {label}
+      {badge != null && badge > 0 && (
+        <span className="ml-0.5 px-1 min-w-4 text-center rounded-full bg-amber-500/80 text-zinc-950 text-[9px] font-bold">
+          {badge}
+        </span>
+      )}
     </button>
   )
 }
@@ -249,6 +284,45 @@ function Stat({ label, value, color }: { label: string; value: number; color: st
     <div className="flex items-center gap-1.5">
       <span className="uppercase tracking-wider text-[10px] text-zinc-500">{label}</span>
       <span className={`font-mono font-semibold ${color}`}>{value}</span>
+    </div>
+  )
+}
+
+function WindowControls() {
+  const [maximized, setMaximized] = useState(false)
+
+  useEffect(() => {
+    window.api.windowIsMaximized().then(setMaximized).catch(() => {})
+    const off = window.api.onWindowMaximizedChanged(setMaximized)
+    return off
+  }, [])
+
+  return (
+    <div
+      className="flex items-center -mr-4"
+      style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
+    >
+      <button
+        onClick={() => window.api.windowMinimize()}
+        title="Minimize"
+        className="w-11 h-11 flex items-center justify-center text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800/70 transition-colors"
+      >
+        <Minus size={15} />
+      </button>
+      <button
+        onClick={() => window.api.windowMaximizeToggle().then(setMaximized)}
+        title={maximized ? 'Restore' : 'Maximize'}
+        className="w-11 h-11 flex items-center justify-center text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800/70 transition-colors"
+      >
+        {maximized ? <Copy size={12} className="-scale-x-100" /> : <Square size={12} />}
+      </button>
+      <button
+        onClick={() => window.api.windowClose()}
+        title="Close"
+        className="w-11 h-11 flex items-center justify-center text-zinc-400 hover:text-white hover:bg-red-600 transition-colors"
+      >
+        <X size={16} />
+      </button>
     </div>
   )
 }

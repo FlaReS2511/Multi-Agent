@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="100" height="100">
+  <defs>
+    <filter id="neon-glow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="1.8" result="blur" />
+      <feComposite in="SourceGraphic" in2="blur" operator="over" />
+    </filter>
+  </defs>
+  <polygon points="50,7 87.3,28.5 87.3,71.5 50,93 12.7,71.5 12.7,28.5" fill="none" stroke="#1b3a32" stroke-width="1" stroke-dasharray="3 3" />
+  <g stroke="#00FFCC" stroke-width="1" opacity="0.3">
+    <line x1="50" y1="50" x2="50" y2="15" />
+    <line x1="50" y1="50" x2="50" y2="85" />
+    <line x1="50" y1="50" x2="19.7" y2="32.5" />
+    <line x1="50" y1="50" x2="80.3" y2="32.5" />
+    <line x1="50" y1="50" x2="19.7" y2="67.5" />
+    <line x1="50" y1="50" x2="80.3" y2="67.5" />
+  </g>
+  <polygon points="50,15 80.3,32.5 80.3,67.5 50,85 19.7,67.5 19.7,32.5" fill="#0A1210" stroke="#00FFCC" stroke-width="2.5" filter="url(#neon-glow)" />
+  <g filter="url(#neon-glow)">
+    <circle cx="50" cy="15" r="4.5" fill="#00FFCC" />
+    <circle cx="80.3" cy="32.5" r="4.5" fill="#00FFCC" />
+    <circle cx="80.3" cy="67.5" r="4.5" fill="#00FFCC" />
+    <circle cx="50" cy="85" r="4.5" fill="#00FFCC" />
+    <circle cx="19.7" cy="67.5" r="4.5" fill="#00FFCC" />
+    <circle cx="19.7" cy="32.5" r="4.5" fill="#00FFCC" />
+  </g>
+  <g fill="#0A1210">
+    <circle cx="50" cy="15" r="1.5" />
+    <circle cx="80.3" cy="32.5" r="1.5" />
+    <circle cx="80.3" cy="67.5" r="1.5" />
+    <circle cx="50" cy="85" r="1.5" />
+    <circle cx="19.7" cy="67.5" r="1.5" />
+    <circle cx="19.7" cy="32.5" r="1.5" />
+  </g>
+  <polygon points="50,38 60.4,44 60.4,56 50,62 39.6,56 39.6,44" fill="#00FFCC" opacity="0.8" />
+  <circle cx="50" cy="50" r="2.5" fill="#0A1210" />
+</svg>

@@ -1,5 +1,6 @@
 import React, { useState } from 'react'
-import { Folder, FolderOpen, File, ChevronDown, ChevronRight } from 'lucide-react'
+import { Folder, FolderOpen, ChevronDown, ChevronRight } from 'lucide-react'
+import { getFileIcon } from './fileIcons'
 
 interface FileNode {
   name: string
@@ -8,16 +9,33 @@ interface FileNode {
   children?: FileNode[]
 }
 
-interface IDEFileTreeProps {
+interface FileOps {
+  onRename?: (relPath: string) => void
+  onDelete?: (relPath: string) => void
+  onNewFile?: (parentDir: string) => void
+  onNewFolder?: (parentDir: string) => void
+}
+
+interface IDEFileTreeProps extends FileOps {
   files: FileNode[]
   selectedFile: string | null
   onSelectFile: (relPath: string) => void
   gitChanges: { file: string; type: string }[]
 }
 
-export function IDEFileTree({ files, selectedFile, onSelectFile, gitChanges }: IDEFileTreeProps) {
+interface MenuState {
+  x: number
+  y: number
+  node: FileNode
+}
+
+export function IDEFileTree({ files, selectedFile, onSelectFile, gitChanges, onRename, onDelete, onNewFile, onNewFolder }: IDEFileTreeProps) {
+  const [menu, setMenu] = useState<MenuState | null>(null)
+
+  const ops: FileOps = { onRename, onDelete, onNewFile, onNewFolder }
+
   return (
-    <div className="text-xs select-none font-mono text-zinc-300">
+    <div className="text-xs select-none font-mono text-zinc-300" onClick={() => setMenu(null)}>
       {files.map((node) => (
         <TreeNode
           key={node.relPath}
@@ -26,9 +44,43 @@ export function IDEFileTree({ files, selectedFile, onSelectFile, gitChanges }: I
           selectedFile={selectedFile}
           onSelectFile={onSelectFile}
           gitChanges={gitChanges}
+          onContextMenu={(e, n) => {
+            e.preventDefault()
+            e.stopPropagation()
+            setMenu({ x: e.clientX, y: e.clientY, node: n })
+          }}
         />
       ))}
+
+      {menu && (
+        <div
+          className="fixed z-50 min-w-40 bg-zinc-900 border border-zinc-700 rounded shadow-2xl py-1 text-xs"
+          style={{ top: menu.y, left: menu.x }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          {menu.node.isDir && (
+            <>
+              <MenuItem label="New File" onClick={() => { ops.onNewFile?.(menu.node.relPath); setMenu(null) }} />
+              <MenuItem label="New Folder" onClick={() => { ops.onNewFolder?.(menu.node.relPath); setMenu(null) }} />
+              <div className="my-1 border-t border-zinc-800" />
+            </>
+          )}
+          <MenuItem label="Rename" onClick={() => { ops.onRename?.(menu.node.relPath); setMenu(null) }} />
+          <MenuItem label="Delete" danger onClick={() => { ops.onDelete?.(menu.node.relPath); setMenu(null) }} />
+        </div>
+      )}
     </div>
+  )
+}
+
+function MenuItem({ label, onClick, danger }: { label: string; onClick: () => void; danger?: boolean }) {
+  return (
+    <button
+      onClick={onClick}
+      className={`w-full text-left px-3 py-1.5 hover:bg-zinc-800 ${danger ? 'text-rose-300' : 'text-zinc-200'}`}
+    >
+      {label}
+    </button>
   )
 }
 
@@ -38,26 +90,20 @@ interface TreeNodeProps {
   selectedFile: string | null
   onSelectFile: (relPath: string) => void
   gitChanges: { file: string; type: string }[]
+  onContextMenu: (e: React.MouseEvent, node: FileNode) => void
 }
 
-function TreeNode({ node, depth, selectedFile, onSelectFile, gitChanges }: TreeNodeProps) {
+function TreeNode({ node, depth, selectedFile, onSelectFile, gitChanges, onContextMenu }: TreeNodeProps) {
   const [isOpen, setIsOpen] = useState(depth === 0) // expand root items by default
   const isSelected = selectedFile === node.relPath
 
-  // Find if this node (or any of its children recursively) has git changes
-  const hasGitChanges = (n: FileNode): boolean => {
-    if (gitChanges.some((c) => c.file === n.relPath || c.file.startsWith(n.relPath + '/'))) {
-      return true
-    }
-    return false
-  }
+  const hasGitChanges = (n: FileNode): boolean =>
+    gitChanges.some((c) => c.file === n.relPath || c.file.startsWith(n.relPath + '/'))
 
-  // Get specific Git change status for a file node
   const getGitStatus = (n: FileNode) => {
     if (n.isDir) return null
     const change = gitChanges.find((c) => c.file === n.relPath)
-    if (!change) return null
-    return change.type // 'M', 'A', '??', etc.
+    return change ? change.type : null
   }
 
   const gitStatus = getGitStatus(node)
@@ -87,6 +133,7 @@ function TreeNode({ node, depth, selectedFile, onSelectFile, gitChanges }: TreeN
     <div>
       <div
         onClick={handleClick}
+        onContextMenu={(e) => onContextMenu(e, node)}
         className={`flex items-center gap-1.5 py-1 px-2 cursor-pointer transition-colors group rounded ${
           isSelected ? 'bg-zinc-800 text-white' : 'hover:bg-zinc-900/60'
         }`}
@@ -111,8 +158,8 @@ function TreeNode({ node, depth, selectedFile, onSelectFile, gitChanges }: TreeN
         ) : (
           <>
             <span className="w-3.5" /> {/* alignment spacer for files */}
-            <span className="text-zinc-500">
-              <File size={14} className={labelColor} />
+            <span className="shrink-0 text-[14px] flex items-center" style={{ color: getFileIcon(node.name).color }}>
+              {getFileIcon(node.name).icon}
             </span>
             <span className={`truncate ${labelColor} flex-1`}>
               {node.name}
@@ -142,6 +189,7 @@ function TreeNode({ node, depth, selectedFile, onSelectFile, gitChanges }: TreeN
               selectedFile={selectedFile}
               onSelectFile={onSelectFile}
               gitChanges={gitChanges}
+              onContextMenu={onContextMenu}
             />
           ))}
         </div>

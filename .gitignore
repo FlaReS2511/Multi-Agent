@@ -23,13 +23,20 @@ pnpm-debug.log*
 # Electron / build artefacts
 project/frontend/.vite/
 
-# Runtime files
+# Runtime files (legacy file-based storage — now in shared/state.db; kept
+# ignored so any leftover or migration-backup copies aren't committed)
 shared/inbox/
 shared/outbox/
 shared/logs/
 shared/.secrets.json
 
-# Auto-generated agent context copies (canonical: agents/<role>/AGENT.md)
+# SQLite state (source of truth — local runtime, not committed)
+shared/state.db
+shared/state.db-wal
+shared/state.db-shm
+shared/.backup/
+
+# Auto-generated agent context copies (CLI-only; not generated in API mode)
 agents/*/CLAUDE.md
 agents/*/GEMINI.md
 agents/*/AGENTS.md

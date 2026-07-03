@@ -1,118 +1,127 @@
 {
+  "orchestration": {
+    "enabled": true,
+    "max_concurrent_groups": 3,
+    "max_groups_per_task": 20,
+    "max_recursion_depth": 3,
+    "budget_per_task_usd": 5,
+    "budget_per_group_usd": 1,
+    "max_retries_per_group": 3,
+    "reviewer_level_offset": 1,
+    "review_policy": "on-demand",
+    "reviewer_for": {
+      "backend-engineer": "be-reviewer",
+      "frontend-engineer": "fe-reviewer",
+      "ai-engineer": "ai-reviewer"
+    },
+    "heartbeat_timeout_sec": 300
+  },
+  "providers": {
+    "vietapi": {
+      "kind": "openai-compatible",
+      "name": "VietAPI",
+      "base_url": "https://api.vietapi.tech/v1",
+      "models": [
+        "claude-opus-4.8",
+        "claude-opus-4.8-thinking",
+        "claude-opus-4.7",
+        "gpt-5.5",
+        "gpt-5.5-high",
+        "deepseek-v4-pro",
+        "deepseek-v4-flash",
+        "glm-5.2",
+        "qwen3.5",
+        "kimi-k2.6"
+      ]
+    },
+    "anthropic": {
+      "kind": "anthropic",
+      "name": "Anthropic",
+      "models": [
+        "claude-opus-4-7",
+        "claude-sonnet-4-6",
+        "claude-haiku-4-5"
+      ]
+    },
+    "openai": {
+      "kind": "openai",
+      "name": "OpenAI",
+      "models": [
+        "gpt-5",
+        "gpt-5-mini"
+      ]
+    },
+    "google": {
+      "kind": "google",
+      "name": "Google",
+      "models": [
+        "gemini-2.5-pro",
+        "gemini-2.5-flash"
+      ]
+    },
+    "lmstudio": {
+      "kind": "openai-compatible",
+      "name": "LM Studio (local)",
+      "base_url": "http://localhost:1234/v1",
+      "models": []
+    }
+  },
   "agents": {
     "planner": {
       "backend": {
-        "kind": "claude-cli"
+        "mode": "api"
       },
-      "provider": "anthropic",
-      "model": "claude-opus-4-7"
+      "provider": "vietapi",
+      "model": "claude-opus-4.8"
     },
     "orchestrator": {
       "backend": {
-        "kind": "claude-cli",
-        "model": "claude-opus-4-7"
+        "mode": "api"
       },
-      "provider": "anthropic",
-      "model": "claude-opus-4-7"
+      "provider": "vietapi",
+      "model": "claude-opus-4.8-thinking"
     },
     "backend-engineer": {
       "backend": {
-        "kind": "codex-cli",
-        "model": "gpt-5-codex"
+        "mode": "api"
       },
-      "provider": "openai",
-      "model": "gpt-5-codex"
+      "provider": "vietapi",
+      "model": "glm-5.2"
     },
     "frontend-engineer": {
       "backend": {
-        "kind": "claude-cli"
+        "mode": "api"
       },
-      "provider": "anthropic",
-      "model": "claude-sonnet-4-6"
+      "provider": "vietapi",
+      "model": "glm-5.2"
     },
     "ai-engineer": {
       "backend": {
-        "kind": "claude-cli"
+        "mode": "api"
       },
-      "provider": "anthropic",
-      "model": "claude-sonnet-4-6"
+      "provider": "vietapi",
+      "model": "gpt-5.5-high"
     },
     "be-reviewer": {
       "backend": {
-        "kind": "claude-cli"
+        "mode": "api"
       },
-      "provider": "anthropic",
-      "model": "claude-sonnet-4-6"
+      "provider": "vietapi",
+      "model": "gpt-5.5"
     },
     "fe-reviewer": {
       "backend": {
-        "kind": "claude-cli"
+        "mode": "api"
       },
-      "provider": "anthropic",
-      "model": "claude-sonnet-4-6"
+      "provider": "vietapi",
+      "model": "gpt-5.5"
     },
     "ai-reviewer": {
       "backend": {
-        "kind": "claude-cli"
+        "mode": "api"
       },
-      "provider": "anthropic",
-      "model": "claude-sonnet-4-6"
+      "provider": "vietapi",
+      "model": "claude-opus-4.8"
     }
-  },
-  "available_models": [
-    {
-      "provider": "anthropic",
-      "id": "claude-opus-4-7",
-      "label": "Claude Opus 4.7",
-      "tier": "smart"
-    },
-    {
-      "provider": "anthropic",
-      "id": "claude-sonnet-4-6",
-      "label": "Claude Sonnet 4.6",
-      "tier": "balanced"
-    },
-    {
-      "provider": "anthropic",
-      "id": "claude-haiku-4-5",
-      "label": "Claude Haiku 4.5",
-      "tier": "fast"
-    },
-    {
-      "provider": "openai",
-      "id": "gpt-5",
-      "label": "GPT-5",
-      "tier": "smart"
-    },
-    {
-      "provider": "openai",
-      "id": "gpt-5-codex",
-      "label": "GPT-5 Codex",
-      "tier": "smart"
-    },
-    {
-      "provider": "openai",
-      "id": "gpt-5-mini",
-      "label": "GPT-5 Mini",
-      "tier": "balanced"
-    },
-    {
-      "provider": "google",
-      "id": "gemini-2.5-pro",
-      "label": "Gemini 2.5 Pro",
-      "tier": "smart"
-    },
-    {
-      "provider": "google",
-      "id": "gemini-2.5-flash",
-      "label": "Gemini 2.5 Flash",
-      "tier": "fast"
-    },
-    {
-      "provider": "local",
-      "id": "lm-studio-local",
-      "label": "LM Studio (local model)",
-      "tier": "local"
-    }
-  ]
+  }
 }

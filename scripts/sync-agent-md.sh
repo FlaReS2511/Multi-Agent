@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# DEPRECATED (API-only): the runtime reads agents/<role>/AGENT.md directly, so
+# the CLAUDE.md/GEMINI.md/AGENTS.md copies are no longer needed. Kept for CLI
+# revival. See REDESIGN_PLAN.md "CLI removal — hồi sinh tương lai".
+#
 # sync-agent-md.sh — copy agents/<role>/AGENT.md to CLAUDE.md/GEMINI.md/AGENTS.md
 # so each CLI (Claude Code, Gemini CLI, Codex CLI) can auto-load its expected
 # context filename. AGENT.md is the canonical source; the three copies are
