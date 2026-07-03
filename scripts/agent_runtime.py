@@ -40,7 +40,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 from db import Db  # noqa: E402
 
 POLL_INTERVAL = 2.0
-MAX_TURNS = 25
+MAX_TURNS = int(os.environ.get("MULTIAGENT_MAX_TURNS", "25"))
 BASH_TIMEOUT = 120
 
 # Appended to every agent's AGENT.md system prompt. API-only mode stores all
@@ -515,6 +515,7 @@ class OpenAIAdapter:
         msgs = [{"role": "system", "content": system}] + list(messages)
         resp = self.client.chat.completions.create(
             model=self.model, messages=msgs, tools=self.tools, tool_choice="auto",
+            max_tokens=8192,
         )
         msg = resp.choices[0].message
         tool_calls: list[dict] = []
@@ -525,6 +526,14 @@ class OpenAIAdapter:
                     "args": json.loads(tc.function.arguments or "{}"),
                 })
         text = msg.content or ""
+        # Reasoning models (DeepSeek R-series, etc.) may return the visible answer
+        # in `content` but put chain-of-thought in `reasoning_content`. If content
+        # is empty but the model produced reasoning and no tool call, surface the
+        # reasoning so the turn isn't silently blank.
+        if not text and not tool_calls:
+            reasoning = getattr(msg, "reasoning_content", None) or getattr(msg, "reasoning", None)
+            if reasoning:
+                text = reasoning
         assistant_msg: dict = {"role": "assistant", "content": text}
         if tool_calls:
             assistant_msg["tool_calls"] = [
@@ -674,7 +683,6 @@ def main() -> None:
     agent_dir = AGENTS / role
     if not agent_dir.exists():
         sys.exit(f"agent dir not found: {agent_dir}")
-    os.chdir(agent_dir)
 
     cfg = json.loads((SHARED / "agents-config.json").read_text(encoding="utf-8"))
     agent_cfg = cfg.get("agents", {}).get(role)
@@ -691,6 +699,13 @@ def main() -> None:
     system_prompt = agent_md.read_text(encoding="utf-8") + PROTOCOL_APPENDIX.format(role=role)
 
     db = Db(SHARED)
+
+    # Work in the active workspace root (where the code lives), not the agent's
+    # own folder — so relative paths like project/backend/x.py resolve correctly.
+    # Falls back to the repo ROOT if no workspace has been chosen in the UI.
+    ws = db.get_meta("workspace_root") if hasattr(db, "get_meta") else None
+    workdir = Path(ws) if ws and Path(ws).exists() else ROOT
+    os.chdir(workdir)
     _CTX["db"] = db
     _CTX["role"] = role
 

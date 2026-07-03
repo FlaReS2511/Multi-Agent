@@ -200,6 +200,12 @@ class Db:
         ).fetchone()
         return int(row["value"]) if row else 1
 
+    def get_meta(self, key: str):
+        row = self.conn.execute(
+            "SELECT value FROM meta WHERE key = ?", (key,)
+        ).fetchone()
+        return row["value"] if row else None
+
     def _set_next_id(self, n: int) -> None:
         self.conn.execute(
             "INSERT INTO meta (key, value) VALUES ('next_id', ?) "
