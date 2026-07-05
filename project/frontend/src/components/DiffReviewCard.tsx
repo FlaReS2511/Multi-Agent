@@ -8,11 +8,11 @@
 // exist yet, so there's no selection to anchor to. IDEView opens the target
 // file first, then floats this card over the editor.
 
-import { motion } from 'framer-motion'
+import { motion, AnimatePresence } from 'framer-motion'
 import { Check, X, FilePlus2, FilePen } from 'lucide-react'
 import { PendingChange } from '../lib/api'
 import { computeLineDiff, DiffRow } from '../lib/lineDiff'
-import { useMemo } from 'react'
+import { useMemo, useState } from 'react'
 
 interface Props {
   change: PendingChange
@@ -29,6 +29,9 @@ export function DiffReviewCard({ change, onAccept, onReject, readOnly = false }:
   )
   const added = rows.filter((r) => r.kind === 'add').length
   const removed = rows.filter((r) => r.kind === 'del').length
+  // On accept, flash the card green then fire the real handler on completion.
+  const [accepting, setAccepting] = useState(false)
+  const handleAccept = () => setAccepting(true)
 
   return (
     <motion.div
@@ -38,10 +41,28 @@ export function DiffReviewCard({ change, onAccept, onReject, readOnly = false }:
         boxShadow: '0 18px 50px -8px rgba(0,0,0,.7), 0 0 0 1px rgba(63,63,70,.6)',
       }}
       initial={{ opacity: 0, y: -10, scale: 0.96 }}
-      animate={{ opacity: 1, y: 0, scale: 1 }}
+      animate={
+        accepting
+          ? { opacity: [1, 1, 0], scale: [1, 1.01, 0.98], y: 0 }
+          : { opacity: 1, y: 0, scale: 1 }
+      }
       exit={{ opacity: 0, scale: 0.96 }}
-      transition={{ type: 'spring', stiffness: 320, damping: 30 }}
+      transition={accepting
+        ? { duration: 0.42, ease: [0.22, 1, 0.36, 1], times: [0, 0.4, 1] }
+        : { type: 'spring', stiffness: 320, damping: 30 }}
+      onAnimationComplete={() => { if (accepting) onAccept() }}
     >
+      {/* Green flash sweep on accept */}
+      <AnimatePresence>
+        {accepting && (
+          <motion.div
+            className="absolute inset-0 z-50 pointer-events-none bg-emerald-400/25"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: [0, 1, 0] }}
+            transition={{ duration: 0.42, times: [0, 0.35, 1] }}
+          />
+        )}
+      </AnimatePresence>
       {/* Header */}
       <div className="flex items-center gap-2 px-3 py-2 bg-zinc-900/95 border-b border-blue-500/30">
         <span className="text-blue-300">
@@ -90,8 +111,9 @@ export function DiffReviewCard({ change, onAccept, onReject, readOnly = false }:
               <X size={11} /> Reject
             </button>
             <button
-              onClick={onAccept}
-              className="px-2.5 py-1 text-[11px] font-medium rounded bg-emerald-600 hover:bg-emerald-500 text-white flex items-center gap-1.5"
+              onClick={handleAccept}
+              disabled={accepting}
+              className="px-2.5 py-1 text-[11px] font-medium rounded bg-emerald-600 hover:bg-emerald-500 text-white flex items-center gap-1.5 disabled:opacity-70"
             >
               <Check size={11} /> Accept
             </button>
