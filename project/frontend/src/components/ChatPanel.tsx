@@ -59,6 +59,11 @@ interface Props {
   // Review mode: the agent proposes a change and waits. IDEView shows the diff.
   onPendingChange?: (change: PendingChange) => void
   onChangeResolved?: (changeId: string) => void
+  // Editor round-trip tools: the agent drives the editor via IDEView.
+  onEditorRequest?: (
+    op: 'OpenFile' | 'GetOpenEditor' | 'ShowDiff',
+    args: Record<string, unknown>,
+  ) => Promise<{ ok: boolean; result: string }>
   // When true, inner elements fade/slide in with a staggered "wind-up" after
   // the panel frame has slid open. When false, everything renders instantly.
   windup?: boolean
@@ -77,7 +82,7 @@ const itemVariants = {
   show: { opacity: 1, y: 0, transition: { duration: 0.28, ease: 'easeOut' } },
 }
 
-export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, onChangeResolved, windup = true }: Props) {
+export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, onChangeResolved, onEditorRequest, windup = true }: Props) {
   const [mode, setMode] = useState<'ask' | 'agent'>('ask')
   const [reviewMode, setReviewMode] = useState(false)
   const [messages, setMessages] = useState<Msg[]>([])
@@ -245,6 +250,20 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
     targetRef.current.clear()
     shownRef.current.clear()
 
+    // Editor round-trip: main asks us to drive the editor; delegate to IDEView.
+    const offEditor = window.api.onAiAgentEditorReq(runId, async (req) => {
+      let resp = { requestId: req.requestId, ok: false, result: 'error: editor not available' }
+      if (onEditorRequest) {
+        try {
+          const r = await onEditorRequest(req.op, req.args)
+          resp = { requestId: req.requestId, ok: r.ok, result: r.result }
+        } catch (err) {
+          resp = { requestId: req.requestId, ok: false, result: `error: ${String(err)}` }
+        }
+      }
+      window.api.aiAgentEditorRes(resp)
+    })
+
     const off = window.api.onAiAgentEvent(runId, (e: IdeAgentEvent) => {
       if (e.type === 'reasoning' || e.type === 'token') {
         const id = `${e.type}-${e.turn}`
@@ -278,6 +297,7 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
       if (e.type === 'file_changed') onFileChanged?.(e.path)
       if (e.type === 'done' || e.type === 'error') {
         off()
+        offEditor()
         reqIdRef.current = null
         setStreaming(false)
         if (rafRef.current != null) { cancelAnimationFrame(rafRef.current); rafRef.current = null }

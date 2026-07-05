@@ -8,7 +8,7 @@ import { createRequire } from 'node:module'
 import * as db from './db'
 import { streamInlineEdit, stripCodeFence, streamChat, InlineEditParams, ChatParams } from './ai-client'
 import { GroupCoordinator, DEFAULT_ORCHESTRATION, OrchestrationConfig } from './group-coordinator'
-import { runIdeAgent, IdeAgentParams, IdeAgentEvent, PendingChange, ReviewDecision } from './ide-agent'
+import { runIdeAgent, IdeAgentParams, IdeAgentEvent, PendingChange, ReviewDecision, EditorRequest, EditorResponse } from './ide-agent'
 const require = createRequire(import.meta.url)
 // node-pty is a native module that must be rebuilt for Electron. If it failed
 // to build (e.g. missing VS Build Tools on Windows), load it lazily so the app
@@ -1634,6 +1634,9 @@ ipcMain.handle('ai-chat-cancel', (_evt, requestId: string) => {
 const agentAborts = new Map<string, AbortController>()
 // changeId → resolver, so the renderer's accept/reject can unblock the agent.
 const pendingReviews = new Map<string, (d: ReviewDecision) => void>()
+// requestId → resolver for editor round-trip tools (OpenFile/ShowDiff/…).
+const pendingEditorReqs = new Map<string, (r: EditorResponse) => void>()
+let editorReqCounter = 0
 
 ipcMain.handle('ai-agent-run', async (_evt, runId: string, params: IdeAgentParams) => {
   const ac = new AbortController()
@@ -1656,8 +1659,24 @@ ipcMain.handle('ai-agent-run', async (_evt, runId: string, params: IdeAgentParam
         resolve(d)
       })
     })
+  // Ask the renderer to drive the editor; resolves when it replies (or aborts).
+  const editorBridge = (op: EditorRequest['op'], args: Record<string, unknown>): Promise<EditorResponse> =>
+    new Promise((resolve) => {
+      const requestId = `edreq-${++editorReqCounter}-${Date.now()}`
+      if (ac.signal.aborted || !mainWindow || mainWindow.isDestroyed()) {
+        resolve({ requestId, ok: false, result: 'error: editor unavailable' }); return
+      }
+      const onAbort = () => { pendingEditorReqs.delete(requestId); resolve({ requestId, ok: false, result: 'error: cancelled' }) }
+      ac.signal.addEventListener('abort', onAbort, { once: true })
+      pendingEditorReqs.set(requestId, (r) => {
+        ac.signal.removeEventListener('abort', onAbort)
+        pendingEditorReqs.delete(requestId)
+        resolve(r)
+      })
+      mainWindow.webContents.send(`ai-agent-editor-req:${runId}`, { requestId, op, args } as EditorRequest)
+    })
   try {
-    await runIdeAgent(SHARED, params, decryptKey, emit, ac.signal, requestReview)
+    await runIdeAgent(SHARED, params, decryptKey, emit, ac.signal, requestReview, editorBridge)
     return { ok: true }
   } catch (e) {
     const msg = (e as Error).message || String(e)
@@ -1666,6 +1685,12 @@ ipcMain.handle('ai-agent-run', async (_evt, runId: string, params: IdeAgentParam
   } finally {
     agentAborts.delete(runId)
   }
+})
+
+ipcMain.handle('ai-agent-editor-res', (_evt, resp: EditorResponse) => {
+  const resolve = pendingEditorReqs.get(resp.requestId)
+  if (resolve) resolve(resp)
+  return { ok: true }
 })
 
 ipcMain.handle('ai-agent-review', (_evt, changeId: string, decision: ReviewDecision) => {

@@ -431,6 +431,57 @@ export function IDEView() {
     setPendingChange((cur) => (cur && cur.changeId === changeId ? null : cur))
   }, [])
 
+  // ── Editor round-trip tools (OpenFile / GetOpenEditor / ShowDiff) ─────
+  // A read-only diff the agent asked to display (ShowDiff). Dismiss-only.
+  const [previewDiff, setPreviewDiff] = useState<PendingChange | null>(null)
+
+  const onEditorRequest = useCallback(async (
+    op: 'OpenFile' | 'GetOpenEditor' | 'ShowDiff',
+    args: Record<string, unknown>,
+  ): Promise<{ ok: boolean; result: string }> => {
+    try {
+      if (op === 'OpenFile') {
+        const rel = String(args.path ?? '')
+        if (!rel) return { ok: false, result: 'error: path required' }
+        await openFile(rel)
+        const line = typeof args.line === 'number' ? args.line : undefined
+        if (line && editorRef.current) {
+          try {
+            editorRef.current.revealLineInCenter(line)
+            editorRef.current.setPosition({ lineNumber: line, column: 1 })
+          } catch { /* ignore */ }
+        }
+        return { ok: true, result: `opened ${rel}${line ? ` at line ${line}` : ''}` }
+      }
+      if (op === 'GetOpenEditor') {
+        const ctx = getChatContext()
+        if (!ctx) return { ok: true, result: 'no file is open in the editor' }
+        const body = ctx.content.length > 12000 ? ctx.content.slice(0, 12000) + '\n… (truncated)' : ctx.content
+        let out = `open file: ${ctx.path}\n\n${body}`
+        if (ctx.selection) out += `\n\n--- current selection ---\n${ctx.selection.slice(0, 4000)}`
+        return { ok: true, result: out }
+      }
+      if (op === 'ShowDiff') {
+        const rel = String(args.path ?? '')
+        const newContent = String(args.new_content ?? '')
+        if (!rel) return { ok: false, result: 'error: path required' }
+        const disk = await window.api.workspaceReadFile(rel)
+        const before = disk.ok ? disk.content : ''
+        await openFile(rel)
+        setPreviewDiff({
+          changeId: `preview-${Date.now()}`,
+          path: rel, kind: 'edit', before, after: newContent,
+          isNew: !disk.ok, note: 'preview (not applied)',
+        })
+        return { ok: true, result: `showing diff for ${rel} (not applied — use Write/Edit to apply)` }
+      }
+      return { ok: false, result: `error: unknown editor op ${op}` }
+    } catch (e) {
+      return { ok: false, result: `error: ${(e as Error).message || e}` }
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [getChatContext, openTabs, gitChanges])
+
   // Flatten the file tree into relative paths for quick-open.
   const flatFiles = useMemo(() => {
     const out: string[] = []
@@ -1030,6 +1081,14 @@ export function IDEView() {
                         onReject={() => resolvePending('reject')}
                       />
                     )}
+                    {!pendingChange && previewDiff && previewDiff.path === activeTab && (
+                      <DiffReviewCard
+                        change={previewDiff}
+                        readOnly
+                        onAccept={() => setPreviewDiff(null)}
+                        onReject={() => setPreviewDiff(null)}
+                      />
+                    )}
                   </AnimatePresence>
                 </div>
               )}
@@ -1198,6 +1257,7 @@ export function IDEView() {
                 onFileChanged={onAgentFileChanged}
                 onPendingChange={onPendingChange}
                 onChangeResolved={onChangeResolved}
+                onEditorRequest={onEditorRequest}
                 windup={animationsOn}
               />
             </div>

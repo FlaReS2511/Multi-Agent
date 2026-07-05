@@ -197,6 +197,15 @@ const api = {
   ideAgentConfigGet: () => ipcRenderer.invoke('ide-agent-config-get'),
   ideAgentConfigSet: (patch: { reviewMode?: boolean }) =>
     ipcRenderer.invoke('ide-agent-config-set', patch),
+  // Editor round-trip tools: main asks the renderer to drive Monaco.
+  onAiAgentEditorReq: (runId: string, cb: (req: unknown) => void) => {
+    const channel = `ai-agent-editor-req:${runId}`
+    const listener = (_e: unknown, req: unknown) => cb(req)
+    ipcRenderer.on(channel, listener)
+    return () => ipcRenderer.removeListener(channel, listener)
+  },
+  aiAgentEditorRes: (resp: { requestId: string; ok: boolean; result: string }) =>
+    ipcRenderer.invoke('ai-agent-editor-res', resp),
   setAutoTrigger: (enabled: boolean) => ipcRenderer.invoke('set-auto-trigger', enabled),
   getAutoTrigger: () => ipcRenderer.invoke('get-auto-trigger'),
   onAutoTrigger: (cb: (info: { agent: string }) => void) => {

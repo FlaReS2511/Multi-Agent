@@ -20,8 +20,40 @@ import * as db from './db'
 
 const MAX_TURNS = parseInt(process.env.IDE_AGENT_MAX_TURNS || '30', 10)
 
-// GĐ1: file tools only, Bash excluded (dangerous; gated on later).
-const IDE_TOOL_SPECS: ToolSpec[] = FILE_TOOL_SPECS.filter((s) => s.name !== 'Bash')
+// Editor round-trip tools (GĐ2). These don't touch fs — main asks the renderer
+// to drive the Monaco editor the user is looking at, then returns the result.
+const EDITOR_TOOL_SPECS: ToolSpec[] = [
+  {
+    name: 'OpenFile',
+    description: 'Open a file in the editor so the user can see it (like clicking it in the file tree). Optionally jump to a line. Use this to show the user what you are working on.',
+    input_schema: {
+      type: 'object',
+      properties: { path: { type: 'string' }, line: { type: 'integer' } },
+      required: ['path'],
+    },
+  },
+  {
+    name: 'GetOpenEditor',
+    description: 'Get the file path, full content, and current selection of the tab the user is currently viewing. Use this to see exactly what the user is looking at right now.',
+    input_schema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'ShowDiff',
+    description: 'Show the user a read-only diff between a file\'s current content and a proposed new version, WITHOUT writing it. Use this to preview or explain a change. To actually apply a change, use Write or Edit.',
+    input_schema: {
+      type: 'object',
+      properties: { path: { type: 'string' }, new_content: { type: 'string' } },
+      required: ['path', 'new_content'],
+    },
+  },
+]
+const EDITOR_TOOL_NAMES = new Set(EDITOR_TOOL_SPECS.map((s) => s.name))
+
+// File tools minus Bash (dangerous; gated in a later phase) + editor tools.
+const IDE_TOOL_SPECS: ToolSpec[] = [
+  ...FILE_TOOL_SPECS.filter((s) => s.name !== 'Bash'),
+  ...EDITOR_TOOL_SPECS,
+]
 
 export interface IdeAgentParams {
   provider: string
@@ -46,6 +78,19 @@ export interface PendingChange {
 }
 
 export type ReviewDecision = 'accept' | 'reject'
+
+// A request from the agent to drive the editor, answered by the renderer.
+export interface EditorRequest {
+  requestId: string
+  op: 'OpenFile' | 'GetOpenEditor' | 'ShowDiff'
+  args: Record<string, unknown>
+}
+// The renderer's reply. `result` is the string handed back to the model.
+export interface EditorResponse {
+  requestId: string
+  ok: boolean
+  result: string
+}
 
 export type IdeAgentEvent =
   | { type: 'reasoning'; delta: string; turn: number }
@@ -88,6 +133,10 @@ function buildSystemPrompt(params: IdeAgentParams, workspaceRoot: string): strin
   let s =
     'You are Orqon, an expert AI coding agent embedded in an IDE. You have tools ' +
     'to read and modify the user\'s workspace directly: Read, Write, Edit, Grep, Glob. ' +
+    'You also have editor tools to work with what the user sees: OpenFile (show a file ' +
+    'in the editor, optionally at a line), GetOpenEditor (get the currently viewed file ' +
+    'and selection), and ShowDiff (preview a proposed change without writing it). ' +
+    'Open the relevant file with OpenFile so the user can follow along. ' +
     'Work autonomously: inspect the code with Read/Grep/Glob before changing it, make ' +
     'the smallest correct edit, and prefer Edit over Write for existing files. ' +
     'Paths are relative to the workspace root. When done, give a brief summary of what ' +
@@ -117,6 +166,7 @@ export async function runIdeAgent(
   emit: (e: IdeAgentEvent) => void,
   signal: AbortSignal,
   requestReview?: (change: PendingChange) => Promise<ReviewDecision>,
+  editorBridge?: (op: EditorRequest['op'], args: Record<string, unknown>) => Promise<EditorResponse>,
 ): Promise<void> {
   try {
     const providers = loadProviders(sharedDir)
@@ -181,8 +231,24 @@ export async function runIdeAgent(
         let result: string
         let isError = false
         const isMutation = call.name === 'Write' || call.name === 'Edit'
+        const isEditorTool = EDITOR_TOOL_NAMES.has(call.name)
 
-        if (reviewOn && isMutation) {
+        if (isEditorTool) {
+          // Round-trip to the renderer to drive the editor.
+          if (!editorBridge) {
+            result = `error: editor tool ${call.name} is unavailable`
+            isError = true
+          } else {
+            try {
+              const resp = await editorBridge(call.name as EditorRequest['op'], call.args)
+              result = resp.result
+              isError = !resp.ok
+            } catch (e: any) {
+              result = `error: ${e?.message || e}`
+              isError = true
+            }
+          }
+        } else if (reviewOn && isMutation) {
           // Compute the change, show the user a diff, and only persist on accept.
           try {
             result = await reviewMutation(workspaceRoot, call, emit, requestReview!)

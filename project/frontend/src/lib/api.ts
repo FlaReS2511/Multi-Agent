@@ -259,6 +259,17 @@ export interface PendingChange {
   note: string
 }
 
+export interface EditorRequest {
+  requestId: string
+  op: 'OpenFile' | 'GetOpenEditor' | 'ShowDiff'
+  args: Record<string, unknown>
+}
+export interface EditorResponse {
+  requestId: string
+  ok: boolean
+  result: string
+}
+
 export type IdeAgentEvent =
   | { type: 'reasoning'; delta: string; turn: number }
   | { type: 'token'; delta: string; turn: number }
@@ -374,6 +385,8 @@ declare global {
       onAiAgentEvent(runId: string, cb: (e: IdeAgentEvent) => void): () => void
       ideAgentConfigGet(): Promise<{ reviewMode: boolean }>
       ideAgentConfigSet(patch: { reviewMode?: boolean }): Promise<{ ok: boolean; reviewMode: boolean }>
+      onAiAgentEditorReq(runId: string, cb: (req: EditorRequest) => void): () => void
+      aiAgentEditorRes(resp: EditorResponse): Promise<{ ok: boolean }>
       groupCreate(input: { task_id: string; worker_role: string }): Promise<{ ok: boolean; group?: string; error?: string }>
       groupList(): Promise<{ ok: boolean; groups: GroupRow[] }>
       groupKill(groupId: string): Promise<{ ok: boolean }>
