@@ -212,6 +212,8 @@ export interface GroupRow {
   worker_pid: number | null
   reviewer_pid: number | null
   heartbeat_at: string | null
+  peak_context?: number
+  context_window?: number
   created_at: string
   updated_at: string
 }
@@ -278,6 +280,8 @@ export type IdeAgentEvent =
   | { type: 'pending_change'; change: PendingChange }
   | { type: 'change_resolved'; changeId: string; decision: 'accept' | 'reject' }
   | { type: 'file_changed'; path: string }
+  | { type: 'context'; used: number; window: number; turn: number }
+  | { type: 'blocked'; reason: string; turns: number }
   | { type: 'done'; text: string; turns: number }
   | { type: 'error'; error: string }
 

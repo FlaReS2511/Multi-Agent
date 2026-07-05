@@ -16,6 +16,7 @@ import {
   ChangePreview, previewWrite, previewEdit, applyChange,
 } from './agent-tools'
 import { buildAdapter, ProviderCfgLike } from './adapters'
+import { contextWindowFor } from './context-window'
 import * as db from './db'
 
 const MAX_TURNS = parseInt(process.env.IDE_AGENT_MAX_TURNS || '30', 10)
@@ -78,11 +79,27 @@ const ORCH_TOOL_SPECS: ToolSpec[] = [
 ]
 const ORCH_TOOL_NAMES = new Set(ORCH_TOOL_SPECS.map((s) => s.name))
 
+// Control tool: let the agent bail out cleanly instead of looping to MAX_TURNS
+// on an impossible task. Always available.
+const REPORT_BLOCKED_SPEC: ToolSpec = {
+  name: 'ReportBlocked',
+  description:
+    'Use ONLY when the request genuinely cannot be completed (missing files/prerequisites, contradictory or ' +
+    'impossible requirements, needed access absent, or you are stuck with no viable next step). This ends the ' +
+    'run and reports the blocker to the user. Do NOT use it to avoid hard work. reason is REQUIRED.',
+  input_schema: {
+    type: 'object',
+    properties: { reason: { type: 'string', description: 'concrete reason the task cannot be completed' } },
+    required: ['reason'],
+  },
+}
+
 // Build the tool set for a run. Bash and orchestration tools are opt-in.
 function toolSpecsFor(opts: { allowBash: boolean; orchestrationEnabled: boolean }): ToolSpec[] {
   const specs: ToolSpec[] = [
     ...FILE_TOOL_SPECS.filter((s) => opts.allowBash || s.name !== 'Bash'),
     ...EDITOR_TOOL_SPECS,
+    REPORT_BLOCKED_SPEC,
   ]
   if (opts.orchestrationEnabled) specs.push(...ORCH_TOOL_SPECS)
   return specs
@@ -143,6 +160,8 @@ export type IdeAgentEvent =
   | { type: 'pending_change'; change: PendingChange }
   | { type: 'change_resolved'; changeId: string; decision: ReviewDecision }
   | { type: 'file_changed'; path: string }
+  | { type: 'context'; used: number; window: number; turn: number }
+  | { type: 'blocked'; reason: string; turns: number }
   | { type: 'done'; text: string; turns: number }
   | { type: 'error'; error: string }
 
@@ -150,6 +169,8 @@ interface ProviderCfg extends ProviderCfgLike {
   models?: string[]
   price_in?: number
   price_out?: number
+  context_window?: number
+  context_windows?: Record<string, number>
 }
 
 function loadProviders(sharedDir: string): Record<string, ProviderCfg> {
@@ -232,6 +253,7 @@ export async function runIdeAgent(
 
     const allowBash = Boolean(params.allowBash)
     const orchestrationEnabled = Boolean(params.orchestrationEnabled && orchestrationBridge)
+    const contextWindow = contextWindowFor(model, pc)
     const specs = toolSpecsFor({ allowBash, orchestrationEnabled })
     const adapter = buildAdapter(pc, key, model, specs)
     const system = buildSystemPrompt(params, workspaceRoot)
@@ -266,6 +288,11 @@ export async function runIdeAgent(
         task_id: null,
       })
 
+      // Report context fill: prompt tokens this turn = current context size.
+      if (usage.input > 0) {
+        emit({ type: 'context', used: usage.input, window: contextWindow, turn })
+      }
+
       if (text) finalText = text
       if (toolCalls.length === 0) break
 
@@ -275,6 +302,20 @@ export async function runIdeAgent(
         if (signal.aborted) { emit({ type: 'error', error: 'cancelled' }); return }
         const callId = call.id || `${call.name}-${Date.now()}`
         emit({ type: 'tool_call', callId, name: call.name, args: call.args })
+
+        // Control tool: bail out of the run cleanly.
+        if (call.name === 'ReportBlocked') {
+          const reason = String((call.args as { reason?: string }).reason || '').trim()
+          if (!reason) {
+            emit({ type: 'tool_result', callId, name: call.name, result: 'error: reason is required', isError: true })
+            results.push('error: reason is required — explain concretely why the task is blocked')
+            continue
+          }
+          emit({ type: 'tool_result', callId, name: call.name, result: `blocked: ${reason}`, isError: false })
+          emit({ type: 'blocked', reason, turns })
+          return
+        }
+
         let result: string
         let isError = false
         const isMutation = call.name === 'Write' || call.name === 'Edit'

@@ -177,6 +177,10 @@ function createSchema(d: Database.Database): void {
   } catch {
     // column already exists — ignore
   }
+  // Migration: peak context (max prompt tokens seen in a session) + its window,
+  // so the Groups panel can show how full each group's context got.
+  try { d.exec(`ALTER TABLE groups ADD COLUMN peak_context INTEGER NOT NULL DEFAULT 0`) } catch { /* exists */ }
+  try { d.exec(`ALTER TABLE groups ADD COLUMN context_window INTEGER NOT NULL DEFAULT 0`) } catch { /* exists */ }
 }
 
 function ensureMeta(d: Database.Database): void {
@@ -570,6 +574,8 @@ export interface GroupRow {
   worker_pid: number | null
   reviewer_pid: number | null
   heartbeat_at: string | null
+  peak_context: number
+  context_window: number
   created_at: string
   updated_at: string
 }
@@ -662,6 +668,8 @@ export function updateGroupFields(
       | 'spent_usd'
       | 'heartbeat_at'
       | 'level'
+      | 'peak_context'
+      | 'context_window'
     >
   >
 ): void {

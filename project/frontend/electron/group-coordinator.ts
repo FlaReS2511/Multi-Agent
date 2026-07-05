@@ -238,6 +238,14 @@ export class GroupCoordinator {
     } else if (signal === 'verdict:fail') {
       db.updateGroupFields(g.id, { signal: null })
       await this.handleFail(g, cfg)
+    } else if (signal.startsWith('blocked:')) {
+      // Worker declared the task impossible. Fail immediately — no reviewer, no
+      // retry — so it stops burning retries on something that can't be done.
+      const reason = signal.slice('blocked:'.length)
+      db.updateGroupFields(g.id, { signal: null, status: 'failed' })
+      db.updateTaskStatus(g.task_id, 'blocked')
+      this.log(g.task_id, `group ${g.id} reported blocked (no retry): ${reason}`)
+      this.deps.notify?.('group-failed', { group: g.id, task: g.task_id })
     } else {
       // Unknown signal — clear it to avoid a stuck group.
       db.updateGroupFields(g.id, { signal: null })

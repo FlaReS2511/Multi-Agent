@@ -92,6 +92,8 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
   const [undoing, setUndoing] = useState(false)
   // Set when a run is held pending confirmation because the git tree is dirty.
   const [dirtyWarn, setDirtyWarn] = useState<{ count: number } | null>(null)
+  // Context fill of the latest agent turn (prompt tokens vs the model window).
+  const [ctxUsage, setCtxUsage] = useState<{ used: number; window: number } | null>(null)
   const [messages, setMessages] = useState<Msg[]>([])
   const [agentItems, setAgentItems] = useState<AgentItem[]>([])
   const [input, setInput] = useState('')
@@ -280,6 +282,7 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
     shownRef.current.clear()
     runFilesRef.current = new Set()
     setLastRunFiles([])
+    setCtxUsage(null)
 
     // Editor round-trip: main asks us to drive the editor; delegate to IDEView.
     const offEditor = window.api.onAiAgentEditorReq(runId, async (req) => {
@@ -312,6 +315,7 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
       }
       if (e.type === 'pending_change') { onPendingChange?.(e.change); return }
       if (e.type === 'change_resolved') { onChangeResolved?.(e.changeId); return }
+      if (e.type === 'context') { setCtxUsage({ used: e.used, window: e.window }); return }
       setAgentItems((prev) => {
         const copy = [...prev]
         if (e.type === 'tool_call') {
@@ -326,13 +330,13 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
         return copy
       })
       if (e.type === 'file_changed') { runFilesRef.current.add(e.path); onFileChanged?.(e.path) }
-      if (e.type === 'done' || e.type === 'error') {
+      if (e.type === 'done' || e.type === 'error' || e.type === 'blocked') {
         off()
         offEditor()
         reqIdRef.current = null
         setStreaming(false)
-        // Surface an Undo affordance if the run wrote files.
-        if (e.type === 'done' && runFilesRef.current.size > 0) {
+        // Surface an Undo affordance if the run wrote files (done or blocked).
+        if (e.type !== 'error' && runFilesRef.current.size > 0) {
           setLastRunFiles(Array.from(runFilesRef.current))
         }
         if (rafRef.current != null) { cancelAnimationFrame(rafRef.current); rafRef.current = null }
@@ -351,6 +355,7 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
             return it
           })
           if (e.type === 'error') copy.push({ kind: 'text', role: 'assistant', content: `⚠ ${e.error}` })
+          if (e.type === 'blocked') copy.push({ kind: 'text', role: 'assistant', content: `⛔ Blocked: ${e.reason}` })
           return copy
         })
       }
@@ -596,6 +601,8 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
             : 'No file open'}
         </button>
 
+        {mode === 'agent' && ctxUsage && <ContextMeter used={ctxUsage.used} window={ctxUsage.window} />}
+
         <textarea
           value={input}
           onChange={(e) => setInput(e.target.value)}
@@ -765,6 +772,25 @@ function RiseIn({ children }: { children: ReactNode }) {
 // level (not per word). All wrapped lines share one moving band.
 function ShimmerText({ text }: { text: string }) {
   return <span className="thinking-shimmer">{text}</span>
+}
+
+// A slim bar showing how full the model's context window is this turn. Turns
+// amber past 75% and red past 90% so long runs get a visible warning.
+function ContextMeter({ used, window }: { used: number; window: number }) {
+  const pct = window > 0 ? Math.min(100, (used / window) * 100) : 0
+  const color = pct >= 90 ? 'bg-rose-500' : pct >= 75 ? 'bg-amber-500' : 'bg-blue-500'
+  const fmt = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}k` : String(n))
+  return (
+    <div className="flex items-center gap-1.5 px-0.5" title={`Context: ${used.toLocaleString()} / ${window.toLocaleString()} tokens`}>
+      <span className="text-[9px] text-zinc-600 font-mono flex-shrink-0">ctx</span>
+      <div className="flex-1 h-1 rounded-full bg-zinc-800 overflow-hidden">
+        <div className={`h-full ${color} transition-all duration-300`} style={{ width: `${pct}%` }} />
+      </div>
+      <span className="text-[9px] text-zinc-500 font-mono flex-shrink-0">
+        {fmt(used)}/{fmt(window)} · {pct.toFixed(0)}%
+      </span>
+    </div>
+  )
 }
 
 // The model's reasoning ("thinking"), docked above the composer so it doesn't
