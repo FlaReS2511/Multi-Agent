@@ -49,11 +49,44 @@ const EDITOR_TOOL_SPECS: ToolSpec[] = [
 ]
 const EDITOR_TOOL_NAMES = new Set(EDITOR_TOOL_SPECS.map((s) => s.name))
 
-// File tools minus Bash (dangerous; gated in a later phase) + editor tools.
-const IDE_TOOL_SPECS: ToolSpec[] = [
-  ...FILE_TOOL_SPECS.filter((s) => s.name !== 'Bash'),
-  ...EDITOR_TOOL_SPECS,
+// Orchestration tools (GĐ3): hand large/multi-step work to the v2 group
+// coordinator instead of doing it inline. Gated on orchestration.enabled.
+const ORCH_TOOL_SPECS: ToolSpec[] = [
+  {
+    name: 'CreateTask',
+    description: 'Create a task on the shared task board for a specialist agent to pick up. Use for work you are not doing inline. owner is a role like backend-engineer, frontend-engineer, or ai-engineer.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        title: { type: 'string' },
+        owner: { type: 'string' },
+        description: { type: 'string' },
+        priority: { type: 'string', enum: ['low', 'medium', 'high'] },
+      },
+      required: ['title', 'owner'],
+    },
+  },
+  {
+    name: 'CreateGroup',
+    description: 'Spawn a v2 orchestration group to autonomously complete a task (a worker writes code, a reviewer checks it). Use for large or multi-step work rather than editing everything yourself. The user monitors progress in the Groups panel. Requires an existing task_id (call CreateTask first).',
+    input_schema: {
+      type: 'object',
+      properties: { task_id: { type: 'string' }, worker_role: { type: 'string' } },
+      required: ['task_id', 'worker_role'],
+    },
+  },
 ]
+const ORCH_TOOL_NAMES = new Set(ORCH_TOOL_SPECS.map((s) => s.name))
+
+// Build the tool set for a run. Bash and orchestration tools are opt-in.
+function toolSpecsFor(opts: { allowBash: boolean; orchestrationEnabled: boolean }): ToolSpec[] {
+  const specs: ToolSpec[] = [
+    ...FILE_TOOL_SPECS.filter((s) => opts.allowBash || s.name !== 'Bash'),
+    ...EDITOR_TOOL_SPECS,
+  ]
+  if (opts.orchestrationEnabled) specs.push(...ORCH_TOOL_SPECS)
+  return specs
+}
 
 export interface IdeAgentParams {
   provider: string
@@ -64,6 +97,16 @@ export interface IdeAgentParams {
   selection?: string
   // When true, every Write/Edit is held for user approval before hitting disk.
   reviewMode?: boolean
+  // Opt-in capabilities (resolved from config in main before the run).
+  allowBash?: boolean
+  orchestrationEnabled?: boolean
+}
+
+// Orchestration tools run in main (need db + coordinator), so they're routed
+// through this bridge rather than executed in ide-agent directly.
+export interface OrchestrationBridge {
+  createTask(input: { title: string; owner: string; description?: string; priority?: string }): Promise<string>
+  createGroup(input: { task_id: string; worker_role: string }): Promise<string>
 }
 
 // A change awaiting the user's verdict in review mode.
@@ -167,6 +210,7 @@ export async function runIdeAgent(
   signal: AbortSignal,
   requestReview?: (change: PendingChange) => Promise<ReviewDecision>,
   editorBridge?: (op: EditorRequest['op'], args: Record<string, unknown>) => Promise<EditorResponse>,
+  orchestrationBridge?: OrchestrationBridge,
 ): Promise<void> {
   try {
     const providers = loadProviders(sharedDir)
@@ -186,7 +230,10 @@ export async function runIdeAgent(
       throw new Error('no workspace is open — open a folder first')
     }
 
-    const adapter = buildAdapter(pc, key, model, IDE_TOOL_SPECS)
+    const allowBash = Boolean(params.allowBash)
+    const orchestrationEnabled = Boolean(params.orchestrationEnabled && orchestrationBridge)
+    const specs = toolSpecsFor({ allowBash, orchestrationEnabled })
+    const adapter = buildAdapter(pc, key, model, specs)
     const system = buildSystemPrompt(params, workspaceRoot)
     // Seed the conversation with the prior chat turns (user + assistant text).
     const messages: unknown[] = params.messages.map((m) => ({ role: m.role, content: m.content }))
@@ -232,8 +279,22 @@ export async function runIdeAgent(
         let isError = false
         const isMutation = call.name === 'Write' || call.name === 'Edit'
         const isEditorTool = EDITOR_TOOL_NAMES.has(call.name)
+        const isOrchTool = ORCH_TOOL_NAMES.has(call.name)
 
-        if (isEditorTool) {
+        if (isOrchTool) {
+          if (!orchestrationEnabled || !orchestrationBridge) {
+            result = 'error: orchestration is disabled — enable it in Backend Settings to hand work to groups'
+            isError = true
+          } else {
+            try {
+              result = await runOrchTool(call, orchestrationBridge)
+              isError = result.startsWith('error:')
+            } catch (e: any) {
+              result = `error: ${e?.message || e}`
+              isError = true
+            }
+          }
+        } else if (isEditorTool) {
           // Round-trip to the renderer to drive the editor.
           if (!editorBridge) {
             result = `error: editor tool ${call.name} is unavailable`
@@ -285,6 +346,28 @@ export async function runIdeAgent(
   } catch (e: any) {
     emit({ type: 'error', error: e?.message || String(e) })
   }
+}
+
+// Route a CreateTask/CreateGroup call through the main-process bridge.
+async function runOrchTool(
+  call: { name: string; args: Record<string, unknown> },
+  bridge: OrchestrationBridge,
+): Promise<string> {
+  if (call.name === 'CreateTask') {
+    const a = call.args as { title?: string; owner?: string; description?: string; priority?: string }
+    if (!a.title || !a.owner) return 'error: title and owner are required'
+    const id = await bridge.createTask({
+      title: a.title, owner: a.owner, description: a.description, priority: a.priority,
+    })
+    return `created task ${id} (owner ${a.owner}). Call CreateGroup with this task_id to have a group work it.`
+  }
+  if (call.name === 'CreateGroup') {
+    const a = call.args as { task_id?: string; worker_role?: string }
+    if (!a.task_id || !a.worker_role) return 'error: task_id and worker_role are required'
+    const groupId = await bridge.createGroup({ task_id: a.task_id, worker_role: a.worker_role })
+    return `spawned group ${groupId} for ${a.task_id}. The user can watch it in the Groups panel.`
+  }
+  return `error: unknown orchestration tool ${call.name}`
 }
 
 let changeCounter = 0

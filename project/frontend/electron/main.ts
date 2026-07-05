@@ -1638,6 +1638,28 @@ const pendingReviews = new Map<string, (d: ReviewDecision) => void>()
 const pendingEditorReqs = new Map<string, (r: EditorResponse) => void>()
 let editorReqCounter = 0
 
+// Create a task on the board (mirrors the create-task IPC, minus HTN split).
+function createBoardTask(input: { title: string; owner: string; description?: string; priority?: string }): string {
+  const ts = nowStamp()
+  const priority = (input.priority as 'low' | 'medium' | 'high') || 'medium'
+  return db.transaction(() => {
+    const nextId = db.getNextId()
+    const id = `T-${String(nextId).padStart(3, '0')}`
+    db.insertTask({
+      id, title: input.title, owner: input.owner, status: 'todo', deps: [],
+      priority, created_at: ts, updated_at: ts, parent_id: null, children: [],
+    })
+    db.setNextId(nextId + 1)
+    db.addMessage({
+      ts, from_role: 'ide-agent', to_role: input.owner, task_id: id,
+      subject: input.title, priority, deps: 'none',
+      body: input.description || '(no description)', status: 'unread',
+    })
+    db.addLog('ide-agent', `created ${id} owner=${input.owner} priority=${priority}`, ts)
+    return id
+  })
+}
+
 ipcMain.handle('ai-agent-run', async (_evt, runId: string, params: IdeAgentParams) => {
   const ac = new AbortController()
   agentAborts.set(runId, ac)
@@ -1675,8 +1697,23 @@ ipcMain.handle('ai-agent-run', async (_evt, runId: string, params: IdeAgentParam
       })
       mainWindow.webContents.send(`ai-agent-editor-req:${runId}`, { requestId, op, args } as EditorRequest)
     })
+  // Resolve opt-in capabilities from config (not trusted from the renderer).
+  const orch = await readOrchestration()
+  const rawCfg = db.getMeta('ide_agent_config')
+  const ideCfg = rawCfg ? JSON.parse(rawCfg) : {}
+  const runParams: IdeAgentParams = {
+    ...params,
+    allowBash: Boolean(ideCfg.allowBash),
+    orchestrationEnabled: Boolean(orch.enabled),
+  }
+  const orchestrationBridge = {
+    createTask: async (input: { title: string; owner: string; description?: string; priority?: string }) =>
+      createBoardTask(input),
+    createGroup: async (input: { task_id: string; worker_role: string }) =>
+      coordinator.createGroupForTask(input.task_id, input.worker_role),
+  }
   try {
-    await runIdeAgent(SHARED, params, decryptKey, emit, ac.signal, requestReview, editorBridge)
+    await runIdeAgent(SHARED, runParams, decryptKey, emit, ac.signal, requestReview, editorBridge, orchestrationBridge)
     return { ok: true }
   } catch (e) {
     const msg = (e as Error).message || String(e)
@@ -1706,19 +1743,19 @@ ipcMain.handle('ai-agent-cancel', (_evt, runId: string) => {
   return { ok: true }
 })
 
-// IDE-agent config (currently just reviewMode) persisted in meta.
+// IDE-agent config (reviewMode + allowBash) persisted in meta.
 ipcMain.handle('ide-agent-config-get', () => {
   const raw = db.getMeta('ide_agent_config')
   const cfg = raw ? JSON.parse(raw) : {}
-  return { reviewMode: Boolean(cfg.reviewMode) }
+  return { reviewMode: Boolean(cfg.reviewMode), allowBash: Boolean(cfg.allowBash) }
 })
 
-ipcMain.handle('ide-agent-config-set', (_evt, patch: { reviewMode?: boolean }) => {
+ipcMain.handle('ide-agent-config-set', (_evt, patch: { reviewMode?: boolean; allowBash?: boolean }) => {
   const raw = db.getMeta('ide_agent_config')
   const cfg = raw ? JSON.parse(raw) : {}
   const next = { ...cfg, ...patch }
   db.setMeta('ide_agent_config', JSON.stringify(next))
-  return { ok: true, reviewMode: Boolean(next.reviewMode) }
+  return { ok: true, reviewMode: Boolean(next.reviewMode), allowBash: Boolean(next.allowBash) }
 })
 
 // ── Lifecycle ───────────────────────────────────────────────

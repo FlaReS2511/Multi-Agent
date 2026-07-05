@@ -195,7 +195,7 @@ const api = {
     return () => ipcRenderer.removeListener(channel, listener)
   },
   ideAgentConfigGet: () => ipcRenderer.invoke('ide-agent-config-get'),
-  ideAgentConfigSet: (patch: { reviewMode?: boolean }) =>
+  ideAgentConfigSet: (patch: { reviewMode?: boolean; allowBash?: boolean }) =>
     ipcRenderer.invoke('ide-agent-config-set', patch),
   // Editor round-trip tools: main asks the renderer to drive Monaco.
   onAiAgentEditorReq: (runId: string, cb: (req: unknown) => void) => {

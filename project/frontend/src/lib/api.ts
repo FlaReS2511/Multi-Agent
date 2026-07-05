@@ -383,8 +383,8 @@ declare global {
       aiAgentCancel(runId: string): Promise<{ ok: boolean }>
       aiAgentReview(changeId: string, decision: 'accept' | 'reject'): Promise<{ ok: boolean }>
       onAiAgentEvent(runId: string, cb: (e: IdeAgentEvent) => void): () => void
-      ideAgentConfigGet(): Promise<{ reviewMode: boolean }>
-      ideAgentConfigSet(patch: { reviewMode?: boolean }): Promise<{ ok: boolean; reviewMode: boolean }>
+      ideAgentConfigGet(): Promise<{ reviewMode: boolean; allowBash: boolean }>
+      ideAgentConfigSet(patch: { reviewMode?: boolean; allowBash?: boolean }): Promise<{ ok: boolean; reviewMode: boolean; allowBash: boolean }>
       onAiAgentEditorReq(runId: string, cb: (req: EditorRequest) => void): () => void
       aiAgentEditorRes(resp: EditorResponse): Promise<{ ok: boolean }>
       groupCreate(input: { task_id: string; worker_role: string }): Promise<{ ok: boolean; group?: string; error?: string }>

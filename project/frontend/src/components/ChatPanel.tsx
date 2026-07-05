@@ -10,6 +10,7 @@ import { motion } from 'framer-motion'
 import {
   Sparkles, Send, Square, Trash2, FileCode,
   FileText, FilePen, FilePlus2, Search, FolderSearch, Wrench, CheckCircle2, XCircle, ShieldCheck,
+  TerminalSquare, ListPlus, Boxes,
 } from 'lucide-react'
 import { ModelOption, IdeAgentEvent, PendingChange } from '../lib/api'
 
@@ -734,10 +735,16 @@ function ToolActivity({ entry }: { entry: ToolEntry }) {
     Edit: <FilePen size={12} />,
     Grep: <Search size={12} />,
     Glob: <FolderSearch size={12} />,
+    Bash: <TerminalSquare size={12} />,
+    OpenFile: <FileText size={12} />,
+    GetOpenEditor: <FileCode size={12} />,
+    ShowDiff: <FilePen size={12} />,
+    CreateTask: <ListPlus size={12} />,
+    CreateGroup: <Boxes size={12} />,
   }[entry.name] ?? <Wrench size={12} />
 
-  const p = entry.args as { path?: string; pattern?: string; command?: string }
-  const target = p.path || p.pattern || p.command || ''
+  const p = entry.args as { path?: string; pattern?: string; command?: string; title?: string; task_id?: string }
+  const target = p.path || p.pattern || p.command || p.title || p.task_id || ''
   const hasResult = Boolean(entry.result) && !entry.running
 
   return (
