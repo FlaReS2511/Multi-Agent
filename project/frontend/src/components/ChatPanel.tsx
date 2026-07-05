@@ -10,7 +10,7 @@ import { motion } from 'framer-motion'
 import {
   Sparkles, Send, Square, Trash2, FileCode,
   FileText, FilePen, FilePlus2, Search, FolderSearch, Wrench, CheckCircle2, XCircle, ShieldCheck,
-  TerminalSquare, ListPlus, Boxes,
+  TerminalSquare, ListPlus, Boxes, Undo2, AlertTriangle,
 } from 'lucide-react'
 import { ModelOption, IdeAgentEvent, PendingChange } from '../lib/api'
 
@@ -86,6 +86,12 @@ const itemVariants = {
 export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, onChangeResolved, onEditorRequest, windup = true }: Props) {
   const [mode, setMode] = useState<'ask' | 'agent'>('ask')
   const [reviewMode, setReviewMode] = useState(false)
+  // Files the current agent run has written (for the "Undo run" affordance).
+  const runFilesRef = useRef<Set<string>>(new Set())
+  const [lastRunFiles, setLastRunFiles] = useState<string[]>([])
+  const [undoing, setUndoing] = useState(false)
+  // Set when a run is held pending confirmation because the git tree is dirty.
+  const [dirtyWarn, setDirtyWarn] = useState<{ count: number } | null>(null)
   const [messages, setMessages] = useState<Msg[]>([])
   const [agentItems, setAgentItems] = useState<AgentItem[]>([])
   const [input, setInput] = useState('')
@@ -123,6 +129,28 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
     const next = !reviewMode
     setReviewMode(next)
     window.api.ideAgentConfigSet({ reviewMode: next }).catch(() => {})
+  }
+
+  // Revert every file the last run wrote (git checkout tracked, delete new).
+  const undoLastRun = async () => {
+    if (undoing || lastRunFiles.length === 0) return
+    setUndoing(true)
+    try {
+      const res = await window.api.workspaceGitRestoreFiles(lastRunFiles)
+      lastRunFiles.forEach((f) => onFileChanged?.(f))
+      setLastRunFiles([])
+      const failed = res.failed ?? []
+      if (!res.ok && failed.length) {
+        setAgentItems((prev) => [...prev, {
+          kind: 'text', role: 'assistant',
+          content: `⚠ Undo could not revert: ${failed.join(', ')}`,
+        }])
+      }
+    } catch (err) {
+      setAgentItems((prev) => [...prev, { kind: 'text', role: 'assistant', content: `⚠ Undo failed: ${String(err)}` }])
+    } finally {
+      setUndoing(false)
+    }
   }
 
 
@@ -250,6 +278,8 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
     reqIdRef.current = runId
     targetRef.current.clear()
     shownRef.current.clear()
+    runFilesRef.current = new Set()
+    setLastRunFiles([])
 
     // Editor round-trip: main asks us to drive the editor; delegate to IDEView.
     const offEditor = window.api.onAiAgentEditorReq(runId, async (req) => {
@@ -295,12 +325,16 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
         }
         return copy
       })
-      if (e.type === 'file_changed') onFileChanged?.(e.path)
+      if (e.type === 'file_changed') { runFilesRef.current.add(e.path); onFileChanged?.(e.path) }
       if (e.type === 'done' || e.type === 'error') {
         off()
         offEditor()
         reqIdRef.current = null
         setStreaming(false)
+        // Surface an Undo affordance if the run wrote files.
+        if (e.type === 'done' && runFilesRef.current.size > 0) {
+          setLastRunFiles(Array.from(runFilesRef.current))
+        }
         if (rafRef.current != null) { cancelAnimationFrame(rafRef.current); rafRef.current = null }
         // Snap every streaming item to its full received text — append the
         // remaining tail as one final glowing chunk, no lingering typewriter.
@@ -359,7 +393,21 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
     setAgentItems([])
   }
 
-  const submit = () => (mode === 'agent' ? sendAgent() : send())
+  const submit = async () => {
+    if (mode !== 'agent') { send(); return }
+    // Auto-apply on a dirty tree is risky (no clean git baseline to undo to).
+    // Warn once; review mode is safe (each change is gated) so skip the check.
+    if (!reviewMode && input.trim() && !streaming) {
+      try {
+        const d = await window.api.workspaceGitDirtyCount()
+        if (d.ok && d.count > 0) { setDirtyWarn({ count: d.count }); return }
+      } catch { /* ignore — proceed */ }
+    }
+    sendAgent()
+  }
+
+  // Proceed with a run the user confirmed despite a dirty tree.
+  const confirmDirtyRun = () => { setDirtyWarn(null); sendAgent() }
 
   const ctxPreview = useFileContext ? getContext() : null
 
@@ -477,6 +525,54 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
       {/* Thinking dock — reasoning lives here, not in the chat flow */}
       {mode === 'agent' && latestReasoning && (
         <ThinkingDock chunks={latestReasoning.chunks ?? []} active={streaming} />
+      )}
+
+      {/* Git-dirty warning before an auto-apply run */}
+      {dirtyWarn && (
+        <div className="flex items-start gap-2 px-3 py-2 border-t border-amber-500/30 bg-amber-500/5 flex-shrink-0">
+          <AlertTriangle size={13} className="text-amber-400 mt-0.5 flex-shrink-0" />
+          <div className="flex-1 text-[11px] text-zinc-300 leading-relaxed">
+            You have {dirtyWarn.count} uncommitted change{dirtyWarn.count > 1 ? 's' : ''}. The agent applies
+            edits directly — undoing a run reverts files to their last committed state, which would also drop
+            your current changes. Commit first, or turn on Review mode.
+            <div className="flex items-center gap-2 mt-1.5">
+              <button
+                onClick={confirmDirtyRun}
+                className="text-[11px] font-medium px-2 py-0.5 rounded bg-amber-600 hover:bg-amber-500 text-white"
+              >
+                Run anyway
+              </button>
+              <button
+                onClick={() => setDirtyWarn(null)}
+                className="text-[11px] px-2 py-0.5 rounded border border-zinc-700 text-zinc-400 hover:text-zinc-200"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Undo-run bar: revert everything the last agent run wrote */}
+      {mode === 'agent' && !streaming && lastRunFiles.length > 0 && (
+        <div className="flex items-center gap-2 px-3 py-2 border-t border-zinc-800 bg-zinc-900/40 flex-shrink-0">
+          <span className="text-[11px] text-zinc-400 flex-1">
+            Agent changed {lastRunFiles.length} file{lastRunFiles.length > 1 ? 's' : ''}
+          </span>
+          <button
+            onClick={() => setLastRunFiles([])}
+            className="text-[10px] text-zinc-500 hover:text-zinc-300 px-1.5 py-0.5"
+          >
+            Dismiss
+          </button>
+          <button
+            onClick={undoLastRun}
+            disabled={undoing}
+            className="flex items-center gap-1 text-[11px] font-medium px-2 py-0.5 rounded border border-amber-500/40 bg-amber-500/10 text-amber-300 hover:bg-amber-500/20 disabled:opacity-60"
+          >
+            <Undo2 size={11} /> {undoing ? 'Undoing…' : 'Undo run'}
+          </button>
+        </div>
       )}
 
       {/* Composer */}

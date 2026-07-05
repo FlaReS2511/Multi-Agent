@@ -1510,6 +1510,38 @@ ipcMain.handle('workspace-git-pull', async () => {
   return { ok, output: stdout + stderr }
 })
 
+// Count of dirty (modified/untracked) files — used to warn before agent runs.
+ipcMain.handle('workspace-git-dirty-count', async () => {
+  const { ok, stdout } = await gitExec(['status', '--porcelain'])
+  if (!ok) return { ok: false, count: 0 }
+  return { ok: true, count: stdout.trim().split('\n').filter(Boolean).length }
+})
+
+// Undo an agent run: revert the given files to their HEAD state. Tracked files
+// are checked out from HEAD; files the agent newly created (untracked) are
+// deleted. Paths are workspace-relative and validated to stay inside the root.
+ipcMain.handle('workspace-git-restore-files', async (_evt, files: string[]) => {
+  if (!workspaceRoot) return { ok: false, error: 'no workspace open' }
+  const restored: string[] = []
+  const removed: string[] = []
+  const failed: string[] = []
+  const root = path.resolve(workspaceRoot)
+  for (const rel of files) {
+    const abs = path.resolve(workspaceRoot, rel)
+    if (abs !== root && !abs.startsWith(root + path.sep)) { failed.push(rel); continue }
+    const gitPath = rel.replace(/\\/g, '/')
+    const tracked = await gitExec(['ls-files', '--error-unmatch', '--', gitPath])
+    if (tracked.ok) {
+      const r = await gitExec(['checkout', 'HEAD', '--', gitPath])
+      if (r.ok) restored.push(rel); else failed.push(rel)
+    } else {
+      // Untracked = created by the agent this run → remove it.
+      try { await fs.rm(abs, { force: true }); removed.push(rel) } catch { failed.push(rel) }
+    }
+  }
+  return { ok: failed.length === 0, restored, removed, failed }
+})
+
 // ── Task update ─────────────────────────────────────────────────
 
 

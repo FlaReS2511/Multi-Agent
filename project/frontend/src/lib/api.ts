@@ -351,6 +351,8 @@ declare global {
       workspaceGitCheckout(branch: string, create?: boolean): Promise<{ ok: boolean; error?: string }>
       workspaceGitPush(): Promise<{ ok: boolean; output?: string }>
       workspaceGitPull(): Promise<{ ok: boolean; output?: string }>
+      workspaceGitDirtyCount(): Promise<{ ok: boolean; count: number }>
+      workspaceGitRestoreFiles(files: string[]): Promise<{ ok: boolean; restored?: string[]; removed?: string[]; failed?: string[]; error?: string }>
       shellStart(id: string): Promise<{ ok: boolean; history?: string; error?: string }>
       shellWrite(id: string, data: string): Promise<{ ok: boolean }>
       shellResize(id: string, cols: number, rows: number): Promise<{ ok: boolean }>

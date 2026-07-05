@@ -136,6 +136,8 @@ const api = {
   workspaceGitCheckout: (branch: string, create?: boolean) => ipcRenderer.invoke('workspace-git-checkout', branch, create),
   workspaceGitPush: () => ipcRenderer.invoke('workspace-git-push'),
   workspaceGitPull: () => ipcRenderer.invoke('workspace-git-pull'),
+  workspaceGitDirtyCount: () => ipcRenderer.invoke('workspace-git-dirty-count'),
+  workspaceGitRestoreFiles: (files: string[]) => ipcRenderer.invoke('workspace-git-restore-files', files),
 
   // Inline AI edit (streaming)
   aiInlineEdit: (requestId: string, params: {
