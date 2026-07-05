@@ -9,9 +9,9 @@ import { useEffect, useRef, useState, ReactNode } from 'react'
 import { motion } from 'framer-motion'
 import {
   Sparkles, Send, Square, Trash2, FileCode,
-  FileText, FilePen, FilePlus2, Search, FolderSearch, Wrench, CheckCircle2, XCircle,
+  FileText, FilePen, FilePlus2, Search, FolderSearch, Wrench, CheckCircle2, XCircle, ShieldCheck,
 } from 'lucide-react'
-import { ModelOption, IdeAgentEvent } from '../lib/api'
+import { ModelOption, IdeAgentEvent, PendingChange } from '../lib/api'
 
 export interface ChatContext {
   path: string
@@ -56,6 +56,9 @@ interface Props {
   getContext: () => ChatContext | null
   // Called when the agent writes/edits a file, so the editor can reload it.
   onFileChanged?: (relPath: string) => void
+  // Review mode: the agent proposes a change and waits. IDEView shows the diff.
+  onPendingChange?: (change: PendingChange) => void
+  onChangeResolved?: (changeId: string) => void
   // When true, inner elements fade/slide in with a staggered "wind-up" after
   // the panel frame has slid open. When false, everything renders instantly.
   windup?: boolean
@@ -74,8 +77,9 @@ const itemVariants = {
   show: { opacity: 1, y: 0, transition: { duration: 0.28, ease: 'easeOut' } },
 }
 
-export function ChatPanel({ models, getContext, onFileChanged, windup = true }: Props) {
+export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, onChangeResolved, windup = true }: Props) {
   const [mode, setMode] = useState<'ask' | 'agent'>('ask')
+  const [reviewMode, setReviewMode] = useState(false)
   const [messages, setMessages] = useState<Msg[]>([])
   const [agentItems, setAgentItems] = useState<AgentItem[]>([])
   const [input, setInput] = useState('')
@@ -103,6 +107,17 @@ export function ChatPanel({ models, getContext, onFileChanged, windup = true }: 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight })
   }, [messages, agentItems, streaming])
+
+  // Load the persisted review-mode preference once.
+  useEffect(() => {
+    window.api.ideAgentConfigGet().then((c) => setReviewMode(c.reviewMode)).catch(() => {})
+  }, [])
+
+  const toggleReview = () => {
+    const next = !reviewMode
+    setReviewMode(next)
+    window.api.ideAgentConfigSet({ reviewMode: next }).catch(() => {})
+  }
 
 
 
@@ -245,6 +260,8 @@ export function ChatPanel({ models, getContext, onFileChanged, windup = true }: 
         ensureReveal()
         return
       }
+      if (e.type === 'pending_change') { onPendingChange?.(e.change); return }
+      if (e.type === 'change_resolved') { onChangeResolved?.(e.changeId); return }
       setAgentItems((prev) => {
         const copy = [...prev]
         if (e.type === 'tool_call') {
@@ -290,6 +307,7 @@ export function ChatPanel({ models, getContext, onFileChanged, windup = true }: 
       messages: history,
       openFile: ctx ? { path: ctx.path, language: ctx.language, content: ctx.content } : undefined,
       selection: ctx?.selection,
+      reviewMode,
     })
   }
 
@@ -359,6 +377,24 @@ export function ChatPanel({ models, getContext, onFileChanged, windup = true }: 
               </button>
             ))}
           </div>
+          {/* Review-mode toggle (agent only): hold every write for approval. */}
+          {mode === 'agent' && (
+            <button
+              onClick={toggleReview}
+              disabled={streaming}
+              className={`flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold border transition-colors ${
+                reviewMode
+                  ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300'
+                  : 'border-zinc-800 text-zinc-500 hover:text-zinc-300'
+              } ${streaming ? 'cursor-not-allowed opacity-60' : ''}`}
+              title={reviewMode
+                ? 'Review on: you approve each change before it is applied'
+                : 'Review off: changes are applied automatically'}
+            >
+              <ShieldCheck size={11} />
+              Review
+            </button>
+          )}
         </div>
         <button
           onClick={clear}

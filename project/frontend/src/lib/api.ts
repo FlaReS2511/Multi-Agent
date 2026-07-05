@@ -249,11 +249,23 @@ export const GROUP_STATUS_STYLES: Record<GroupStatus, { label: string; classes: 
   killed:    { label: 'KILLED',    classes: 'bg-rose-900/30 text-rose-400 ring-rose-800/40' },
 }
 
+export interface PendingChange {
+  changeId: string
+  path: string
+  kind: 'write' | 'edit'
+  before: string
+  after: string
+  isNew: boolean
+  note: string
+}
+
 export type IdeAgentEvent =
   | { type: 'reasoning'; delta: string; turn: number }
   | { type: 'token'; delta: string; turn: number }
   | { type: 'tool_call'; callId: string; name: string; args: Record<string, unknown> }
   | { type: 'tool_result'; callId: string; name: string; result: string; isError: boolean }
+  | { type: 'pending_change'; change: PendingChange }
+  | { type: 'change_resolved'; changeId: string; decision: 'accept' | 'reject' }
   | { type: 'file_changed'; path: string }
   | { type: 'done'; text: string; turns: number }
   | { type: 'error'; error: string }
@@ -355,9 +367,13 @@ declare global {
         messages: { role: 'user' | 'assistant'; content: string }[]
         openFile?: { path: string; language?: string; content: string }
         selection?: string
+        reviewMode?: boolean
       }): Promise<{ ok: boolean; error?: string }>
       aiAgentCancel(runId: string): Promise<{ ok: boolean }>
+      aiAgentReview(changeId: string, decision: 'accept' | 'reject'): Promise<{ ok: boolean }>
       onAiAgentEvent(runId: string, cb: (e: IdeAgentEvent) => void): () => void
+      ideAgentConfigGet(): Promise<{ reviewMode: boolean }>
+      ideAgentConfigSet(patch: { reviewMode?: boolean }): Promise<{ ok: boolean; reviewMode: boolean }>
       groupCreate(input: { task_id: string; worker_role: string }): Promise<{ ok: boolean; group?: string; error?: string }>
       groupList(): Promise<{ ok: boolean; groups: GroupRow[] }>
       groupKill(groupId: string): Promise<{ ok: boolean }>

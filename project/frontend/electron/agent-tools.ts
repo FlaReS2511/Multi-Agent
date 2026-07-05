@@ -61,6 +61,61 @@ export function toolEdit(
   return `edited ${a.path} (${a.replace_all ? occurrences : 1} replacement(s))`
 }
 
+// ── Preview / apply split (for review mode) ─────────────────
+// These let the IDE agent compute what a Write/Edit *would* do without touching
+// disk, so the user can review a diff first, then apply on approval.
+
+export interface ChangePreview {
+  path: string
+  kind: 'write' | 'edit'
+  before: string   // '' when creating a new file
+  after: string
+  isNew: boolean
+  note: string     // human summary (e.g. "2 replacement(s)")
+}
+
+// Compute a Write without persisting. Throws on path escape.
+export function previewWrite(cwd: string, a: { path: string; content: string }): ChangePreview {
+  const p = resolveInside(cwd, a.path)
+  let before = ''
+  let isNew = true
+  try { before = fs.readFileSync(p, 'utf-8'); isNew = false } catch { /* new file */ }
+  return {
+    path: a.path, kind: 'write', before, after: a.content, isNew,
+    note: isNew ? `create ${a.path}` : `overwrite ${a.path}`,
+  }
+}
+
+// Compute an Edit without persisting. Returns an error string if the edit can't
+// be resolved (old_string missing / ambiguous) — same rules as toolEdit.
+export function previewEdit(
+  cwd: string,
+  a: { path: string; old_string: string; new_string: string; replace_all?: boolean },
+): ChangePreview | string {
+  const p = resolveInside(cwd, a.path)
+  let before: string
+  try { before = fs.readFileSync(p, 'utf-8') } catch { return `error: cannot read ${a.path}` }
+  if (!before.includes(a.old_string)) return `error: old_string not found in ${a.path}`
+  const occurrences = before.split(a.old_string).length - 1
+  if (!a.replace_all && occurrences > 1) {
+    return `error: old_string occurs ${occurrences} times in ${a.path}; add more context or set replace_all=true`
+  }
+  const after = a.replace_all
+    ? before.split(a.old_string).join(a.new_string)
+    : before.replace(a.old_string, a.new_string)
+  return {
+    path: a.path, kind: 'edit', before, after, isNew: false,
+    note: `${a.replace_all ? occurrences : 1} replacement(s)`,
+  }
+}
+
+// Persist an already-approved change (full-content write).
+export function applyChange(cwd: string, relPath: string, content: string): void {
+  const p = resolveInside(cwd, relPath)
+  fs.mkdirSync(path.dirname(p), { recursive: true })
+  fs.writeFileSync(p, content, 'utf-8')
+}
+
 export function toolBash(cwd: string, a: { command: string }): string {
   try {
     const out = execSync(a.command, {

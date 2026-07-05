@@ -11,7 +11,10 @@
 
 import fs from 'node:fs'
 import path from 'node:path'
-import { FILE_TOOL_SPECS, runFileTool, ToolSpec } from './agent-tools'
+import {
+  FILE_TOOL_SPECS, runFileTool, ToolSpec,
+  ChangePreview, previewWrite, previewEdit, applyChange,
+} from './agent-tools'
 import { buildAdapter, ProviderCfgLike } from './adapters'
 import * as db from './db'
 
@@ -27,13 +30,30 @@ export interface IdeAgentParams {
   // The file currently open in the editor (optional context).
   openFile?: { path: string; language?: string; content: string }
   selection?: string
+  // When true, every Write/Edit is held for user approval before hitting disk.
+  reviewMode?: boolean
 }
+
+// A change awaiting the user's verdict in review mode.
+export interface PendingChange {
+  changeId: string
+  path: string
+  kind: 'write' | 'edit'
+  before: string
+  after: string
+  isNew: boolean
+  note: string
+}
+
+export type ReviewDecision = 'accept' | 'reject'
 
 export type IdeAgentEvent =
   | { type: 'reasoning'; delta: string; turn: number }
   | { type: 'token'; delta: string; turn: number }
   | { type: 'tool_call'; callId: string; name: string; args: Record<string, unknown> }
   | { type: 'tool_result'; callId: string; name: string; result: string; isError: boolean }
+  | { type: 'pending_change'; change: PendingChange }
+  | { type: 'change_resolved'; changeId: string; decision: ReviewDecision }
   | { type: 'file_changed'; path: string }
   | { type: 'done'; text: string; turns: number }
   | { type: 'error'; error: string }
@@ -87,13 +107,16 @@ function buildSystemPrompt(params: IdeAgentParams, workspaceRoot: string): strin
 }
 
 // Run the IDE agent loop. `emit` streams events to the renderer; `signal`
-// aborts between turns. Resolves when the loop ends (done or error emitted).
+// aborts between turns. `requestReview` is awaited before a Write/Edit is
+// persisted when reviewMode is on — it resolves with the user's verdict.
+// Resolves when the loop ends (done or error emitted).
 export async function runIdeAgent(
   sharedDir: string,
   params: IdeAgentParams,
   decrypt: (b64: string) => string,
   emit: (e: IdeAgentEvent) => void,
   signal: AbortSignal,
+  requestReview?: (change: PendingChange) => Promise<ReviewDecision>,
 ): Promise<void> {
   try {
     const providers = loadProviders(sharedDir)
@@ -149,6 +172,7 @@ export async function runIdeAgent(
       if (text) finalText = text
       if (toolCalls.length === 0) break
 
+      const reviewOn = Boolean(params.reviewMode && requestReview)
       const results: string[] = []
       for (const call of toolCalls) {
         if (signal.aborted) { emit({ type: 'error', error: 'cancelled' }); return }
@@ -156,21 +180,35 @@ export async function runIdeAgent(
         emit({ type: 'tool_call', callId, name: call.name, args: call.args })
         let result: string
         let isError = false
-        try {
-          const r = runFileTool(workspaceRoot, call.name, call.args)
-          result = r == null ? `error: unknown tool ${call.name}` : r
-          if (r == null || r.startsWith('error:')) isError = true
-        } catch (e: any) {
-          result = `error: ${e?.message || e}`
-          isError = true
+        const isMutation = call.name === 'Write' || call.name === 'Edit'
+
+        if (reviewOn && isMutation) {
+          // Compute the change, show the user a diff, and only persist on accept.
+          try {
+            result = await reviewMutation(workspaceRoot, call, emit, requestReview!)
+            isError = result.startsWith('error:')
+          } catch (e: any) {
+            result = `error: ${e?.message || e}`
+            isError = true
+          }
+        } else {
+          try {
+            const r = runFileTool(workspaceRoot, call.name, call.args)
+            result = r == null ? `error: unknown tool ${call.name}` : r
+            if (r == null || r.startsWith('error:')) isError = true
+          } catch (e: any) {
+            result = `error: ${e?.message || e}`
+            isError = true
+          }
+          // Auto-apply mode: notify renderer so it reloads the changed file/tree.
+          if (isMutation && !isError) {
+            const rel = (call.args as { path?: string }).path
+            if (rel) emit({ type: 'file_changed', path: rel })
+          }
         }
+
         results.push(result)
         emit({ type: 'tool_result', callId, name: call.name, result: result.slice(0, 2000), isError })
-        // Notify the renderer so it can reload a changed file / the tree.
-        if ((call.name === 'Write' || call.name === 'Edit') && !isError) {
-          const rel = (call.args as { path?: string }).path
-          if (rel) emit({ type: 'file_changed', path: rel })
-        }
       }
 
       messages.push(assistantMsg)
@@ -181,4 +219,46 @@ export async function runIdeAgent(
   } catch (e: any) {
     emit({ type: 'error', error: e?.message || String(e) })
   }
+}
+
+let changeCounter = 0
+
+// In review mode: compute the diff for a Write/Edit call, show it to the user,
+// and only persist if they accept. Returns the tool-result string the model
+// sees, so a reject reads as "rejected by user" (the model can react / stop).
+async function reviewMutation(
+  workspaceRoot: string,
+  call: { name: string; args: Record<string, unknown> },
+  emit: (e: IdeAgentEvent) => void,
+  requestReview: (change: PendingChange) => Promise<ReviewDecision>,
+): Promise<string> {
+  let preview: ChangePreview | string
+  if (call.name === 'Write') {
+    preview = previewWrite(workspaceRoot, call.args as { path: string; content: string })
+  } else {
+    preview = previewEdit(
+      workspaceRoot,
+      call.args as { path: string; old_string: string; new_string: string; replace_all?: boolean },
+    )
+  }
+  // A string means the change couldn't be resolved (missing/ambiguous) — surface
+  // it as the tool error without prompting the user.
+  if (typeof preview === 'string') return preview
+  if (preview.before === preview.after) return `no change: ${preview.path} already matches`
+
+  const changeId = `chg-${++changeCounter}-${Date.now()}`
+  const pending: PendingChange = { changeId, ...preview }
+  emit({ type: 'pending_change', change: pending })
+
+  const decision = await requestReview(pending)
+  emit({ type: 'change_resolved', changeId, decision })
+
+  if (decision === 'reject') {
+    return `rejected by user: the ${preview.kind} to ${preview.path} was not applied`
+  }
+  applyChange(workspaceRoot, preview.path, preview.after)
+  emit({ type: 'file_changed', path: preview.path })
+  return preview.kind === 'write'
+    ? `wrote ${preview.after.length} chars to ${preview.path} (approved)`
+    : `edited ${preview.path} — ${preview.note} (approved)`
 }

@@ -32,10 +32,11 @@ import { GitPanel } from './GitPanel'
 import { CommandPalette, Command } from './CommandPalette'
 import { ChatPanel } from './ChatPanel'
 import { GroupsPanel } from './GroupsPanel'
+import { DiffReviewCard } from './DiffReviewCard'
 import { OrqonLogo } from './OrqonLogo'
 import { useAnimationsEnabled } from '../lib/uiSettings'
 import { useInlineAIEdit } from './useInlineAIEdit'
-import { activeAgents, AgentsConfig, colorFor, ModelOption, isResidentRole } from '../lib/api'
+import { activeAgents, AgentsConfig, colorFor, ModelOption, isResidentRole, PendingChange } from '../lib/api'
 
 interface FileNode {
   name: string
@@ -394,6 +395,40 @@ export function IDEView() {
     }
     refreshWorkspace()
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // ── Agent review mode: pending change awaiting the user's verdict ─────
+  const [pendingChange, setPendingChange] = useState<PendingChange | null>(null)
+
+  const onPendingChange = useCallback((change: PendingChange) => {
+    // Bring the target file into view so the user reviews it in context. For a
+    // brand-new file there's nothing on disk yet; open a preview tab anyway so
+    // the card floats over a sensible spot.
+    setPendingChange(change)
+    if (change.isNew) {
+      setOpenTabs((prev) => (prev.includes(change.path) ? prev : [...prev, change.path]))
+      setFileContents((prev) => (change.path in prev ? prev : { ...prev, [change.path]: change.before }))
+      setOriginalContents((prev) => (change.path in prev ? prev : { ...prev, [change.path]: '' }))
+      setActiveTab(change.path)
+      setDiffMode(false)
+    } else {
+      openFile(change.path)
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [openTabs, gitChanges])
+
+  const resolvePending = useCallback((decision: 'accept' | 'reject') => {
+    const change = pendingChange
+    if (!change) return
+    window.api.aiAgentReview(change.changeId, decision).catch(() => {})
+    setPendingChange(null)
+    // The agent emits file_changed on accept, which triggers onAgentFileChanged
+    // and reloads the content live — no extra reload needed here.
+  }, [pendingChange])
+
+  // Clear the card if the run ends/aborts while a change is still on screen.
+  const onChangeResolved = useCallback((changeId: string) => {
+    setPendingChange((cur) => (cur && cur.changeId === changeId ? null : cur))
   }, [])
 
   // Flatten the file tree into relative paths for quick-open.
@@ -988,6 +1023,13 @@ export function IDEView() {
                         onReject={inlineAI.reject}
                       />
                     )}
+                    {pendingChange && pendingChange.path === activeTab && (
+                      <DiffReviewCard
+                        change={pendingChange}
+                        onAccept={() => resolvePending('accept')}
+                        onReject={() => resolvePending('reject')}
+                      />
+                    )}
                   </AnimatePresence>
                 </div>
               )}
@@ -1150,7 +1192,14 @@ export function IDEView() {
             onAnimationComplete={stopLayoutSync}
           >
             <div className="w-[360px] h-full">
-              <ChatPanel models={availableModels} getContext={getChatContext} onFileChanged={onAgentFileChanged} windup={animationsOn} />
+              <ChatPanel
+                models={availableModels}
+                getContext={getChatContext}
+                onFileChanged={onAgentFileChanged}
+                onPendingChange={onPendingChange}
+                onChangeResolved={onChangeResolved}
+                windup={animationsOn}
+              />
             </div>
           </motion.aside>
         )}

@@ -183,14 +183,20 @@ const api = {
     messages: { role: 'user' | 'assistant'; content: string }[]
     openFile?: { path: string; language?: string; content: string }
     selection?: string
+    reviewMode?: boolean
   }) => ipcRenderer.invoke('ai-agent-run', runId, params),
   aiAgentCancel: (runId: string) => ipcRenderer.invoke('ai-agent-cancel', runId),
+  aiAgentReview: (changeId: string, decision: 'accept' | 'reject') =>
+    ipcRenderer.invoke('ai-agent-review', changeId, decision),
   onAiAgentEvent: (runId: string, cb: (e: unknown) => void) => {
     const channel = `ai-agent-event:${runId}`
     const listener = (_e: unknown, ev: unknown) => cb(ev)
     ipcRenderer.on(channel, listener)
     return () => ipcRenderer.removeListener(channel, listener)
   },
+  ideAgentConfigGet: () => ipcRenderer.invoke('ide-agent-config-get'),
+  ideAgentConfigSet: (patch: { reviewMode?: boolean }) =>
+    ipcRenderer.invoke('ide-agent-config-set', patch),
   setAutoTrigger: (enabled: boolean) => ipcRenderer.invoke('set-auto-trigger', enabled),
   getAutoTrigger: () => ipcRenderer.invoke('get-auto-trigger'),
   onAutoTrigger: (cb: (info: { agent: string }) => void) => {

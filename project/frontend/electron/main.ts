@@ -8,7 +8,7 @@ import { createRequire } from 'node:module'
 import * as db from './db'
 import { streamInlineEdit, stripCodeFence, streamChat, InlineEditParams, ChatParams } from './ai-client'
 import { GroupCoordinator, DEFAULT_ORCHESTRATION, OrchestrationConfig } from './group-coordinator'
-import { runIdeAgent, IdeAgentParams, IdeAgentEvent } from './ide-agent'
+import { runIdeAgent, IdeAgentParams, IdeAgentEvent, PendingChange, ReviewDecision } from './ide-agent'
 const require = createRequire(import.meta.url)
 // node-pty is a native module that must be rebuilt for Electron. If it failed
 // to build (e.g. missing VS Build Tools on Windows), load it lazily so the app
@@ -1632,6 +1632,8 @@ ipcMain.handle('ai-chat-cancel', (_evt, requestId: string) => {
 // the shared agent tools. Events stream on ai-agent-event:<runId>.
 
 const agentAborts = new Map<string, AbortController>()
+// changeId → resolver, so the renderer's accept/reject can unblock the agent.
+const pendingReviews = new Map<string, (d: ReviewDecision) => void>()
 
 ipcMain.handle('ai-agent-run', async (_evt, runId: string, params: IdeAgentParams) => {
   const ac = new AbortController()
@@ -1641,8 +1643,21 @@ ipcMain.handle('ai-agent-run', async (_evt, runId: string, params: IdeAgentParam
       mainWindow.webContents.send(`ai-agent-event:${runId}`, e)
     }
   }
+  // Held until the renderer replies via ai-agent-review. Aborting the run
+  // auto-rejects any outstanding change so the loop can unwind.
+  const requestReview = (change: PendingChange): Promise<ReviewDecision> =>
+    new Promise((resolve) => {
+      if (ac.signal.aborted) { resolve('reject'); return }
+      const onAbort = () => { pendingReviews.delete(change.changeId); resolve('reject') }
+      ac.signal.addEventListener('abort', onAbort, { once: true })
+      pendingReviews.set(change.changeId, (d) => {
+        ac.signal.removeEventListener('abort', onAbort)
+        pendingReviews.delete(change.changeId)
+        resolve(d)
+      })
+    })
   try {
-    await runIdeAgent(SHARED, params, decryptKey, emit, ac.signal)
+    await runIdeAgent(SHARED, params, decryptKey, emit, ac.signal, requestReview)
     return { ok: true }
   } catch (e) {
     const msg = (e as Error).message || String(e)
@@ -1653,11 +1668,32 @@ ipcMain.handle('ai-agent-run', async (_evt, runId: string, params: IdeAgentParam
   }
 })
 
+ipcMain.handle('ai-agent-review', (_evt, changeId: string, decision: ReviewDecision) => {
+  const resolve = pendingReviews.get(changeId)
+  if (resolve) resolve(decision)
+  return { ok: true }
+})
+
 ipcMain.handle('ai-agent-cancel', (_evt, runId: string) => {
   const ac = agentAborts.get(runId)
   if (ac) ac.abort()
   agentAborts.delete(runId)
   return { ok: true }
+})
+
+// IDE-agent config (currently just reviewMode) persisted in meta.
+ipcMain.handle('ide-agent-config-get', () => {
+  const raw = db.getMeta('ide_agent_config')
+  const cfg = raw ? JSON.parse(raw) : {}
+  return { reviewMode: Boolean(cfg.reviewMode) }
+})
+
+ipcMain.handle('ide-agent-config-set', (_evt, patch: { reviewMode?: boolean }) => {
+  const raw = db.getMeta('ide_agent_config')
+  const cfg = raw ? JSON.parse(raw) : {}
+  const next = { ...cfg, ...patch }
+  db.setMeta('ide_agent_config', JSON.stringify(next))
+  return { ok: true, reviewMode: Boolean(next.reviewMode) }
 })
 
 // ── Lifecycle ───────────────────────────────────────────────

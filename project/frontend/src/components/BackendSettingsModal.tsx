@@ -25,11 +25,19 @@ export function BackendSettingsModal({ open, onClose }: Props) {
   const [error, setError] = useState<string>('')
   const animationsOn = useAnimationsEnabled()
   const [orch, setOrch] = useState<OrchestrationConfig | null>(null)
+  const [reviewMode, setReviewMode] = useState(false)
 
   const refresh = useCallback(async () => {
     setSettings(await window.api.getBackendSettings())
     setOrch(await window.api.orchestrationGet())
+    setReviewMode((await window.api.ideAgentConfigGet()).reviewMode)
   }, [])
+
+  const toggleReview = async () => {
+    const next = !reviewMode
+    setReviewMode(next)
+    await window.api.ideAgentConfigSet({ reviewMode: next }).catch(() => {})
+  }
 
   useEffect(() => { if (open) refresh() }, [open, refresh])
 
@@ -199,6 +207,31 @@ export function BackendSettingsModal({ open, onClose }: Props) {
               <span
                 className={`size-4 rounded-full bg-white shadow-sm transition-transform will-change-transform ${
                   animationsOn ? 'translate-x-5' : 'translate-x-0'
+                }`}
+              />
+            </button>
+          </label>
+
+          <label className="flex items-center justify-between gap-4 cursor-pointer group mt-4">
+            <div>
+              <div className="text-xs text-zinc-200 font-medium">Agent review mode</div>
+              <div className="text-[11px] text-zinc-500 mt-0.5">
+                Hold every file change the IDE agent makes and show a diff for you to approve or reject
+                before it is written to disk. Off = changes apply automatically.
+              </div>
+            </div>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={reviewMode}
+              onClick={toggleReview}
+              className={`relative w-10 h-5 rounded-full flex-shrink-0 p-0.5 flex items-center transition-colors ${
+                reviewMode ? 'bg-emerald-600' : 'bg-zinc-700'
+              }`}
+            >
+              <span
+                className={`size-4 rounded-full bg-white shadow-sm transition-transform will-change-transform ${
+                  reviewMode ? 'translate-x-5' : 'translate-x-0'
                 }`}
               />
             </button>
