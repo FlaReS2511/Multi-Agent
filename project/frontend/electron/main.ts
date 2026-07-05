@@ -8,6 +8,7 @@ import { createRequire } from 'node:module'
 import * as db from './db'
 import { streamInlineEdit, stripCodeFence, streamChat, InlineEditParams, ChatParams } from './ai-client'
 import { GroupCoordinator, DEFAULT_ORCHESTRATION, OrchestrationConfig } from './group-coordinator'
+import { runIdeAgent, IdeAgentParams, IdeAgentEvent } from './ide-agent'
 const require = createRequire(import.meta.url)
 // node-pty is a native module that must be rebuilt for Electron. If it failed
 // to build (e.g. missing VS Build Tools on Windows), load it lazily so the app
@@ -1623,6 +1624,39 @@ ipcMain.handle('ai-chat-cancel', (_evt, requestId: string) => {
   const ac = chatAborts.get(requestId)
   if (ac) ac.abort()
   chatAborts.delete(requestId)
+  return { ok: true }
+})
+
+// ── IDE agent (tool-calling loop, streams tool activity) ─────
+// Unlike ai-chat (text only), this lets the model read/modify the workspace via
+// the shared agent tools. Events stream on ai-agent-event:<runId>.
+
+const agentAborts = new Map<string, AbortController>()
+
+ipcMain.handle('ai-agent-run', async (_evt, runId: string, params: IdeAgentParams) => {
+  const ac = new AbortController()
+  agentAborts.set(runId, ac)
+  const emit = (e: IdeAgentEvent) => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send(`ai-agent-event:${runId}`, e)
+    }
+  }
+  try {
+    await runIdeAgent(SHARED, params, decryptKey, emit, ac.signal)
+    return { ok: true }
+  } catch (e) {
+    const msg = (e as Error).message || String(e)
+    emit({ type: 'error', error: msg })
+    return { ok: false, error: msg }
+  } finally {
+    agentAborts.delete(runId)
+  }
+})
+
+ipcMain.handle('ai-agent-cancel', (_evt, runId: string) => {
+  const ac = agentAborts.get(runId)
+  if (ac) ac.abort()
+  agentAborts.delete(runId)
   return { ok: true }
 })
 

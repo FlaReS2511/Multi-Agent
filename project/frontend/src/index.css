@@ -1,7 +1,8 @@
 @import "tailwindcss";
+@import "@fontsource-variable/geist/index.css";
 
 @theme {
-  --font-sans: ui-sans-serif, -apple-system, system-ui, "Segoe UI", sans-serif;
+  --font-sans: "Geist Variable", ui-sans-serif, -apple-system, system-ui, "Segoe UI", sans-serif;
   --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Consolas, monospace;
 }
 
@@ -10,6 +11,7 @@ html, body, #root {
   margin: 0;
   background: #09090b;
   color: #e4e4e7;
+  font-family: "Geist Variable", ui-sans-serif, -apple-system, system-ui, "Segoe UI", sans-serif;
 }
 
 ::-webkit-scrollbar {
@@ -35,4 +37,41 @@ html, body, #root {
 @keyframes inline-ai-fade {
   0% { background: rgba(16, 185, 129, 0.32); }
   100% { background: rgba(16, 185, 129, 0); }
+}
+
+/* Streaming text: each freshly revealed chunk fades from dark → bright,
+   giving the typewriter a smooth "glow-in" feel instead of a hard pop. */
+.stream-chunk {
+  display: inline;
+  animation: stream-glow 0.5s ease forwards;
+}
+@keyframes stream-glow {
+  0%   { opacity: 0; filter: brightness(0.3); }
+  100% { opacity: 1; filter: brightness(1); }
+}
+
+/* Thinking dock: once the text has streamed in but the model is still thinking,
+   a faint darker band sweeps left→right across the words, like a loading pulse. */
+/* Codex-style thinking shimmer: dim text with a brighter band gliding across.
+   The gradient is clipped to the glyphs and its position animates, so the
+   highlight flows smoothly at the pixel level rather than per word. */
+.thinking-shimmer {
+  background: linear-gradient(
+    100deg,
+    #a1a1aa 0%,
+    #a1a1aa 42%,
+    #f4f4f5 50%,
+    #a1a1aa 58%,
+    #a1a1aa 100%
+  );
+  background-size: 300% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  color: transparent;
+  animation: thinking-shimmer 3s linear infinite;
+}
+@keyframes thinking-shimmer {
+  0%   { background-position: 150% 0; }
+  100% { background-position: -150% 0; }
 }

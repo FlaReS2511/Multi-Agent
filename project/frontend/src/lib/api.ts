@@ -249,6 +249,15 @@ export const GROUP_STATUS_STYLES: Record<GroupStatus, { label: string; classes: 
   killed:    { label: 'KILLED',    classes: 'bg-rose-900/30 text-rose-400 ring-rose-800/40' },
 }
 
+export type IdeAgentEvent =
+  | { type: 'reasoning'; delta: string; turn: number }
+  | { type: 'token'; delta: string; turn: number }
+  | { type: 'tool_call'; callId: string; name: string; args: Record<string, unknown> }
+  | { type: 'tool_result'; callId: string; name: string; result: string; isError: boolean }
+  | { type: 'file_changed'; path: string }
+  | { type: 'done'; text: string; turns: number }
+  | { type: 'error'; error: string }
+
 declare global {
   interface Window {
     api: {
@@ -341,6 +350,14 @@ declare global {
       aiChatCancel(requestId: string): Promise<{ ok: boolean }>
       onAiChatChunk(requestId: string, cb: (delta: string) => void): () => void
       onAiChatDone(requestId: string, cb: (info: { ok: boolean; text?: string; error?: string }) => void): () => void
+      aiAgentRun(runId: string, params: {
+        provider: string; model?: string
+        messages: { role: 'user' | 'assistant'; content: string }[]
+        openFile?: { path: string; language?: string; content: string }
+        selection?: string
+      }): Promise<{ ok: boolean; error?: string }>
+      aiAgentCancel(runId: string): Promise<{ ok: boolean }>
+      onAiAgentEvent(runId: string, cb: (e: IdeAgentEvent) => void): () => void
       groupCreate(input: { task_id: string; worker_role: string }): Promise<{ ok: boolean; group?: string; error?: string }>
       groupList(): Promise<{ ok: boolean; groups: GroupRow[] }>
       groupKill(groupId: string): Promise<{ ok: boolean }>

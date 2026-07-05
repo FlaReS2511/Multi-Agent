@@ -383,6 +383,19 @@ export function IDEView() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [openTabs, gitChanges])
 
+  // Called when the IDE agent writes/edits a file. Re-read it from disk if it's
+  // open so the editor reflects the agent's change, and refresh tree + git.
+  const onAgentFileChanged = useCallback(async (relPath: string) => {
+    const disk = await window.api.workspaceReadFile(relPath)
+    if (disk.ok) {
+      setFileContents((prev) =>
+        relPath in prev ? { ...prev, [relPath]: disk.content } : prev,
+      )
+    }
+    refreshWorkspace()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
   // Flatten the file tree into relative paths for quick-open.
   const flatFiles = useMemo(() => {
     const out: string[] = []
@@ -1137,7 +1150,7 @@ export function IDEView() {
             onAnimationComplete={stopLayoutSync}
           >
             <div className="w-[360px] h-full">
-              <ChatPanel models={availableModels} getContext={getChatContext} windup={animationsOn} />
+              <ChatPanel models={availableModels} getContext={getChatContext} onFileChanged={onAgentFileChanged} windup={animationsOn} />
             </div>
           </motion.aside>
         )}

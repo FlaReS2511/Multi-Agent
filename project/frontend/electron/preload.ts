@@ -176,6 +176,21 @@ const api = {
     ipcRenderer.on(channel, listener)
     return () => ipcRenderer.removeListener(channel, listener)
   },
+
+  // IDE agent (tool-calling loop)
+  aiAgentRun: (runId: string, params: {
+    provider: string; model?: string
+    messages: { role: 'user' | 'assistant'; content: string }[]
+    openFile?: { path: string; language?: string; content: string }
+    selection?: string
+  }) => ipcRenderer.invoke('ai-agent-run', runId, params),
+  aiAgentCancel: (runId: string) => ipcRenderer.invoke('ai-agent-cancel', runId),
+  onAiAgentEvent: (runId: string, cb: (e: unknown) => void) => {
+    const channel = `ai-agent-event:${runId}`
+    const listener = (_e: unknown, ev: unknown) => cb(ev)
+    ipcRenderer.on(channel, listener)
+    return () => ipcRenderer.removeListener(channel, listener)
+  },
   setAutoTrigger: (enabled: boolean) => ipcRenderer.invoke('set-auto-trigger', enabled),
   getAutoTrigger: () => ipcRenderer.invoke('get-auto-trigger'),
   onAutoTrigger: (cb: (info: { agent: string }) => void) => {
