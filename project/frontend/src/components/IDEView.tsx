@@ -94,6 +94,31 @@ export function IDEView() {
   const [activeSidebar, setActiveSidebar] = useState<'explorer' | 'search' | 'git' | 'agents' | 'groups'>('explorer')
   const [isSidebarOpen, setIsSidebarOpen] = useState(true)
   const [chatOpen, setChatOpen] = useState(false)
+  // Resizable chat panel width (drag the left edge), persisted.
+  const [chatWidth, setChatWidth] = useState(() => {
+    const v = Number(localStorage.getItem('orqon.chatWidth'))
+    return v >= 280 && v <= 900 ? v : 360
+  })
+  const draggingChatRef = useRef(false)
+  const startChatResize = (e: React.MouseEvent) => {
+    e.preventDefault()
+    draggingChatRef.current = true
+    const startX = e.clientX
+    const startW = chatWidth
+    let latest = startW
+    const onMove = (ev: MouseEvent) => {
+      latest = Math.min(900, Math.max(280, startW + (startX - ev.clientX)))
+      setChatWidth(latest)
+    }
+    const onUp = () => {
+      draggingChatRef.current = false
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', onUp)
+      localStorage.setItem('orqon.chatWidth', String(latest))
+    }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
+  }
   const animationsOn = useAnimationsEnabled()
   // Minimap is hidden while a side panel animates its width (it flickers on
   // frame-by-frame relayout) and restored once the animation settles.
@@ -131,6 +156,8 @@ export function IDEView() {
 
   const editorRef = useRef<any>(null)
   const monacoRef = useRef<any>(null)
+  // The pulsing "agent revealed this line" decoration; cleared on any click/key.
+  const revealDecoRef = useRef<any>(null)
   const [availableModels, setAvailableModels] = useState<ModelOption[]>([])
 
   // Keep the editor sized in lockstep with the side-panel width animation, and
@@ -435,6 +462,14 @@ export function IDEView() {
   // A read-only diff the agent asked to display (ShowDiff). Dismiss-only.
   const [previewDiff, setPreviewDiff] = useState<PendingChange | null>(null)
 
+  // Remove the pulsing reveal highlight + its dismiss listeners.
+  const clearReveal = useCallback(() => {
+    if (revealDecoRef.current) { try { revealDecoRef.current.clear() } catch { /* ignore */ } revealDecoRef.current = null }
+    window.removeEventListener('mousedown', clearReveal)
+    window.removeEventListener('keydown', clearReveal)
+  }, [])
+  useEffect(() => () => clearReveal(), [clearReveal])
+
   const onEditorRequest = useCallback(async (
     op: 'OpenFile' | 'GetOpenEditor' | 'ShowDiff',
     args: Record<string, unknown>,
@@ -445,21 +480,35 @@ export function IDEView() {
         if (!rel) return { ok: false, result: 'error: path required' }
         await openFile(rel)
         const line = typeof args.line === 'number' ? args.line : undefined
-        if (line && editorRef.current) {
-          try {
-            editorRef.current.revealLineInCenter(line)
-            editorRef.current.setPosition({ lineNumber: line, column: 1 })
-            editorRef.current.focus()
-            // Flash the target line so the jump is obvious.
+        if (line) {
+          // openFile only sets state — Monaco hasn't swapped to the new file's
+          // model yet, so revealing now scrolls the wrong (old) content. Wait
+          // for the model to actually load `line` lines, THEN center + pulse.
+          const reveal = (tries = 0) => {
+            const ed = editorRef.current
             const mon = monacoRef.current
-            if (mon) {
-              const col = editorRef.current.createDecorationsCollection([{
-                range: new mon.Range(line, 1, line, 1),
-                options: { isWholeLine: true, className: 'agent-reveal-line' },
-              }])
-              setTimeout(() => { try { col.clear() } catch { /* ignore */ } }, 1800)
+            if (!ed || !mon) return
+            const model = ed.getModel?.()
+            if ((!model || model.getLineCount() < line) && tries < 25) {
+              setTimeout(() => reveal(tries + 1), 40)
+              return
             }
-          } catch { /* ignore */ }
+            try {
+              ed.revealLineInCenter(line)
+              ed.setPosition({ lineNumber: line, column: 1 })
+              ed.focus()
+              // Pulse the target line (bright↔dim, like a warning). Keeps pulsing
+              // until the user clicks or types anywhere.
+              clearReveal() // drop any previous reveal first
+              revealDecoRef.current = ed.createDecorationsCollection([{
+                range: new mon.Range(line, 1, line, 1),
+                options: { isWholeLine: true, className: 'agent-reveal-line', linesDecorationsClassName: 'agent-reveal-gutter' },
+              }])
+              window.addEventListener('mousedown', clearReveal)
+              window.addEventListener('keydown', clearReveal)
+            } catch { /* ignore */ }
+          }
+          requestAnimationFrame(() => reveal())
         }
         return { ok: true, result: `opened ${rel}${line ? ` at line ${line}` : ''}` }
       }
@@ -1252,15 +1301,21 @@ export function IDEView() {
       <AnimatePresence>
         {chatOpen && (
           <motion.aside
-            className="border-l border-zinc-800 bg-zinc-950 flex-shrink-0 overflow-hidden"
+            className="relative border-l border-zinc-800 bg-zinc-950 flex-shrink-0 overflow-hidden"
             initial={animationsOn ? { width: 0 } : false}
-            animate={{ width: 360 }}
-            exit={animationsOn ? { width: 0 } : { width: 0 }}
-            transition={{ duration: 0.26, ease: 'easeInOut' }}
+            animate={{ width: chatWidth }}
+            exit={{ width: 0 }}
+            transition={{ duration: draggingChatRef.current ? 0 : 0.26, ease: 'easeInOut' }}
             onAnimationStart={startLayoutSync}
             onAnimationComplete={stopLayoutSync}
           >
-            <div className="w-[360px] h-full">
+            {/* Drag handle: resize the chat panel from its left edge. */}
+            <div
+              onMouseDown={startChatResize}
+              className="absolute left-0 top-0 h-full w-1.5 z-20 cursor-col-resize hover:bg-blue-500/50 transition-colors"
+              title="Drag to resize"
+            />
+            <div style={{ width: chatWidth }} className="h-full">
               <ChatPanel
                 models={availableModels}
                 getContext={getChatContext}

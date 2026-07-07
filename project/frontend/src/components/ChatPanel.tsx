@@ -6,19 +6,22 @@
 // about the code the user is looking at.
 
 import { useEffect, useRef, useState, ReactNode } from 'react'
-import { motion } from 'framer-motion'
+import { motion, AnimatePresence } from 'framer-motion'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 import {
   Sparkles, Send, Square, Trash2, FileCode,
   FileText, FilePen, FilePlus2, Search, FolderSearch, Wrench, CheckCircle2, XCircle, ShieldCheck,
   TerminalSquare, ListPlus, Boxes, Undo2, AlertTriangle,
   GitBranch, GitCommitHorizontal, GitPullRequestArrow, UserCog, Globe, ListChecks, FolderTree, Trash, FileInput,
-  History, Plus, Archive,
+  History, Plus, Archive, Telescope, Copy, Check,
 } from 'lucide-react'
 import { ModelOption, IdeAgentEvent, PendingChange, PendingAction, AgentTodo, AgentSessionMeta } from '../lib/api'
 
 // Slash commands available in agent mode. Typing "/" pops up a filtered menu.
 const AGENT_SLASH_COMMANDS: { name: string; desc: string }[] = [
   { name: '/plan', desc: 'Toggle plan mode (investigate read-only, then approve a plan)' },
+  { name: '/research', desc: 'Toggle research mode (deep read-only web + code → a cited answer)' },
   { name: '/compact', desc: 'Summarize the conversation to save context' },
   { name: '/new', desc: 'Start a fresh session (clear history)' },
   { name: '/review', desc: 'Toggle review mode (approve each change)' },
@@ -167,8 +170,15 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
   // Plan mode is a toggle WITHIN agent mode (via /plan): runs read-only and
   // presents a plan to approve instead of editing directly.
   const [planMode, setPlanMode] = useState(false)
-  // A plan produced in plan mode, awaiting the user's "Approve & Run".
-  const [planApproval, setPlanApproval] = useState<string | null>(null)
+  // Research mode (/research): read-only deep investigation (web + code) → a
+  // cited answer. Mutually exclusive with plan mode.
+  const [researchMode, setResearchMode] = useState(false)
+  // A plan awaiting the user's "Approve & Run". `explicit` = the agent called
+  // PresentPlan; false = a plan run just ended with text (fallback).
+  const [planApproval, setPlanApproval] = useState<{ text: string; explicit: boolean } | null>(null)
+  const [planExpanded, setPlanExpanded] = useState(false)
+  // Plan text stashed while a git-dirty warning is shown before running it.
+  const pendingPlanRef = useRef<string | null>(null)
   const [reviewMode, setReviewMode] = useState(false)
   // Files the current agent run has written (for the "Undo run" affordance).
   const runFilesRef = useRef<Set<string>>(new Set())
@@ -488,10 +498,11 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
   useEffect(() => () => { if (rafRef.current != null) cancelAnimationFrame(rafRef.current) }, [])
 
   // Agent mode: run the tool-calling loop, rendering tool activity inline.
-  const sendAgent = (opts?: { text?: string; planMode?: boolean }) => {
+  const sendAgent = (opts?: { text?: string; planMode?: boolean; researchMode?: boolean }) => {
     const text = (opts?.text ?? input).trim()
     if (!text || streaming) return
     const usePlan = opts?.planMode ?? planMode
+    const useResearch = opts?.researchMode ?? researchMode
 
     const ctx = useFileContext ? getContext() : null
     // Preserve tool activity from earlier turns so the agent remembers what it
@@ -561,7 +572,7 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
         return copy
       })
       if (e.type === 'file_changed') { runFilesRef.current.add(e.path); onFileChanged?.(e.path) }
-      if (e.type === 'done' || e.type === 'error' || e.type === 'blocked') {
+      if (e.type === 'done' || e.type === 'error' || e.type === 'blocked' || e.type === 'plan') {
         off()
         offEditor()
         reqIdRef.current = null
@@ -572,8 +583,11 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
           setLastRunFiles(Array.from(runFilesRef.current))
         }
         if (rafRef.current != null) { cancelAnimationFrame(rafRef.current); rafRef.current = null }
-        // Plan mode: the final message IS the plan — offer "Approve & Run".
-        if (e.type === 'done' && usePlan && e.text?.trim()) setPlanApproval(e.text.trim())
+        // Plan is ready when the agent explicitly calls PresentPlan → 'plan'.
+        if (e.type === 'plan' && e.plan?.trim()) setPlanApproval({ text: e.plan.trim(), explicit: true })
+        // Fallback: a plan run that ended with text but never called PresentPlan
+        // — offer to treat that text as the plan (clearly labeled).
+        else if (e.type === 'done' && usePlan && e.text?.trim()) setPlanApproval({ text: e.text.trim(), explicit: false })
         // Snap every streaming item to its full received text — append the
         // remaining tail as one final glowing chunk, no lingering typewriter.
         setAgentItems((prev) => {
@@ -590,6 +604,7 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
           })
           if (e.type === 'error') copy.push({ kind: 'text', role: 'assistant', content: `⚠ ${e.error}` })
           if (e.type === 'blocked') copy.push({ kind: 'text', role: 'assistant', content: `⛔ Blocked: ${e.reason}` })
+          if (e.type === 'plan') copy.push({ kind: 'text', role: 'assistant', content: `📋 **Plan**\n\n${e.plan}` })
           // Persist the finished transcript so memory survives a restart.
           agentItemsRef.current = copy
           void persistSession(copy)
@@ -606,17 +621,33 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
       selection: ctx?.selection,
       reviewMode,
       planMode: usePlan,
+      researchMode: useResearch,
     })
   }
 
-  // Approve the pending plan → turn plan mode off and execute it.
-  const approvePlan = () => {
-    const plan = planApproval
-    setPlanApproval(null)
-    if (!plan) return
+  // Execute an approved plan in agent mode.
+  const runPlan = (plan: string) => {
     setPlanMode(false)
     sendAgent({ text: `Implement this approved plan, following it step by step:\n\n${plan}`, planMode: false })
   }
+  // Approve the pending plan → (git-dirty guard, then) execute it.
+  const approvePlan = async () => {
+    const plan = planApproval?.text
+    setPlanApproval(null)
+    setPlanExpanded(false)
+    if (!plan) return
+    if (!reviewMode) {
+      try {
+        const d = await window.api.workspaceGitDirtyCount()
+        if (d.ok && d.count > 0) { pendingPlanRef.current = plan; setDirtyWarn({ count: d.count }); return }
+      } catch { /* proceed */ }
+    }
+    runPlan(plan)
+  }
+  // Refine: drop the approval but STAY in plan mode so the next message re-plans
+  // with this plan already in context. Dismiss: cancel planning entirely.
+  const refinePlan = () => { setPlanApproval(null); setPlanExpanded(false) }
+  const dismissPlan = () => { setPlanApproval(null); setPlanExpanded(false); setPlanMode(false) }
 
   const stop = () => {
     if (pendingAction) { resolveAction(false) }
@@ -664,9 +695,14 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
   // Reset selection/dismissal whenever the query changes.
   useEffect(() => { setSlashIndex(0); setSlashDismissed(false) }, [slashQuery])
 
+  // Plan and research are mutually exclusive read-only modes.
+  const togglePlan = () => { const next = !planMode; setPlanMode(next); if (next) setResearchMode(false) }
+  const toggleResearch = () => { const next = !researchMode; setResearchMode(next); if (next) setPlanMode(false) }
+
   const runSlash = (name: string) => {
     setInput('')
-    if (name === '/plan') setPlanMode((v) => !v)
+    if (name === '/plan') togglePlan()
+    else if (name === '/research') toggleResearch()
     else if (name === '/compact') void compact()
     else if (name === '/new') newSession()
     else if (name === '/review') toggleReview()
@@ -682,6 +718,8 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
       return
     }
     if (mode === 'ask') { send(); return }
+    // Research mode: read-only deep dive → cited answer. No dirty check.
+    if (researchMode) { sendAgent({ researchMode: true }); return }
     // Plan mode: read-only investigation → a plan to approve. No dirty check.
     if (planMode) { sendAgent({ planMode: true }); return }
     // Agent: auto-apply on a dirty tree is risky (no clean git baseline to undo
@@ -695,8 +733,13 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
     sendAgent()
   }
 
-  // Proceed with a run the user confirmed despite a dirty tree.
-  const confirmDirtyRun = () => { setDirtyWarn(null); sendAgent() }
+  // Proceed with a run the user confirmed despite a dirty tree. If a plan was
+  // stashed (approve → dirty), run that; otherwise a normal agent run.
+  const confirmDirtyRun = () => {
+    setDirtyWarn(null)
+    if (pendingPlanRef.current) { const p = pendingPlanRef.current; pendingPlanRef.current = null; runPlan(p) }
+    else sendAgent()
+  }
 
   // Approve or decline a sensitive git/login/background action.
   const resolveAction = (approved: boolean) => {
@@ -714,7 +757,7 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
 
   return (
     <motion.div
-      className="h-full flex flex-col bg-zinc-950"
+      className="h-full flex flex-col bg-zinc-950 relative overflow-hidden"
       variants={windup ? containerVariants : undefined}
       initial={windup ? 'hidden' : false}
       animate={windup ? 'show' : false}
@@ -726,8 +769,10 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
       >
         <div className="flex items-center gap-2">
           <Sparkles size={13} className="text-blue-400" />
-          {/* Ask / Agent mode toggle */}
-          <div className="flex rounded-md bg-zinc-900 border border-zinc-800 p-0.5">
+          {/* Ask / Agent mode toggle. Plan / Research / Review are toggled via
+              slash commands (/plan, /research, /review); plan & research show a
+              glow, and review shows the green shield badge below. */}
+          <div className="relative flex rounded-md bg-zinc-900 border border-zinc-800 p-0.5">
             {(['ask', 'agent'] as const).map((m) => (
               <button
                 key={m}
@@ -741,43 +786,16 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
                 {m}
               </button>
             ))}
+            {/* Review-on indicator: green shield badge above the Agent corner. */}
+            {mode === 'agent' && reviewMode && (
+              <span
+                className="absolute -top-1.5 -right-1.5 grid place-items-center w-3.5 h-3.5 rounded-[3px] bg-emerald-500 ring-1 ring-zinc-950 shadow"
+                title="Review mode on — you approve each change before it applies (/review to toggle)"
+              >
+                <ShieldCheck size={9} className="text-white" />
+              </span>
+            )}
           </div>
-          {/* Plan-mode toggle (agent only): /plan or click — read-only, produces a plan */}
-          {mode === 'agent' && (
-            <button
-              onClick={() => { if (!streaming) setPlanMode((v) => !v) }}
-              disabled={streaming}
-              className={`flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold border transition-colors ${
-                planMode
-                  ? 'border-blue-500/40 bg-blue-500/10 text-blue-300'
-                  : 'border-zinc-800 text-zinc-500 hover:text-zinc-300'
-              } ${streaming ? 'cursor-not-allowed opacity-60' : ''}`}
-              title={planMode
-                ? 'Plan mode on: investigate read-only, then approve a plan (/plan to toggle)'
-                : 'Plan mode off: agent edits directly (/plan to toggle)'}
-            >
-              <ListPlus size={11} />
-              Plan
-            </button>
-          )}
-          {/* Review-mode toggle (agent only): hold every write for approval. */}
-          {mode === 'agent' && (
-            <button
-              onClick={toggleReview}
-              disabled={streaming}
-              className={`flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold border transition-colors ${
-                reviewMode
-                  ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300'
-                  : 'border-zinc-800 text-zinc-500 hover:text-zinc-300'
-              } ${streaming ? 'cursor-not-allowed opacity-60' : ''}`}
-              title={reviewMode
-                ? 'Review on: you approve each change before it is applied'
-                : 'Review off: changes are applied automatically'}
-            >
-              <ShieldCheck size={11} />
-              Review
-            </button>
-          )}
         </div>
         <div className="flex items-center gap-1.5">
           {mode !== 'ask' && (
@@ -959,12 +977,27 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
       )}
 
       {/* Git-dirty warning before an auto-apply run */}
-      {/* Plan-approval bar: a plan mode run finished — approve to execute it */}
+      {/* Plan-approval bar: a plan is ready — preview, then approve/refine/dismiss */}
       {planApproval && !streaming && (
         <div className="flex items-start gap-2 px-3 py-2 border-t border-blue-500/30 bg-blue-500/5 flex-shrink-0">
           <ListPlus size={13} className="text-blue-400 mt-0.5 flex-shrink-0" />
           <div className="flex-1 text-[11px] text-zinc-300 leading-relaxed">
-            Plan ready. Approve to execute it in Agent mode.
+            <div className="flex items-center justify-between gap-2">
+              <span>{planApproval.explicit
+                ? 'Plan ready. Approve to run it in Agent mode.'
+                : 'Agent ended without PresentPlan — treat its message as the plan?'}</span>
+              <button
+                onClick={() => setPlanExpanded((v) => !v)}
+                className="text-[10px] text-blue-300/80 hover:text-blue-200 flex-shrink-0"
+              >
+                {planExpanded ? 'Hide' : 'Preview'}
+              </button>
+            </div>
+            {planExpanded && (
+              <div className="mt-1.5 max-h-44 overflow-y-auto whitespace-pre-wrap text-[11px] text-zinc-400 bg-zinc-950/60 border border-zinc-800 rounded p-2">
+                {planApproval.text}
+              </div>
+            )}
             <div className="flex items-center gap-2 mt-1.5">
               <button
                 onClick={approvePlan}
@@ -973,7 +1006,15 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
                 Approve &amp; Run
               </button>
               <button
-                onClick={() => setPlanApproval(null)}
+                onClick={refinePlan}
+                title="Keep plan mode on and give feedback to refine the plan"
+                className="text-[11px] px-2 py-0.5 rounded border border-zinc-700 text-zinc-300 hover:text-white hover:border-zinc-600"
+              >
+                Refine
+              </button>
+              <button
+                onClick={dismissPlan}
+                title="Cancel planning (turn plan mode off)"
                 className="text-[11px] px-2 py-0.5 rounded border border-zinc-700 text-zinc-400 hover:text-zinc-200"
               >
                 Dismiss
@@ -1089,9 +1130,11 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
             }}
             rows={3}
             placeholder={mode === 'agent'
-              ? (planMode
-                  ? 'Describe the task to plan… (read-only, then a plan to approve · /plan to exit)'
-                  : 'Describe a change… (Enter to run · / for commands)')
+              ? (researchMode
+                  ? 'Ask a research question… (deep read-only web + code · /research to exit)'
+                  : planMode
+                    ? 'Describe the task to plan… (read-only, then a plan to approve · /plan to exit)'
+                    : 'Describe a change… (Enter to run · / for commands)')
               : 'Ask anything… (Enter to send, Shift+Enter for newline)'}
             className="w-full px-2 py-1.5 bg-zinc-900 border border-zinc-700 rounded text-xs text-zinc-100 placeholder-zinc-600 resize-none focus:outline-none focus:border-blue-500"
           />
@@ -1128,7 +1171,7 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
             <button
               onClick={submit}
               disabled={!input.trim()}
-              title={mode === 'agent' ? (planMode ? 'Make a plan' : 'Run agent') : 'Send'}
+              title={mode === 'agent' ? (researchMode ? 'Research' : planMode ? 'Make a plan' : 'Run agent') : 'Send'}
               className="px-2.5 py-1 rounded bg-blue-600 hover:bg-blue-500 disabled:bg-zinc-800 disabled:text-zinc-600 text-white flex items-center gap-1"
             >
               <Send size={12} />
@@ -1136,54 +1179,90 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
           )}
         </div>
       </motion.div>
+
+      {/* Plan-mode glow: while plan mode is ON (from /plan until it ends), an
+          Apple-Intelligence-style edge glow surrounds the chat. Fades in on
+          enter and DIMS OUT on exit (the wrapper animates opacity; the inner
+          rim/breathe keep their own CSS animation). Clipped, no pointer. */}
+      <AnimatePresence>
+        {mode === 'agent' && (planMode || researchMode) && (
+          <motion.div
+            key={planMode ? 'plan-glow' : 'research-glow'}
+            className="absolute inset-0 z-30 pointer-events-none"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            transition={{ duration: 0.6, ease: 'easeInOut' }}
+          >
+            <div className={planMode ? 'plan-glow' : 'research-glow'} aria-hidden="true" />
+          </motion.div>
+        )}
+      </AnimatePresence>
     </motion.div>
   )
 }
 
 function MessageBubble({ role, content, streaming }: { role: 'user' | 'assistant'; content: string; streaming: boolean }) {
   const isUser = role === 'user'
+  const contentRef = useRef<HTMLDivElement>(null)
   return (
     <div className={isUser ? 'flex justify-end' : 'flex justify-start'}>
       <div
-        className={`max-w-[92%] rounded-lg px-3 py-2 text-xs leading-relaxed ${
+        className={`group relative select-text max-w-[92%] min-w-0 overflow-hidden break-words rounded-lg px-3 py-2 text-xs leading-relaxed ${
           isUser
             ? 'bg-blue-600/20 border border-blue-500/30 text-zinc-100'
             : 'bg-zinc-900 border border-zinc-800 text-zinc-200'
         }`}
       >
-        {content ? <MessageContent text={content} /> : streaming ? (
-          <span className="inline-flex gap-1 items-center text-zinc-500">
-            <span className="size-1.5 rounded-full bg-zinc-500 animate-pulse" />
-            thinking…
-          </span>
-        ) : null}
+        <div ref={contentRef}>
+          {content
+            ? (isUser ? <div className="whitespace-pre-wrap break-words">{content}</div> : <MessageContent text={content} />)
+            : streaming ? (
+              <span className="inline-flex gap-1 items-center text-zinc-500">
+                <span className="size-1.5 rounded-full bg-zinc-500 animate-pulse" />
+                thinking…
+              </span>
+            ) : null}
+        </div>
         {streaming && content && <span className="inline-block w-1.5 h-3.5 ml-0.5 align-middle bg-blue-400 animate-pulse" />}
+        {!isUser && !streaming && content.trim() && <CopyButton getText={() => contentRef.current?.innerText || content} />}
       </div>
     </div>
   )
 }
 
-// Minimal markdown-ish renderer: splits fenced code blocks from prose.
-function MessageContent({ text }: { text: string }) {
-  const parts = text.split(/(```[\s\S]*?```)/g)
+// Copy-to-clipboard button. `getText` returns the RENDERED text (innerText of
+// the message), so the clipboard gets the readable version — no markdown syntax.
+function CopyButton({ getText }: { getText: () => string }) {
+  const [copied, setCopied] = useState(false)
   return (
-    <>
-      {parts.map((part, i) => {
-        const m = part.match(/^```([a-zA-Z0-9_-]*)\n?([\s\S]*?)```$/)
-        if (m) {
-          const lang = m[1]
-          const code = m[2].replace(/\n$/, '')
-          return (
-            <pre key={i} className="my-1.5 p-2 rounded bg-zinc-950 border border-zinc-800 overflow-x-auto">
-              {lang && <div className="text-[9px] uppercase tracking-wider text-zinc-600 mb-1">{lang}</div>}
-              <code className="text-[11px] font-mono text-zinc-200 whitespace-pre">{code}</code>
-            </pre>
-          )
-        }
-        if (!part) return null
-        return <span key={i} className="whitespace-pre-wrap">{part}</span>
-      })}
-    </>
+    <button
+      onClick={() => {
+        navigator.clipboard.writeText(getText())
+          .then(() => { setCopied(true); setTimeout(() => setCopied(false), 1200) })
+          .catch(() => {})
+      }}
+      title="Copy message"
+      className="absolute top-1 right-1 p-1 rounded bg-zinc-800/90 border border-zinc-700 text-zinc-400 hover:text-zinc-100 opacity-0 group-hover:opacity-100 transition-opacity"
+    >
+      {copied ? <Check size={11} className="text-emerald-400" /> : <Copy size={11} />}
+    </button>
+  )
+}
+
+// Full markdown renderer (GFM: tables, lists, code, links, headings, hr…).
+// Styling lives in `.md-body` in index.css; wide tables/code scroll inside the
+// bubble so nothing overflows.
+function MessageContent({ text }: { text: string }) {
+  return (
+    <div className="md-body">
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{ a: ({ node: _n, ...p }) => <a {...p} target="_blank" rel="noreferrer" /> }}
+      >
+        {text}
+      </ReactMarkdown>
+    </div>
   )
 }
 
@@ -1211,19 +1290,23 @@ function GlowChunks({ chunks }: { chunks: string[] }) {
   )
 }
 
-// Assistant text rendered as glowing streamed chunks (agent mode).
+// Assistant text (agent mode). User prompts stay plain; assistant text renders
+// as markdown (updates live as chunks stream in).
 function GlowMessage({ role, chunks }: { role: 'user' | 'assistant'; chunks: string[] }) {
   const isUser = role === 'user'
+  const text = chunks.join('')
+  const contentRef = useRef<HTMLDivElement>(null)
   return (
     <div className={isUser ? 'flex justify-end' : 'flex justify-start'}>
       <div
-        className={`max-w-[92%] rounded-lg px-3 py-2 text-xs leading-relaxed whitespace-pre-wrap ${
+        className={`group relative select-text max-w-[92%] min-w-0 overflow-hidden break-words rounded-lg px-3 py-2 text-xs leading-relaxed ${
           isUser
-            ? 'bg-blue-600/20 border border-blue-500/30 text-zinc-100'
+            ? 'bg-blue-600/20 border border-blue-500/30 text-zinc-100 whitespace-pre-wrap'
             : 'bg-zinc-900 border border-zinc-800 text-zinc-200'
         }`}
       >
-        <GlowChunks chunks={chunks} />
+        <div ref={contentRef}>{isUser ? text : <MessageContent text={text} />}</div>
+        {!isUser && text.trim() && <CopyButton getText={() => contentRef.current?.innerText || text} />}
       </div>
     </div>
   )
@@ -1346,11 +1429,14 @@ function ToolActivity({ entry }: { entry: ToolEntry }) {
     OpenFile: <FileText size={12} />,
     GetOpenEditor: <FileCode size={12} />,
     ShowDiff: <FilePen size={12} />,
+    PresentPlan: <ListPlus size={12} />,
     CreateTask: <ListPlus size={12} />,
     CreateGroup: <Boxes size={12} />,
+    LoadToolGroup: <Boxes size={12} />,
     TodoWrite: <ListChecks size={12} />,
     WebFetch: <Globe size={12} />,
     WebSearch: <Globe size={12} />,
+    Research: <Telescope size={12} />,
     GitStatus: <GitBranch size={12} />,
     GitDiff: <GitBranch size={12} />,
     GitLog: <GitCommitHorizontal size={12} />,
