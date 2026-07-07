@@ -12,6 +12,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { execSync, execFileSync } from 'node:child_process'
+import ExcelJS from 'exceljs'
 
 const BASH_TIMEOUT_MS = 120_000
 const DIAG_TIMEOUT_MS = 180_000
@@ -620,6 +621,231 @@ export function runFileTool(cwd: string, name: string, args: any): string | null
     case 'GetDiagnostics': return toolGetDiagnostics(cwd, args)
     case 'NotebookEdit': return toolNotebookEdit(cwd, args)
     case 'DownloadFile': return toolDownloadFile(cwd, args)
+    default: return null
+  }
+}
+
+// ── Excel (.xlsx) tools ──────────────────────────────────────────
+// Async (exceljs) → dispatched via runExcelTool, not the sync runFileTool.
+
+function colToNum(col: string): number {
+  let n = 0
+  for (const ch of col.toUpperCase()) n = n * 26 + (ch.charCodeAt(0) - 64)
+  return n
+}
+function parseA1(a1: string): { row: number; col: number } {
+  const m = /^([A-Za-z]+)(\d+)$/.exec(a1.trim())
+  if (!m) throw new Error(`bad cell reference: ${a1}`)
+  return { col: colToNum(m[1]), row: parseInt(m[2], 10) }
+}
+function parseRange(r: string): { r1: number; c1: number; r2: number; c2: number } {
+  const [a, b] = r.split(':')
+  const p1 = parseA1(a)
+  const p2 = b ? parseA1(b) : p1
+  return { r1: Math.min(p1.row, p2.row), c1: Math.min(p1.col, p2.col), r2: Math.max(p1.row, p2.row), c2: Math.max(p1.col, p2.col) }
+}
+// Strings starting with "=" become formulas.
+function toCellValue(v: unknown): unknown {
+  if (typeof v === 'string' && v.startsWith('=')) return { formula: v.slice(1) }
+  return v
+}
+function readCell(cell: any): unknown {
+  const v = cell?.value
+  if (v == null) return null
+  if (typeof v === 'object') {
+    if ('result' in v) return (v as any).result
+    if ('text' in v) return (v as any).text
+    if (v instanceof Date) return v.toISOString()
+    if ('richText' in v) return (v as any).richText.map((t: any) => t.text).join('')
+    return String(v)
+  }
+  return v
+}
+function normArgb(c: string): string {
+  const h = c.replace('#', '').toUpperCase()
+  return h.length === 6 ? 'FF' + h : h
+}
+async function loadWorkbook(p: string, allowNew: boolean): Promise<any> {
+  const wb = new ExcelJS.Workbook()
+  if (fs.existsSync(p)) await wb.xlsx.readFile(p)
+  else if (!allowNew) throw new Error(`file not found: ${p}`)
+  return wb
+}
+function sheetOf(wb: any, name?: string): any {
+  return name ? wb.getWorksheet(name) : wb.worksheets[0]
+}
+
+async function toolExcelInfo(cwd: string, a: { path: string }): Promise<string> {
+  const wb = await loadWorkbook(resolveInside(cwd, a.path), false)
+  const lines = wb.worksheets.map((ws: any) => `- ${ws.name}: ${ws.rowCount} rows × ${ws.columnCount} cols`)
+  return `Workbook ${a.path}:\n${lines.join('\n') || '(no sheets)'}`
+}
+async function toolExcelRead(cwd: string, a: { path: string; sheet?: string; range?: string; as?: string }): Promise<string> {
+  const wb = await loadWorkbook(resolveInside(cwd, a.path), false)
+  const ws = sheetOf(wb, a.sheet)
+  if (!ws) return `error: sheet ${a.sheet ?? '(first)'} not found`
+  let { r1, c1, r2, c2 } = a.range ? parseRange(a.range) : { r1: 1, c1: 1, r2: ws.rowCount || 0, c2: ws.columnCount || 0 }
+  if (r2 - r1 > 2000) r2 = r1 + 2000 // cap
+  const rows: unknown[][] = []
+  for (let r = r1; r <= r2; r++) {
+    const row: unknown[] = []
+    for (let c = c1; c <= c2; c++) row.push(readCell(ws.getCell(r, c)))
+    rows.push(row)
+  }
+  if (a.as === 'json' && rows.length) {
+    const [hdr, ...body] = rows
+    const objs = body.map((rw) => Object.fromEntries((hdr as unknown[]).map((h, i) => [String(h ?? `col${i + 1}`), rw[i] ?? null])))
+    return JSON.stringify(objs).slice(0, 12000)
+  }
+  return JSON.stringify(rows).slice(0, 12000)
+}
+async function toolExcelWrite(cwd: string, a: { path: string; sheets: { name?: string; rows: unknown[][] }[] }): Promise<string> {
+  const p = resolveInside(cwd, a.path)
+  fs.mkdirSync(path.dirname(p), { recursive: true })
+  const wb = new ExcelJS.Workbook()
+  const sheets = a.sheets || []
+  sheets.forEach((s, i) => {
+    const ws = wb.addWorksheet(s.name || `Sheet${i + 1}`)
+    for (const row of s.rows || []) ws.addRow((row || []).map(toCellValue))
+  })
+  if (sheets.length === 0) wb.addWorksheet('Sheet1')
+  await wb.xlsx.writeFile(p)
+  return `wrote ${sheets.length || 1} sheet(s) to ${a.path}`
+}
+async function toolExcelSetRange(cwd: string, a: { path: string; sheet?: string; anchor: string; values: unknown[][] }): Promise<string> {
+  const p = resolveInside(cwd, a.path)
+  const wb = await loadWorkbook(p, true)
+  let ws = sheetOf(wb, a.sheet)
+  if (!ws) ws = wb.addWorksheet(a.sheet || 'Sheet1')
+  const { row: r0, col: c0 } = parseA1(a.anchor)
+  ;(a.values || []).forEach((rowVals, ri) => (rowVals || []).forEach((v, ci) => { ws.getCell(r0 + ri, c0 + ci).value = toCellValue(v) as any }))
+  fs.mkdirSync(path.dirname(p), { recursive: true })
+  await wb.xlsx.writeFile(p)
+  return `set ${(a.values || []).length}×${((a.values || [])[0] || []).length} block at ${a.anchor} in ${ws.name} of ${a.path}`
+}
+async function toolExcelAppendRows(cwd: string, a: { path: string; sheet?: string; rows: unknown[][] }): Promise<string> {
+  const p = resolveInside(cwd, a.path)
+  const wb = await loadWorkbook(p, true)
+  let ws = sheetOf(wb, a.sheet)
+  if (!ws) ws = wb.addWorksheet(a.sheet || 'Sheet1')
+  for (const row of a.rows || []) ws.addRow((row || []).map(toCellValue))
+  fs.mkdirSync(path.dirname(p), { recursive: true })
+  await wb.xlsx.writeFile(p)
+  return `appended ${(a.rows || []).length} row(s) to ${ws.name} in ${a.path}`
+}
+async function toolExcelSheetOp(cwd: string, a: { path: string; op: string; sheet: string; new_name?: string }): Promise<string> {
+  const p = resolveInside(cwd, a.path)
+  const wb = await loadWorkbook(p, a.op === 'add')
+  if (a.op === 'add') {
+    if (wb.getWorksheet(a.sheet)) return `error: sheet "${a.sheet}" already exists`
+    wb.addWorksheet(a.sheet)
+  } else {
+    const ws = wb.getWorksheet(a.sheet)
+    if (!ws) return `error: sheet "${a.sheet}" not found`
+    if (a.op === 'delete') wb.removeWorksheet(ws.id)
+    else if (a.op === 'rename') { if (!a.new_name) return 'error: new_name required'; ws.name = a.new_name }
+    else return `error: unknown op "${a.op}" (use add|delete|rename)`
+  }
+  await wb.xlsx.writeFile(p)
+  return `${a.op} sheet "${a.sheet}"${a.new_name ? ` → "${a.new_name}"` : ''} in ${a.path}`
+}
+async function toolExcelFormat(cwd: string, a: { path: string; sheet?: string; range: string; number_format?: string; bold?: boolean; fill?: string; font_color?: string }): Promise<string> {
+  const p = resolveInside(cwd, a.path)
+  const wb = await loadWorkbook(p, false)
+  const ws = sheetOf(wb, a.sheet)
+  if (!ws) return `error: sheet ${a.sheet ?? '(first)'} not found`
+  const { r1, c1, r2, c2 } = parseRange(a.range)
+  for (let r = r1; r <= r2; r++) for (let c = c1; c <= c2; c++) {
+    const cell = ws.getCell(r, c)
+    if (a.number_format) cell.numFmt = a.number_format
+    if (a.bold) cell.font = { ...(cell.font || {}), bold: true }
+    if (a.font_color) cell.font = { ...(cell.font || {}), color: { argb: normArgb(a.font_color) } }
+    if (a.fill) cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: normArgb(a.fill) } }
+  }
+  await wb.xlsx.writeFile(p)
+  return `formatted ${a.range} in ${ws.name} of ${a.path}`
+}
+
+export const EXCEL_TOOL_SPECS: ToolSpec[] = [
+  {
+    name: 'ExcelInfo',
+    description: 'List the sheets in an .xlsx workbook with their row/column counts. Use before reading/editing to understand the structure.',
+    input_schema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] },
+  },
+  {
+    name: 'ExcelRead',
+    description: 'Read cells from an .xlsx sheet as a 2D array (or as JSON objects with as="json", using row 1 as headers). Optional range like "A1:D50"; sheet defaults to the first.',
+    input_schema: {
+      type: 'object',
+      properties: { path: { type: 'string' }, sheet: { type: 'string' }, range: { type: 'string' }, as: { type: 'string', enum: ['rows', 'json'] } },
+      required: ['path'],
+    },
+  },
+  {
+    name: 'ExcelWrite',
+    description: 'Create or overwrite an .xlsx workbook. sheets = [{ name, rows: [[cell,...],...] }] (multiple sheets supported). A cell string starting with "=" is treated as a formula (e.g. "=SUM(A1:A10)").',
+    input_schema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string' },
+        sheets: { type: 'array', items: { type: 'object', properties: { name: { type: 'string' }, rows: { type: 'array', items: { type: 'array' } } }, required: ['rows'] } },
+      },
+      required: ['path', 'sheets'],
+    },
+  },
+  {
+    name: 'ExcelSetRange',
+    description: 'Write a block of values into an existing (or new) .xlsx starting at a cell anchor like "B2", without rewriting the whole file. Creates the sheet/file if missing. Cell strings starting with "=" are formulas.',
+    input_schema: {
+      type: 'object',
+      properties: { path: { type: 'string' }, sheet: { type: 'string' }, anchor: { type: 'string' }, values: { type: 'array', items: { type: 'array' } } },
+      required: ['path', 'anchor', 'values'],
+    },
+  },
+  {
+    name: 'ExcelAppendRows',
+    description: 'Append rows to the end of a sheet in an .xlsx (creates the file/sheet if missing).',
+    input_schema: {
+      type: 'object',
+      properties: { path: { type: 'string' }, sheet: { type: 'string' }, rows: { type: 'array', items: { type: 'array' } } },
+      required: ['path', 'rows'],
+    },
+  },
+  {
+    name: 'ExcelSheetOp',
+    description: 'Manage sheets in an .xlsx: op = "add" | "delete" | "rename" (rename needs new_name).',
+    input_schema: {
+      type: 'object',
+      properties: { path: { type: 'string' }, op: { type: 'string', enum: ['add', 'delete', 'rename'] }, sheet: { type: 'string' }, new_name: { type: 'string' } },
+      required: ['path', 'op', 'sheet'],
+    },
+  },
+  {
+    name: 'ExcelFormat',
+    description: 'Format a cell range in an .xlsx: number_format (e.g. "#,##0.00", "0%", "yyyy-mm-dd"), bold, fill (hex bg color), font_color (hex). range like "A1:C1".',
+    input_schema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string' }, sheet: { type: 'string' }, range: { type: 'string' },
+        number_format: { type: 'string' }, bold: { type: 'boolean' }, fill: { type: 'string' }, font_color: { type: 'string' },
+      },
+      required: ['path', 'range'],
+    },
+  },
+]
+export const EXCEL_TOOL_NAMES = new Set(EXCEL_TOOL_SPECS.map((s) => s.name))
+// Excel tools that write the file (for /undo tracking + editor refresh).
+export const EXCEL_MUTATORS = new Set(['ExcelWrite', 'ExcelSetRange', 'ExcelAppendRows', 'ExcelSheetOp', 'ExcelFormat'])
+
+export async function runExcelTool(cwd: string, name: string, args: any): Promise<string | null> {
+  switch (name) {
+    case 'ExcelInfo': return toolExcelInfo(cwd, args)
+    case 'ExcelRead': return toolExcelRead(cwd, args)
+    case 'ExcelWrite': return toolExcelWrite(cwd, args)
+    case 'ExcelSetRange': return toolExcelSetRange(cwd, args)
+    case 'ExcelAppendRows': return toolExcelAppendRows(cwd, args)
+    case 'ExcelSheetOp': return toolExcelSheetOp(cwd, args)
+    case 'ExcelFormat': return toolExcelFormat(cwd, args)
     default: return null
   }
 }
