@@ -168,6 +168,26 @@ function createSchema(d: Database.Database): void {
       ts        TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_gmem_group ON group_memory(group_id, id);
+
+    CREATE TABLE IF NOT EXISTS git_profiles (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      label      TEXT NOT NULL UNIQUE,
+      user_name  TEXT NOT NULL,
+      user_email TEXT NOT NULL,
+      remote_url TEXT,
+      gh_account TEXT,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS agent_sessions (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      workspace  TEXT NOT NULL,
+      title      TEXT NOT NULL,
+      items      TEXT NOT NULL DEFAULT '[]',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_sessions_ws ON agent_sessions(workspace, updated_at);
   `)
 
   // Migration: add usage.group_id for cost attribution per group. Older DBs
@@ -764,4 +784,153 @@ export function allGroupMemory(groupId: string): GroupMemoryRow[] {
   return getDb()
     .prepare(`SELECT * FROM group_memory WHERE group_id = ? ORDER BY id`)
     .all(groupId) as GroupMemoryRow[]
+}
+
+// ── git profiles (saved identities for quick account switching) ──────
+//
+// A profile bundles the git identity (user.name/user.email), an optional
+// remote URL to point origin at, and an optional `gh` CLI account handle. The
+// IDE agent's SwitchGitAccount tool applies a profile in one step (behind a
+// user confirmation). No credentials/tokens are stored here — auth stays in the
+// system credential helper / gh's own store.
+
+export interface GitProfileRow {
+  id: number
+  label: string
+  user_name: string
+  user_email: string
+  remote_url: string | null
+  gh_account: string | null
+  created_at: string
+}
+
+export interface GitProfileInput {
+  label: string
+  user_name: string
+  user_email: string
+  remote_url?: string | null
+  gh_account?: string | null
+}
+
+export function listGitProfiles(): GitProfileRow[] {
+  return getDb().prepare(`SELECT * FROM git_profiles ORDER BY label`).all() as GitProfileRow[]
+}
+
+export function getGitProfile(label: string): GitProfileRow | null {
+  const r = getDb().prepare(`SELECT * FROM git_profiles WHERE label = ?`).get(label) as
+    | GitProfileRow
+    | undefined
+  return r ?? null
+}
+
+// Insert or update a profile keyed by its (unique) label. Returns the label.
+export function upsertGitProfile(p: GitProfileInput): string {
+  getDb()
+    .prepare(
+      `INSERT INTO git_profiles (label, user_name, user_email, remote_url, gh_account, created_at)
+       VALUES (@label, @user_name, @user_email, @remote_url, @gh_account, @created_at)
+       ON CONFLICT(label) DO UPDATE SET
+         user_name  = excluded.user_name,
+         user_email = excluded.user_email,
+         remote_url = excluded.remote_url,
+         gh_account = excluded.gh_account`
+    )
+    .run({
+      label: p.label,
+      user_name: p.user_name,
+      user_email: p.user_email,
+      remote_url: p.remote_url ?? null,
+      gh_account: p.gh_account ?? null,
+      created_at: nowStampLocal(),
+    })
+  return p.label
+}
+
+export function deleteGitProfile(label: string): void {
+  getDb().prepare(`DELETE FROM git_profiles WHERE label = ?`).run(label)
+}
+
+// ── agent chat sessions (persistent memory across app restarts) ─────
+//
+// One row per saved conversation, scoped to a workspace path. `items` is the
+// JSON-serialized ChatPanel transcript (text + tool activity) so a session can
+// be restored verbatim. The IDE agent's cross-turn memory therefore survives
+// closing and reopening the app.
+
+export interface AgentSessionRow {
+  id: number
+  workspace: string
+  title: string
+  items: string   // JSON array (opaque to the DB layer)
+  created_at: string
+  updated_at: string
+}
+
+export interface AgentSessionMeta {
+  id: number
+  workspace: string
+  title: string
+  updated_at: string
+}
+
+// Session list for a workspace (newest first), WITHOUT the heavy items blob.
+export function listAgentSessions(workspace: string): AgentSessionMeta[] {
+  return getDb()
+    .prepare(
+      `SELECT id, workspace, title, updated_at FROM agent_sessions
+       WHERE workspace = ? ORDER BY updated_at DESC, id DESC`
+    )
+    .all(workspace) as AgentSessionMeta[]
+}
+
+export function getAgentSession(id: number): AgentSessionRow | null {
+  const r = getDb().prepare(`SELECT * FROM agent_sessions WHERE id = ?`).get(id) as
+    | AgentSessionRow
+    | undefined
+  return r ?? null
+}
+
+// Most recently updated session for a workspace (what to auto-open).
+export function latestAgentSession(workspace: string): AgentSessionRow | null {
+  const r = getDb()
+    .prepare(
+      `SELECT * FROM agent_sessions WHERE workspace = ? ORDER BY updated_at DESC, id DESC LIMIT 1`
+    )
+    .get(workspace) as AgentSessionRow | undefined
+  return r ?? null
+}
+
+export function createAgentSession(workspace: string, title: string, items = '[]'): number {
+  const ts = nowStampLocal()
+  const info = getDb()
+    .prepare(
+      `INSERT INTO agent_sessions (workspace, title, items, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?)`
+    )
+    .run(workspace, title, items, ts, ts)
+  return Number(info.lastInsertRowid)
+}
+
+// Persist the transcript (and optionally a refreshed title) for a session.
+export function updateAgentSession(id: number, items: string, title?: string): void {
+  const ts = nowStampLocal()
+  if (title !== undefined) {
+    getDb()
+      .prepare(`UPDATE agent_sessions SET items = ?, title = ?, updated_at = ? WHERE id = ?`)
+      .run(items, title, ts, id)
+  } else {
+    getDb()
+      .prepare(`UPDATE agent_sessions SET items = ?, updated_at = ? WHERE id = ?`)
+      .run(items, ts, id)
+  }
+}
+
+export function renameAgentSession(id: number, title: string): void {
+  getDb()
+    .prepare(`UPDATE agent_sessions SET title = ?, updated_at = ? WHERE id = ?`)
+    .run(title, nowStampLocal(), id)
+}
+
+export function deleteAgentSession(id: number): void {
+  getDb().prepare(`DELETE FROM agent_sessions WHERE id = ?`).run(id)
 }

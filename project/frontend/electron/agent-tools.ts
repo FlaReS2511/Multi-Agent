@@ -11,9 +11,11 @@
 
 import fs from 'node:fs'
 import path from 'node:path'
-import { execSync } from 'node:child_process'
+import { execSync, execFileSync } from 'node:child_process'
 
 const BASH_TIMEOUT_MS = 120_000
+const DIAG_TIMEOUT_MS = 180_000
+const DOWNLOAD_MAX_BYTES = 26_214_400 // 25 MB cap for DownloadFile
 
 // Resolve a user-supplied path against the workspace root and ensure it does
 // not escape. Throws on traversal so a tool call can't touch files outside.
@@ -270,6 +272,188 @@ function globToRegex(glob: string): RegExp {
   return new RegExp(`^${re}$`)
 }
 
+// ── additional filesystem tools ─────────────────────────────────
+
+// List a directory's entries (one per line, dirs suffixed with '/'). Unlike
+// Glob (which recurses + matches), this is a shallow `ls` of one folder.
+export function toolListDir(cwd: string, a: { path?: string }): string {
+  const rel = a.path || '.'
+  const abs = resolveInside(cwd, rel)
+  let entries: fs.Dirent[]
+  try {
+    entries = fs.readdirSync(abs, { withFileTypes: true })
+  } catch (e: any) {
+    return `error: cannot list ${rel}: ${e?.message || e}`
+  }
+  if (entries.length === 0) return '(empty)'
+  return entries
+    .sort((x, y) => {
+      // dirs first, then files, each alphabetical
+      if (x.isDirectory() !== y.isDirectory()) return x.isDirectory() ? -1 : 1
+      return x.name.localeCompare(y.name)
+    })
+    .map((e) => (e.isDirectory() ? `${e.name}/` : e.name))
+    .join('\n')
+}
+
+// Move or rename a file/dir. Both endpoints must stay inside the workspace.
+export function toolMove(cwd: string, a: { from: string; to: string }): string {
+  const from = resolveInside(cwd, a.from)
+  const to = resolveInside(cwd, a.to)
+  try {
+    fs.mkdirSync(path.dirname(to), { recursive: true })
+    fs.renameSync(from, to)
+    return `moved ${a.from} -> ${a.to}`
+  } catch (e: any) {
+    return `error: cannot move ${a.from}: ${e?.message || e}`
+  }
+}
+
+// Delete a file or directory (recursive). Guarded to stay inside the workspace
+// and to never delete the workspace root itself.
+export function toolDelete(cwd: string, a: { path: string; recursive?: boolean }): string {
+  const abs = resolveInside(cwd, a.path)
+  if (abs === path.resolve(cwd)) return 'error: refusing to delete the workspace root'
+  try {
+    const st = fs.statSync(abs)
+    if (st.isDirectory()) {
+      if (!a.recursive) {
+        const kids = fs.readdirSync(abs)
+        if (kids.length > 0) return `error: ${a.path} is a non-empty directory; pass recursive=true to delete it`
+      }
+      fs.rmSync(abs, { recursive: true, force: true })
+      return `deleted directory ${a.path}`
+    }
+    fs.rmSync(abs, { force: true })
+    return `deleted ${a.path}`
+  } catch (e: any) {
+    if (e?.code === 'ENOENT') return `error: ${a.path} does not exist`
+    return `error: cannot delete ${a.path}: ${e?.message || e}`
+  }
+}
+
+// Apply several sequential string replacements to one file atomically. Each
+// edit is applied in order to the running content; the file is only written if
+// every edit resolves. Returns an error (no write) on the first failure.
+export function toolMultiEdit(
+  cwd: string,
+  a: { path: string; edits: { old_string: string; new_string: string; replace_all?: boolean }[] },
+): string {
+  const p = resolveInside(cwd, a.path)
+  if (!Array.isArray(a.edits) || a.edits.length === 0) return 'error: edits must be a non-empty array'
+  let text: string
+  try {
+    text = fs.readFileSync(p, 'utf-8')
+  } catch (e: any) {
+    return `error: cannot read ${a.path}: ${e?.message || e}`
+  }
+  let applied = 0
+  for (let i = 0; i < a.edits.length; i++) {
+    const ed = a.edits[i]
+    if (!text.includes(ed.old_string)) return `error: edit #${i + 1}: old_string not found in ${a.path}`
+    const occurrences = text.split(ed.old_string).length - 1
+    if (!ed.replace_all && occurrences > 1) {
+      return `error: edit #${i + 1}: old_string occurs ${occurrences} times; add more context or set replace_all=true`
+    }
+    text = ed.replace_all
+      ? text.split(ed.old_string).join(ed.new_string)
+      : text.replace(ed.old_string, ed.new_string)
+    applied += ed.replace_all ? occurrences : 1
+  }
+  fs.writeFileSync(p, text, 'utf-8')
+  return `applied ${a.edits.length} edit(s) to ${a.path} (${applied} replacement(s))`
+}
+
+// ── GetDiagnostics ───────────────────────────────────────────────
+// Run the project's typechecker / linter / tests and return the output so the
+// agent can close the loop after edits. Safer than raw Bash: a fixed command
+// set, auto-detected from the workspace. Not a mutator.
+function runDiag(cwd: string, cmd: string, args: string[]): string {
+  try {
+    const out = execSync([cmd, ...args].join(' '), {
+      cwd, timeout: DIAG_TIMEOUT_MS, encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      shell: process.platform === 'win32' ? 'powershell.exe' : '/bin/sh',
+      maxBuffer: 10 * 1024 * 1024,
+    })
+    const text = String(out).trim()
+    return text ? `clean (exit 0)\n${text.slice(-4000)}` : 'clean (exit 0) — no diagnostics'
+  } catch (e: any) {
+    if (e?.killed && e?.signal === 'SIGTERM') return `error: ${cmd} timed out after ${DIAG_TIMEOUT_MS / 1000}s`
+    const out = `${e?.stdout ?? ''}${e?.stderr ?? ''}`.trim()
+    return `exit ${e?.status ?? 1}\n${out.slice(-4000) || '(no output)'}`
+  }
+}
+
+export function toolGetDiagnostics(cwd: string, a: { tool?: string; path?: string }): string {
+  const has = (rel: string) => fs.existsSync(path.join(cwd, rel))
+  let tool = a.tool || 'auto'
+  if (tool === 'auto') {
+    if (has('tsconfig.json')) tool = 'tsc'
+    else if (has('.eslintrc') || has('.eslintrc.json') || has('.eslintrc.cjs') || has('eslint.config.js') || has('eslint.config.mjs')) tool = 'eslint'
+    else if (has('pyproject.toml') || has('pytest.ini') || has('setup.cfg')) tool = 'pytest'
+    else return 'error: could not auto-detect a diagnostics tool (no tsconfig/eslint/pytest). Pass tool="tsc"|"eslint"|"pytest".'
+  }
+  const target = a.path ? resolveInside(cwd, a.path) && a.path : ''
+  switch (tool) {
+    case 'tsc': return runDiag(cwd, 'npx', ['--no-install', 'tsc', '--noEmit'])
+    case 'eslint': return runDiag(cwd, 'npx', ['--no-install', 'eslint', target || '.'])
+    case 'pytest': return runDiag(cwd, 'python', ['-m', 'pytest', '-q', ...(target ? [target] : [])])
+    default: return `error: unknown diagnostics tool "${tool}" (use tsc|eslint|pytest)`
+  }
+}
+
+// ── NotebookEdit ─────────────────────────────────────────────────
+// Edit a Jupyter .ipynb cell (replace / insert / delete). Mutator.
+export function toolNotebookEdit(
+  cwd: string,
+  a: { path: string; cell_index?: number; new_source?: string; cell_type?: string; edit_mode?: string },
+): string {
+  const p = resolveInside(cwd, a.path)
+  let nb: any
+  try { nb = JSON.parse(fs.readFileSync(p, 'utf-8')) } catch (e) { return `error: cannot read notebook ${a.path}: ${(e as Error).message}` }
+  if (!Array.isArray(nb.cells)) return `error: ${a.path} is not a valid notebook (no cells array)`
+  const mode = a.edit_mode || 'replace'
+  const idx = a.cell_index ?? (mode === 'insert' ? nb.cells.length : 0)
+  const toSource = (s: string) => s.split('\n').map((l, i, arr) => (i < arr.length - 1 ? l + '\n' : l))
+
+  if (mode === 'delete') {
+    if (idx < 0 || idx >= nb.cells.length) return `error: cell_index ${idx} out of range (0..${nb.cells.length - 1})`
+    nb.cells.splice(idx, 1)
+  } else if (mode === 'insert') {
+    const cell: any = { cell_type: a.cell_type || 'code', metadata: {}, source: toSource(a.new_source ?? '') }
+    if (cell.cell_type === 'code') { cell.outputs = []; cell.execution_count = null }
+    nb.cells.splice(Math.min(idx, nb.cells.length), 0, cell)
+  } else { // replace
+    if (idx < 0 || idx >= nb.cells.length) return `error: cell_index ${idx} out of range (0..${nb.cells.length - 1})`
+    nb.cells[idx].source = toSource(a.new_source ?? '')
+    if (a.cell_type) nb.cells[idx].cell_type = a.cell_type
+    if (nb.cells[idx].cell_type === 'code' && nb.cells[idx].outputs == null) nb.cells[idx].outputs = []
+  }
+  fs.writeFileSync(p, JSON.stringify(nb, null, 1) + '\n', 'utf-8')
+  return `${mode} cell ${idx} in ${a.path}`
+}
+
+// ── DownloadFile ─────────────────────────────────────────────────
+// Fetch a URL into the workspace via curl (execFileSync avoids shell injection
+// from a model-supplied URL). Creates a file. Mutator.
+export function toolDownloadFile(cwd: string, a: { url: string; path: string }): string {
+  if (!/^https?:\/\//i.test(a.url)) return 'error: url must be http(s)'
+  const dest = resolveInside(cwd, a.path)
+  fs.mkdirSync(path.dirname(dest), { recursive: true })
+  try {
+    execFileSync('curl', ['-fsSL', '--max-filesize', String(DOWNLOAD_MAX_BYTES), '-o', dest, a.url], {
+      timeout: BASH_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 10 * 1024 * 1024,
+    })
+  } catch (e: any) {
+    const out = `${e?.stderr ?? ''}${e?.stdout ?? ''}`.trim()
+    return `error: download failed (${e?.status ?? '?'}): ${out.slice(-300) || a.url}`
+  }
+  let size = 0
+  try { size = fs.statSync(dest).size } catch { /* ignore */ }
+  return `downloaded ${size} bytes to ${a.path}`
+}
+
 export interface ToolSpec {
   name: string
   description: string
@@ -334,6 +518,89 @@ export const FILE_TOOL_SPECS: ToolSpec[] = [
       required: ['pattern'],
     },
   },
+  {
+    name: 'ListDir',
+    description: 'List the entries of a single directory (shallow, like `ls`). Directories are suffixed with "/". Use to explore folder structure. path defaults to the workspace root.',
+    input_schema: {
+      type: 'object',
+      properties: { path: { type: 'string' } },
+      required: [],
+    },
+  },
+  {
+    name: 'Move',
+    description: 'Move or rename a file or directory within the workspace. Creates parent directories of the destination as needed.',
+    input_schema: {
+      type: 'object',
+      properties: { from: { type: 'string' }, to: { type: 'string' } },
+      required: ['from', 'to'],
+    },
+  },
+  {
+    name: 'Delete',
+    description: 'Delete a file or directory in the workspace. For a non-empty directory, pass recursive=true. Cannot delete the workspace root.',
+    input_schema: {
+      type: 'object',
+      properties: { path: { type: 'string' }, recursive: { type: 'boolean' } },
+      required: ['path'],
+    },
+  },
+  {
+    name: 'MultiEdit',
+    description: 'Apply several string replacements to ONE file in order, atomically. Each edit has old_string/new_string and optional replace_all. If any edit fails to match, nothing is written. Prefer this over multiple Edit calls on the same file.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string' },
+        edits: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              old_string: { type: 'string' },
+              new_string: { type: 'string' },
+              replace_all: { type: 'boolean' },
+            },
+            required: ['old_string', 'new_string'],
+          },
+        },
+      },
+      required: ['path', 'edits'],
+    },
+  },
+  {
+    name: 'GetDiagnostics',
+    description: 'Run the project typechecker/linter/tests and return errors — use after editing to verify your change compiles. tool: "auto" (default, detects tsc/eslint/pytest), "tsc", "eslint", or "pytest". Optional path scopes eslint/pytest.',
+    input_schema: {
+      type: 'object',
+      properties: { tool: { type: 'string', enum: ['auto', 'tsc', 'eslint', 'pytest'] }, path: { type: 'string' } },
+      required: [],
+    },
+  },
+  {
+    name: 'NotebookEdit',
+    description: 'Edit a Jupyter .ipynb cell. edit_mode: "replace" (default, needs cell_index), "insert" (at cell_index, or appends), or "delete" (cell_index). new_source is the full cell text. cell_type "code"|"markdown" for inserts.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string' },
+        cell_index: { type: 'integer' },
+        new_source: { type: 'string' },
+        cell_type: { type: 'string', enum: ['code', 'markdown'] },
+        edit_mode: { type: 'string', enum: ['replace', 'insert', 'delete'] },
+      },
+      required: ['path'],
+    },
+  },
+  {
+    name: 'DownloadFile',
+    description: 'Download an http(s) URL into a file in the workspace (max 25MB). Use for fetching assets/fixtures. For reading web page text, use WebFetch instead.',
+    input_schema: {
+      type: 'object',
+      properties: { url: { type: 'string' }, path: { type: 'string' } },
+      required: ['url', 'path'],
+    },
+  },
 ]
 
 // Dispatch a file/shell tool by name. Returns the tool result string, or null
@@ -346,6 +613,13 @@ export function runFileTool(cwd: string, name: string, args: any): string | null
     case 'Bash': return toolBash(cwd, args)
     case 'Grep': return toolGrep(cwd, args)
     case 'Glob': return toolGlob(cwd, args)
+    case 'ListDir': return toolListDir(cwd, args)
+    case 'Move': return toolMove(cwd, args)
+    case 'Delete': return toolDelete(cwd, args)
+    case 'MultiEdit': return toolMultiEdit(cwd, args)
+    case 'GetDiagnostics': return toolGetDiagnostics(cwd, args)
+    case 'NotebookEdit': return toolNotebookEdit(cwd, args)
+    case 'DownloadFile': return toolDownloadFile(cwd, args)
     default: return null
   }
 }

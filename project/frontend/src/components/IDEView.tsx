@@ -449,6 +449,16 @@ export function IDEView() {
           try {
             editorRef.current.revealLineInCenter(line)
             editorRef.current.setPosition({ lineNumber: line, column: 1 })
+            editorRef.current.focus()
+            // Flash the target line so the jump is obvious.
+            const mon = monacoRef.current
+            if (mon) {
+              const col = editorRef.current.createDecorationsCollection([{
+                range: new mon.Range(line, 1, line, 1),
+                options: { isWholeLine: true, className: 'agent-reveal-line' },
+              }])
+              setTimeout(() => { try { col.clear() } catch { /* ignore */ } }, 1800)
+            }
           } catch { /* ignore */ }
         }
         return { ok: true, result: `opened ${rel}${line ? ` at line ${line}` : ''}` }

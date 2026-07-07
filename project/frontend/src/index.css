@@ -39,6 +39,17 @@ html, body, #root {
   100% { background: rgba(16, 185, 129, 0); }
 }
 
+/* Agent navigation (OpenFile with a line): flash the target line so the jump
+   is obvious. Blue to distinguish from the green "applied edit" flash. */
+.agent-reveal-line {
+  background: rgba(59, 130, 246, 0.22);
+  animation: agent-reveal-fade 1.8s ease forwards;
+}
+@keyframes agent-reveal-fade {
+  0% { background: rgba(59, 130, 246, 0.38); }
+  100% { background: rgba(59, 130, 246, 0); }
+}
+
 /* Streaming text: each freshly revealed chunk fades from dark → bright,
    giving the typewriter a smooth "glow-in" feel instead of a hard pop. */
 .stream-chunk {

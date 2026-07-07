@@ -11,8 +11,19 @@ import {
   Sparkles, Send, Square, Trash2, FileCode,
   FileText, FilePen, FilePlus2, Search, FolderSearch, Wrench, CheckCircle2, XCircle, ShieldCheck,
   TerminalSquare, ListPlus, Boxes, Undo2, AlertTriangle,
+  GitBranch, GitCommitHorizontal, GitPullRequestArrow, UserCog, Globe, ListChecks, FolderTree, Trash, FileInput,
+  History, Plus, Archive,
 } from 'lucide-react'
-import { ModelOption, IdeAgentEvent, PendingChange } from '../lib/api'
+import { ModelOption, IdeAgentEvent, PendingChange, PendingAction, AgentTodo, AgentSessionMeta } from '../lib/api'
+
+// Slash commands available in agent mode. Typing "/" pops up a filtered menu.
+const AGENT_SLASH_COMMANDS: { name: string; desc: string }[] = [
+  { name: '/plan', desc: 'Toggle plan mode (investigate read-only, then approve a plan)' },
+  { name: '/compact', desc: 'Summarize the conversation to save context' },
+  { name: '/new', desc: 'Start a fresh session (clear history)' },
+  { name: '/review', desc: 'Toggle review mode (approve each change)' },
+  { name: '/stop', desc: 'Stop the current run' },
+]
 
 export interface ChatContext {
   path: string
@@ -51,6 +62,74 @@ function itemText(it: AgentItem): string {
   return ''
 }
 
+// Per-tool result budget when folding tool activity into cross-turn history.
+const TOOL_RESULT_BUDGET = 800
+
+// One-line summary of a tool call's target (path/pattern/command/…).
+function toolTarget(t: ToolEntry): string {
+  const a = t.args as Record<string, unknown>
+  const first = a.path || a.pattern || a.command || a.url || a.query || a.branch
+    || a.profile || a.from || a.title || a.task_id || a.account || a.job_id || ''
+  return typeof first === 'string' ? first : ''
+}
+
+// Build the conversation history for a NEW turn, preserving what the agent
+// learned in earlier turns. Text items map to their role message; tool activity
+// is folded (compactly) into the assistant side so knowledge gathered by
+// Read/Grep/Glob/etc. survives across turns instead of being discarded. Without
+// this the agent "forgets" a folder it just scanned and re-scans on every turn.
+function buildHistory(items: AgentItem[]): Msg[] {
+  const out: Msg[] = []
+  // Append a line, coalescing into the previous message if it shares the role.
+  // Keeps roles strictly alternating (required by Anthropic and friends).
+  const push = (role: 'user' | 'assistant', line: string) => {
+    const last = out[out.length - 1]
+    if (last && last.role === role) last.content += (last.content ? '\n' : '') + line
+    else out.push({ role, content: line })
+  }
+  const pushAssistant = (line: string) => push('assistant', line)
+  for (const it of items) {
+    if (it.kind === 'text') {
+      const content = itemText(it)
+      if (it.role === 'user') push('user', content)
+      else if (content.trim()) pushAssistant(content)
+    } else if (it.kind === 'tool') {
+      const target = toolTarget(it)
+      const head = `[used ${it.name}${target ? ` ${target}` : ''}]`
+      let body = ''
+      if (it.result) {
+        const r = it.result.length > TOOL_RESULT_BUDGET
+          ? it.result.slice(0, TOOL_RESULT_BUDGET) + ' …(truncated)'
+          : it.result
+        body = it.isError ? `\n→ error: ${r}` : `\n→ ${r}`
+      }
+      pushAssistant(head + body)
+    }
+  }
+  return out
+}
+
+// Flatten streamed `chunks` into stored `content` so a persisted transcript
+// restores identically without the typewriter machinery. Drops the `running`
+// flag from tool entries (a restored tool is always finished).
+function serializeItems(items: AgentItem[]): AgentItem[] {
+  return items.map((it) => {
+    if (it.kind === 'text') return { kind: 'text', role: it.role, content: itemText(it) }
+    if (it.kind === 'reasoning') return { kind: 'reasoning', id: it.id, content: itemText(it) }
+    return { ...it, running: false }
+  })
+}
+
+// A short title derived from the first user message of a conversation.
+function deriveTitle(items: AgentItem[]): string {
+  const firstUser = items.find((it) => it.kind === 'text' && it.role === 'user') as
+    | Extract<AgentItem, { kind: 'text' }>
+    | undefined
+  const t = (firstUser ? itemText(firstUser) : '').trim().replace(/\s+/g, ' ')
+  if (!t) return 'New session'
+  return t.length > 48 ? t.slice(0, 48) + '…' : t
+}
+
 interface Props {
   models: ModelOption[]
   // Provides the file context on demand (called at send time so it's fresh).
@@ -85,6 +164,11 @@ const itemVariants = {
 
 export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, onChangeResolved, onEditorRequest, windup = true }: Props) {
   const [mode, setMode] = useState<'ask' | 'agent'>('ask')
+  // Plan mode is a toggle WITHIN agent mode (via /plan): runs read-only and
+  // presents a plan to approve instead of editing directly.
+  const [planMode, setPlanMode] = useState(false)
+  // A plan produced in plan mode, awaiting the user's "Approve & Run".
+  const [planApproval, setPlanApproval] = useState<string | null>(null)
   const [reviewMode, setReviewMode] = useState(false)
   // Files the current agent run has written (for the "Undo run" affordance).
   const runFilesRef = useRef<Set<string>>(new Set())
@@ -94,10 +178,24 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
   const [dirtyWarn, setDirtyWarn] = useState<{ count: number } | null>(null)
   // Context fill of the latest agent turn (prompt tokens vs the model window).
   const [ctxUsage, setCtxUsage] = useState<{ used: number; window: number } | null>(null)
+  // A sensitive git/login/background action awaiting the user's approval.
+  const [pendingAction, setPendingAction] = useState<PendingAction | null>(null)
+  // The agent's current run checklist (from TodoWrite).
+  const [todos, setTodos] = useState<AgentTodo[]>([])
   const [messages, setMessages] = useState<Msg[]>([])
   const [agentItems, setAgentItems] = useState<AgentItem[]>([])
   const [input, setInput] = useState('')
   const [streaming, setStreaming] = useState(false)
+  // Slash-command popup (agent mode): highlighted index + Esc-dismissed flag.
+  const [slashIndex, setSlashIndex] = useState(0)
+  const [slashDismissed, setSlashDismissed] = useState(false)
+  // Persistent session: id of the loaded conversation + the picker list.
+  const [sessionId, setSessionId] = useState<number | null>(null)
+  const [sessions, setSessions] = useState<AgentSessionMeta[]>([])
+  const [showSessions, setShowSessions] = useState(false)
+  const sessionIdRef = useRef<number | null>(null)
+  // Latest agent transcript, mirrored to a ref so async persistence sees it.
+  const agentItemsRef = useRef<AgentItem[]>([])
   const [useFileContext, setUseFileContext] = useState(true)
   const [provider, setProvider] = useState('')
   const [model, setModel] = useState('')
@@ -126,6 +224,134 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
   useEffect(() => {
     window.api.ideAgentConfigGet().then((c) => setReviewMode(c.reviewMode)).catch(() => {})
   }, [])
+
+  // Keep refs in sync so async persistence reads the latest values.
+  useEffect(() => { agentItemsRef.current = agentItems }, [agentItems])
+  useEffect(() => { sessionIdRef.current = sessionId }, [sessionId])
+
+  // Restore the most recent session for this workspace on mount, so the agent
+  // remembers earlier conversations across app restarts.
+  useEffect(() => {
+    let cancelled = false
+    window.api.agentSessionLatest().then((s) => {
+      if (cancelled || !s) return
+      try {
+        const items = JSON.parse(s.items) as AgentItem[]
+        if (Array.isArray(items) && items.length > 0) {
+          setAgentItems(items)
+          agentItemsRef.current = items
+        }
+        setSessionId(s.id)
+        sessionIdRef.current = s.id
+      } catch { /* ignore malformed */ }
+    }).catch(() => {})
+    return () => { cancelled = true }
+  }, [])
+
+  // Refresh the session list (for the picker dropdown).
+  const refreshSessions = () => {
+    window.api.agentSessionList().then(setSessions).catch(() => {})
+  }
+  useEffect(() => { if (showSessions) refreshSessions() }, [showSessions])
+
+  // Persist the current transcript. Creates a session row on first save, then
+  // updates it in place. Titles are derived from the opening user message.
+  const persistSession = async (items: AgentItem[]) => {
+    const serialized = JSON.stringify(serializeItems(items))
+    const title = deriveTitle(items)
+    try {
+      if (sessionIdRef.current == null) {
+        const res = await window.api.agentSessionCreate(title, serialized)
+        if (res.ok && res.id != null) { setSessionId(res.id); sessionIdRef.current = res.id }
+      } else {
+        await window.api.agentSessionUpdate(sessionIdRef.current, serialized, title)
+      }
+    } catch { /* best-effort persistence */ }
+  }
+
+  // Start a brand-new empty session (keeps the old one saved on disk).
+  const newSession = () => {
+    if (streaming) stop()
+    setAgentItems([])
+    agentItemsRef.current = []
+    setSessionId(null)
+    sessionIdRef.current = null
+    setTodos([])
+    setShowSessions(false)
+  }
+
+  // Load a saved session into the panel.
+  const loadSession = async (id: number) => {
+    if (streaming) stop()
+    try {
+      const s = await window.api.agentSessionGet(id)
+      if (!s) return
+      const items = JSON.parse(s.items) as AgentItem[]
+      setAgentItems(Array.isArray(items) ? items : [])
+      agentItemsRef.current = Array.isArray(items) ? items : []
+      setSessionId(s.id)
+      sessionIdRef.current = s.id
+      setMode('agent')
+    } catch { /* ignore */ }
+    setShowSessions(false)
+  }
+
+  const deleteSession = async (id: number) => {
+    try { await window.api.agentSessionDelete(id) } catch { /* ignore */ }
+    if (sessionIdRef.current === id) newSession()
+    refreshSessions()
+  }
+
+  // /compact — summarize the whole conversation (including tool activity) into
+  // one compact note that replaces the transcript. Keeps the agent's memory of
+  // what happened while shrinking the context it must carry forward.
+  const [compacting, setCompacting] = useState(false)
+  const compact = async () => {
+    if (streaming || compacting) return
+    const items = agentItemsRef.current
+    const hasContent = items.some((it) => it.kind === 'text' || it.kind === 'tool')
+    if (!hasContent) return
+    setCompacting(true)
+    // Render the transcript as text for the summarizer.
+    const transcript = buildHistory(items)
+      .map((m) => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`)
+      .join('\n\n')
+    const instruction =
+      'Summarize the following coding-assistant conversation into a compact but complete memory. ' +
+      'Preserve: the user\'s goals and decisions, key facts learned about the codebase (files, ' +
+      'structure, APIs), changes already made, and any open TODOs or next steps. Omit chit-chat. ' +
+      'Write it as concise notes the assistant can rely on to continue seamlessly.\n\n' +
+      '=== CONVERSATION ===\n' + transcript
+    const requestId = `compact-${Date.now()}`
+    let summary = ''
+    await new Promise<void>((resolve) => {
+      const offChunk = window.api.onAiChatChunk(requestId, (d) => { summary += d })
+      const offDone = window.api.onAiChatDone(requestId, (info) => {
+        offChunk(); offDone()
+        if (!info.ok) summary = ''
+        else if (info.text) summary = info.text
+        resolve()
+      })
+      window.api.aiChat(requestId, {
+        provider,
+        model: model || undefined,
+        messages: [{ role: 'user', content: instruction }],
+      })
+    })
+    setCompacting(false)
+    if (!summary.trim()) {
+      setAgentItems((prev) => [...prev, { kind: 'text', role: 'assistant', content: '⚠ Compact failed — conversation unchanged.' }])
+      return
+    }
+    const compacted: AgentItem[] = [
+      { kind: 'text', role: 'user', content: '/compact — summarize the conversation so far' },
+      { kind: 'text', role: 'assistant', content: `📝 Summary of earlier conversation:\n\n${summary.trim()}` },
+    ]
+    setAgentItems(compacted)
+    agentItemsRef.current = compacted
+    setTodos([])
+    void persistSession(compacted)
+  }
 
   const toggleReview = () => {
     const next = !reviewMode
@@ -262,15 +488,15 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
   useEffect(() => () => { if (rafRef.current != null) cancelAnimationFrame(rafRef.current) }, [])
 
   // Agent mode: run the tool-calling loop, rendering tool activity inline.
-  const sendAgent = () => {
-    const text = input.trim()
+  const sendAgent = (opts?: { text?: string; planMode?: boolean }) => {
+    const text = (opts?.text ?? input).trim()
     if (!text || streaming) return
+    const usePlan = opts?.planMode ?? planMode
 
     const ctx = useFileContext ? getContext() : null
-    const priorText: Msg[] = agentItems
-      .filter((it): it is Extract<AgentItem, { kind: 'text' }> => it.kind === 'text')
-      .map((it) => ({ role: it.role, content: itemText(it) }))
-    const history: Msg[] = [...priorText, { role: 'user', content: text }]
+    // Preserve tool activity from earlier turns so the agent remembers what it
+    // already read/searched instead of re-scanning the folder every turn.
+    const history: Msg[] = [...buildHistory(agentItems), { role: 'user', content: text }]
 
     setAgentItems((prev) => [...prev, { kind: 'text', role: 'user', content: text }])
     setInput('')
@@ -283,6 +509,8 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
     runFilesRef.current = new Set()
     setLastRunFiles([])
     setCtxUsage(null)
+    setPendingAction(null)
+    setTodos([])
 
     // Editor round-trip: main asks us to drive the editor; delegate to IDEView.
     const offEditor = window.api.onAiAgentEditorReq(runId, async (req) => {
@@ -315,6 +543,9 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
       }
       if (e.type === 'pending_change') { onPendingChange?.(e.change); return }
       if (e.type === 'change_resolved') { onChangeResolved?.(e.changeId); return }
+      if (e.type === 'pending_action') { setPendingAction(e.action); return }
+      if (e.type === 'action_resolved') { setPendingAction(null); return }
+      if (e.type === 'todos') { setTodos(e.todos); return }
       if (e.type === 'context') { setCtxUsage({ used: e.used, window: e.window }); return }
       setAgentItems((prev) => {
         const copy = [...prev]
@@ -335,11 +566,14 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
         offEditor()
         reqIdRef.current = null
         setStreaming(false)
+        setPendingAction(null)
         // Surface an Undo affordance if the run wrote files (done or blocked).
         if (e.type !== 'error' && runFilesRef.current.size > 0) {
           setLastRunFiles(Array.from(runFilesRef.current))
         }
         if (rafRef.current != null) { cancelAnimationFrame(rafRef.current); rafRef.current = null }
+        // Plan mode: the final message IS the plan — offer "Approve & Run".
+        if (e.type === 'done' && usePlan && e.text?.trim()) setPlanApproval(e.text.trim())
         // Snap every streaming item to its full received text — append the
         // remaining tail as one final glowing chunk, no lingering typewriter.
         setAgentItems((prev) => {
@@ -356,6 +590,9 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
           })
           if (e.type === 'error') copy.push({ kind: 'text', role: 'assistant', content: `⚠ ${e.error}` })
           if (e.type === 'blocked') copy.push({ kind: 'text', role: 'assistant', content: `⛔ Blocked: ${e.reason}` })
+          // Persist the finished transcript so memory survives a restart.
+          agentItemsRef.current = copy
+          void persistSession(copy)
           return copy
         })
       }
@@ -368,12 +605,23 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
       openFile: ctx ? { path: ctx.path, language: ctx.language, content: ctx.content } : undefined,
       selection: ctx?.selection,
       reviewMode,
+      planMode: usePlan,
     })
   }
 
+  // Approve the pending plan → turn plan mode off and execute it.
+  const approvePlan = () => {
+    const plan = planApproval
+    setPlanApproval(null)
+    if (!plan) return
+    setPlanMode(false)
+    sendAgent({ text: `Implement this approved plan, following it step by step:\n\n${plan}`, planMode: false })
+  }
+
   const stop = () => {
+    if (pendingAction) { resolveAction(false) }
     if (reqIdRef.current) {
-      if (mode === 'agent') window.api.aiAgentCancel(reqIdRef.current)
+      if (mode !== 'ask') window.api.aiAgentCancel(reqIdRef.current)
       else window.api.aiChatCancel(reqIdRef.current)
     }
     if (rafRef.current != null) { cancelAnimationFrame(rafRef.current); rafRef.current = null }
@@ -396,12 +644,48 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
     if (streaming) stop()
     setMessages([])
     setAgentItems([])
+    agentItemsRef.current = []
+    // Detach from the saved session so a fresh conversation starts a new one
+    // (the previous session remains on disk, reachable from history).
+    setSessionId(null)
+    sessionIdRef.current = null
+    setTodos([])
+  }
+
+  // ── Slash-command popup (agent mode) ──────────────────────────
+  const slashQuery = mode !== 'ask' && input.startsWith('/') && !input.includes(' ') ? input.toLowerCase() : ''
+  const slashMatches = slashQuery
+    ? AGENT_SLASH_COMMANDS
+        .filter((c) => c.name.startsWith(slashQuery) || c.name.slice(1).includes(slashQuery.slice(1)))
+        .sort((a, b) => Number(b.name.startsWith(slashQuery)) - Number(a.name.startsWith(slashQuery)))
+    : []
+  const slashOpen = slashMatches.length > 0 && !slashDismissed
+  const slashSel = Math.min(slashIndex, Math.max(0, slashMatches.length - 1))
+  // Reset selection/dismissal whenever the query changes.
+  useEffect(() => { setSlashIndex(0); setSlashDismissed(false) }, [slashQuery])
+
+  const runSlash = (name: string) => {
+    setInput('')
+    if (name === '/plan') setPlanMode((v) => !v)
+    else if (name === '/compact') void compact()
+    else if (name === '/new') newSession()
+    else if (name === '/review') toggleReview()
+    else if (name === '/stop') stop()
   }
 
   const submit = async () => {
-    if (mode !== 'agent') { send(); return }
-    // Auto-apply on a dirty tree is risky (no clean git baseline to undo to).
-    // Warn once; review mode is safe (each change is gated) so skip the check.
+    // Slash commands (agent mode). Handles a fully-typed command + Enter even
+    // when the popup was dismissed.
+    const cmd = input.trim().toLowerCase()
+    if (mode === 'agent' && AGENT_SLASH_COMMANDS.some((c) => c.name === cmd)) {
+      runSlash(cmd)
+      return
+    }
+    if (mode === 'ask') { send(); return }
+    // Plan mode: read-only investigation → a plan to approve. No dirty check.
+    if (planMode) { sendAgent({ planMode: true }); return }
+    // Agent: auto-apply on a dirty tree is risky (no clean git baseline to undo
+    // to). Warn once; review mode is safe (each change is gated) so skip.
     if (!reviewMode && input.trim() && !streaming) {
       try {
         const d = await window.api.workspaceGitDirtyCount()
@@ -413,6 +697,13 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
 
   // Proceed with a run the user confirmed despite a dirty tree.
   const confirmDirtyRun = () => { setDirtyWarn(null); sendAgent() }
+
+  // Approve or decline a sensitive git/login/background action.
+  const resolveAction = (approved: boolean) => {
+    if (!pendingAction) return
+    window.api.aiAgentAction(pendingAction.actionId, approved).catch(() => {})
+    setPendingAction(null)
+  }
 
   const ctxPreview = useFileContext ? getContext() : null
 
@@ -451,6 +742,24 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
               </button>
             ))}
           </div>
+          {/* Plan-mode toggle (agent only): /plan or click — read-only, produces a plan */}
+          {mode === 'agent' && (
+            <button
+              onClick={() => { if (!streaming) setPlanMode((v) => !v) }}
+              disabled={streaming}
+              className={`flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold border transition-colors ${
+                planMode
+                  ? 'border-blue-500/40 bg-blue-500/10 text-blue-300'
+                  : 'border-zinc-800 text-zinc-500 hover:text-zinc-300'
+              } ${streaming ? 'cursor-not-allowed opacity-60' : ''}`}
+              title={planMode
+                ? 'Plan mode on: investigate read-only, then approve a plan (/plan to toggle)'
+                : 'Plan mode off: agent edits directly (/plan to toggle)'}
+            >
+              <ListPlus size={11} />
+              Plan
+            </button>
+          )}
           {/* Review-mode toggle (agent only): hold every write for approval. */}
           {mode === 'agent' && (
             <button
@@ -470,14 +779,72 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
             </button>
           )}
         </div>
-        <button
-          onClick={clear}
-          disabled={messages.length === 0 && agentItems.length === 0}
-          title="Clear conversation"
-          className="text-zinc-600 hover:text-zinc-300 disabled:opacity-30 disabled:hover:text-zinc-600"
-        >
-          <Trash2 size={14} />
-        </button>
+        <div className="flex items-center gap-1.5">
+          {mode !== 'ask' && (
+            <>
+              <button
+                onClick={compact}
+                disabled={streaming || compacting || agentItems.length === 0}
+                title="Compact: summarize the conversation to save context (/compact)"
+                className="text-zinc-600 hover:text-zinc-300 disabled:opacity-30 disabled:hover:text-zinc-600"
+              >
+                <Archive size={14} />
+              </button>
+              <button
+                onClick={newSession}
+                disabled={streaming}
+                title="New session"
+                className="text-zinc-600 hover:text-zinc-300 disabled:opacity-30"
+              >
+                <Plus size={15} />
+              </button>
+              <div className="relative">
+                <button
+                  onClick={() => setShowSessions((v) => !v)}
+                  title="Session history"
+                  className={`text-zinc-600 hover:text-zinc-300 ${showSessions ? 'text-zinc-300' : ''}`}
+                >
+                  <History size={14} />
+                </button>
+                {showSessions && (
+                  <div className="absolute right-0 top-6 z-20 w-64 max-h-72 overflow-y-auto scrollbar-thin rounded-lg border border-zinc-800 bg-zinc-900 shadow-xl py-1">
+                    {sessions.length === 0 ? (
+                      <div className="px-3 py-2 text-[11px] text-zinc-600">No saved sessions</div>
+                    ) : (
+                      sessions.map((s) => (
+                        <div
+                          key={s.id}
+                          className={`group flex items-center gap-1.5 px-2.5 py-1.5 hover:bg-zinc-800/60 cursor-pointer ${
+                            s.id === sessionId ? 'bg-zinc-800/40' : ''
+                          }`}
+                          onClick={() => loadSession(s.id)}
+                        >
+                          <span className="flex-1 min-w-0 truncate text-[11px] text-zinc-300">{s.title}</span>
+                          <span className="text-[9px] text-zinc-600 flex-shrink-0">{s.updated_at.slice(5, 16)}</span>
+                          <button
+                            onClick={(e) => { e.stopPropagation(); deleteSession(s.id) }}
+                            title="Delete session"
+                            className="opacity-0 group-hover:opacity-100 text-zinc-600 hover:text-rose-400 flex-shrink-0"
+                          >
+                            <Trash size={11} />
+                          </button>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                )}
+              </div>
+            </>
+          )}
+          <button
+            onClick={clear}
+            disabled={messages.length === 0 && agentItems.length === 0}
+            title="Clear conversation"
+            className="text-zinc-600 hover:text-zinc-300 disabled:opacity-30 disabled:hover:text-zinc-600"
+          >
+            <Trash2 size={14} />
+          </button>
+        </div>
       </motion.div>
 
       {/* Messages */}
@@ -523,16 +890,99 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
                 working…
               </div>
             )}
+            {compacting && (
+              <div className="flex items-center gap-1.5 text-[11px] text-amber-400/80 px-1">
+                <Archive size={11} className="animate-pulse" />
+                compacting conversation…
+              </div>
+            )}
           </>
         )}
       </motion.div>
 
       {/* Thinking dock — reasoning lives here, not in the chat flow */}
-      {mode === 'agent' && latestReasoning && (
+      {mode !== 'ask' && latestReasoning && (
         <ThinkingDock chunks={latestReasoning.chunks ?? []} active={streaming} />
       )}
 
+      {/* Sensitive action confirmation (git mutate / account switch / login) */}
+      {pendingAction && (
+        <div className="flex items-start gap-2 px-3 py-2.5 border-t border-blue-500/30 bg-blue-500/5 flex-shrink-0">
+          <ShieldCheck size={14} className="text-blue-400 mt-0.5 flex-shrink-0" />
+          <div className="flex-1 min-w-0">
+            <div className="text-[11px] font-semibold text-zinc-200">{pendingAction.title}</div>
+            <div className="text-[10px] text-zinc-500 mb-1">Agent wants to run <span className="font-mono text-zinc-400">{pendingAction.tool}</span></div>
+            {pendingAction.detail && (
+              <pre className="text-[10px] font-mono text-zinc-300 bg-zinc-950 border border-zinc-800 rounded px-2 py-1 whitespace-pre-wrap max-h-28 overflow-y-auto scrollbar-thin">
+                {pendingAction.detail}
+              </pre>
+            )}
+            <div className="flex items-center gap-2 mt-1.5">
+              <button
+                onClick={() => resolveAction(true)}
+                className="text-[11px] font-medium px-2 py-0.5 rounded bg-blue-600 hover:bg-blue-500 text-white"
+              >
+                Approve
+              </button>
+              <button
+                onClick={() => resolveAction(false)}
+                className="text-[11px] px-2 py-0.5 rounded border border-zinc-700 text-zinc-400 hover:text-zinc-200"
+              >
+                Decline
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Agent run checklist (TodoWrite) */}
+      {mode !== 'ask' && todos.length > 0 && (
+        <div className="px-3 py-2 border-t border-zinc-800 bg-zinc-900/30 flex-shrink-0 max-h-32 overflow-y-auto scrollbar-thin">
+          <div className="flex items-center gap-1.5 text-[10px] uppercase tracking-wider text-zinc-500 mb-1">
+            <ListChecks size={11} /> Plan
+          </div>
+          <ul className="space-y-0.5">
+            {todos.map((t, i) => (
+              <li key={i} className="flex items-center gap-1.5 text-[11px]">
+                {t.status === 'completed'
+                  ? <CheckCircle2 size={11} className="text-emerald-400 flex-shrink-0" />
+                  : t.status === 'in_progress'
+                    ? <span className="size-1.5 rounded-full bg-blue-400 animate-pulse flex-shrink-0" />
+                    : <span className="size-1.5 rounded-full border border-zinc-600 flex-shrink-0" />}
+                <span className={t.status === 'completed' ? 'text-zinc-500 line-through' : 'text-zinc-300'}>
+                  {t.content}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
       {/* Git-dirty warning before an auto-apply run */}
+      {/* Plan-approval bar: a plan mode run finished — approve to execute it */}
+      {planApproval && !streaming && (
+        <div className="flex items-start gap-2 px-3 py-2 border-t border-blue-500/30 bg-blue-500/5 flex-shrink-0">
+          <ListPlus size={13} className="text-blue-400 mt-0.5 flex-shrink-0" />
+          <div className="flex-1 text-[11px] text-zinc-300 leading-relaxed">
+            Plan ready. Approve to execute it in Agent mode.
+            <div className="flex items-center gap-2 mt-1.5">
+              <button
+                onClick={approvePlan}
+                className="text-[11px] font-medium px-2 py-0.5 rounded bg-blue-600 hover:bg-blue-500 text-white"
+              >
+                Approve &amp; Run
+              </button>
+              <button
+                onClick={() => setPlanApproval(null)}
+                className="text-[11px] px-2 py-0.5 rounded border border-zinc-700 text-zinc-400 hover:text-zinc-200"
+              >
+                Dismiss
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {dirtyWarn && (
         <div className="flex items-start gap-2 px-3 py-2 border-t border-amber-500/30 bg-amber-500/5 flex-shrink-0">
           <AlertTriangle size={13} className="text-amber-400 mt-0.5 flex-shrink-0" />
@@ -601,23 +1051,51 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
             : 'No file open'}
         </button>
 
-        {mode === 'agent' && ctxUsage && <ContextMeter used={ctxUsage.used} window={ctxUsage.window} />}
+        {mode !== 'ask' && ctxUsage && <ContextMeter used={ctxUsage.used} window={ctxUsage.window} />}
 
-        <textarea
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter' && !e.shiftKey) {
-              e.preventDefault()
-              submit()
-            }
-          }}
-          rows={3}
-          placeholder={mode === 'agent'
-            ? 'Describe a change… the agent will edit files (Enter to run)'
-            : 'Ask anything… (Enter to send, Shift+Enter for newline)'}
-          className="w-full px-2 py-1.5 bg-zinc-900 border border-zinc-700 rounded text-xs text-zinc-100 placeholder-zinc-600 resize-none focus:outline-none focus:border-blue-500"
-        />
+        <div className="relative">
+          {slashOpen && (
+            <div className="absolute bottom-full left-0 right-0 mb-1 z-20 bg-zinc-900 border border-zinc-700 rounded-md shadow-xl overflow-hidden">
+              <div className="px-2 py-1 text-[9px] uppercase tracking-wider text-zinc-600 border-b border-zinc-800">Commands</div>
+              {slashMatches.map((c, i) => (
+                <button
+                  key={c.name}
+                  type="button"
+                  onMouseDown={(e) => { e.preventDefault(); runSlash(c.name) }}
+                  onMouseEnter={() => setSlashIndex(i)}
+                  className={`w-full flex items-baseline gap-2 px-2 py-1.5 text-left ${i === slashSel ? 'bg-blue-600/20' : 'hover:bg-zinc-800/60'}`}
+                >
+                  <span className="text-xs font-mono text-blue-300">{c.name}</span>
+                  <span className="text-[10px] text-zinc-500 truncate">{c.desc}</span>
+                </button>
+              ))}
+            </div>
+          )}
+          <textarea
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={(e) => {
+              if (slashOpen) {
+                if (e.key === 'ArrowDown') { e.preventDefault(); setSlashIndex((i) => Math.min(i + 1, slashMatches.length - 1)); return }
+                if (e.key === 'ArrowUp') { e.preventDefault(); setSlashIndex((i) => Math.max(i - 1, 0)); return }
+                if (e.key === 'Escape') { e.preventDefault(); setSlashDismissed(true); return }
+                if (e.key === 'Tab') { e.preventDefault(); setInput(slashMatches[slashSel].name + ' '); return }
+                if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); runSlash(slashMatches[slashSel].name); return }
+              }
+              if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault()
+                submit()
+              }
+            }}
+            rows={3}
+            placeholder={mode === 'agent'
+              ? (planMode
+                  ? 'Describe the task to plan… (read-only, then a plan to approve · /plan to exit)'
+                  : 'Describe a change… (Enter to run · / for commands)')
+              : 'Ask anything… (Enter to send, Shift+Enter for newline)'}
+            className="w-full px-2 py-1.5 bg-zinc-900 border border-zinc-700 rounded text-xs text-zinc-100 placeholder-zinc-600 resize-none focus:outline-none focus:border-blue-500"
+          />
+        </div>
 
         <div className="flex items-center gap-1.5">
           <select
@@ -650,7 +1128,7 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
             <button
               onClick={submit}
               disabled={!input.trim()}
-              title={mode === 'agent' ? 'Run agent' : 'Send'}
+              title={mode === 'agent' ? (planMode ? 'Make a plan' : 'Run agent') : 'Send'}
               className="px-2.5 py-1 rounded bg-blue-600 hover:bg-blue-500 disabled:bg-zinc-800 disabled:text-zinc-600 text-white flex items-center gap-1"
             >
               <Send size={12} />
@@ -855,18 +1333,47 @@ function ToolActivity({ entry }: { entry: ToolEntry }) {
     Read: <FileText size={12} />,
     Write: <FilePlus2 size={12} />,
     Edit: <FilePen size={12} />,
+    MultiEdit: <FilePen size={12} />,
     Grep: <Search size={12} />,
     Glob: <FolderSearch size={12} />,
+    ListDir: <FolderTree size={12} />,
+    Move: <FileInput size={12} />,
+    Delete: <Trash size={12} />,
     Bash: <TerminalSquare size={12} />,
+    BashBackground: <TerminalSquare size={12} />,
+    BashOutput: <TerminalSquare size={12} />,
+    KillBash: <Square size={12} />,
     OpenFile: <FileText size={12} />,
     GetOpenEditor: <FileCode size={12} />,
     ShowDiff: <FilePen size={12} />,
     CreateTask: <ListPlus size={12} />,
     CreateGroup: <Boxes size={12} />,
+    TodoWrite: <ListChecks size={12} />,
+    WebFetch: <Globe size={12} />,
+    WebSearch: <Globe size={12} />,
+    GitStatus: <GitBranch size={12} />,
+    GitDiff: <GitBranch size={12} />,
+    GitLog: <GitCommitHorizontal size={12} />,
+    GitBranch: <GitBranch size={12} />,
+    GitAdd: <GitCommitHorizontal size={12} />,
+    GitCommit: <GitCommitHorizontal size={12} />,
+    GitPush: <GitPullRequestArrow size={12} />,
+    GitPull: <GitPullRequestArrow size={12} />,
+    GitCheckout: <GitBranch size={12} />,
+    GitConfigGet: <UserCog size={12} />,
+    GitConfigSet: <UserCog size={12} />,
+    GitRemoteGet: <GitBranch size={12} />,
+    GitRemoteSet: <GitBranch size={12} />,
+    SwitchGitAccount: <UserCog size={12} />,
+    SaveGitProfile: <UserCog size={12} />,
+    ListGitProfiles: <UserCog size={12} />,
+    GitHubAuthStatus: <UserCog size={12} />,
+    GitHubAuthSwitch: <UserCog size={12} />,
+    GitHubLogin: <UserCog size={12} />,
   }[entry.name] ?? <Wrench size={12} />
 
-  const p = entry.args as { path?: string; pattern?: string; command?: string; title?: string; task_id?: string }
-  const target = p.path || p.pattern || p.command || p.title || p.task_id || ''
+  const p = entry.args as { path?: string; pattern?: string; command?: string; title?: string; task_id?: string; url?: string; query?: string; branch?: string; profile?: string; from?: string; account?: string }
+  const target = p.path || p.pattern || p.command || p.title || p.task_id || p.url || p.query || p.branch || p.profile || p.from || p.account || ''
   const hasResult = Boolean(entry.result) && !entry.running
 
   return (

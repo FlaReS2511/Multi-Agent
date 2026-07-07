@@ -242,6 +242,20 @@ export interface OrchestrationConfig {
   heartbeat_timeout_sec: number
 }
 
+// Discord bot config (stored under `discord` in agents-config.json; the bot
+// token itself lives in encrypted secrets, provider id 'discord').
+export interface DiscordConfig {
+  enabled: boolean
+  allowed_user_ids: string[]
+  allowed_channel_ids: string[]
+  default_worker_role: string
+  guild_id: string
+  max_code_bytes: number
+  agent_provider: string
+  agent_model: string
+  allow_agent_bash: boolean
+}
+
 export const GROUP_STATUS_STYLES: Record<GroupStatus, { label: string; classes: string }> = {
   pending:   { label: 'PENDING',   classes: 'bg-zinc-700/40 text-zinc-300 ring-zinc-600/40' },
   active:    { label: 'ACTIVE',    classes: 'bg-blue-500/15 text-blue-300 ring-blue-500/30' },
@@ -272,6 +286,43 @@ export interface EditorResponse {
   result: string
 }
 
+// A sensitive action (git mutation, account switch, login, background command)
+// the agent wants to run, awaiting the user's approve/decline.
+export interface PendingAction {
+  actionId: string
+  tool: string
+  title: string
+  detail: string
+}
+
+export interface AgentTodo {
+  content: string
+  status: string
+}
+
+export interface GitProfile {
+  id: number
+  label: string
+  user_name: string
+  user_email: string
+  remote_url: string | null
+  gh_account: string | null
+  created_at: string
+}
+
+// A saved agent conversation (persistent memory), scoped to a workspace.
+export interface AgentSessionMeta {
+  id: number
+  workspace: string
+  title: string
+  updated_at: string
+}
+
+export interface AgentSessionRow extends AgentSessionMeta {
+  items: string       // JSON transcript
+  created_at: string
+}
+
 export type IdeAgentEvent =
   | { type: 'reasoning'; delta: string; turn: number }
   | { type: 'token'; delta: string; turn: number }
@@ -279,6 +330,9 @@ export type IdeAgentEvent =
   | { type: 'tool_result'; callId: string; name: string; result: string; isError: boolean }
   | { type: 'pending_change'; change: PendingChange }
   | { type: 'change_resolved'; changeId: string; decision: 'accept' | 'reject' }
+  | { type: 'pending_action'; action: PendingAction }
+  | { type: 'action_resolved'; actionId: string; approved: boolean }
+  | { type: 'todos'; todos: AgentTodo[] }
   | { type: 'file_changed'; path: string }
   | { type: 'context'; used: number; window: number; turn: number }
   | { type: 'blocked'; reason: string; turns: number }
@@ -385,9 +439,21 @@ declare global {
         openFile?: { path: string; language?: string; content: string }
         selection?: string
         reviewMode?: boolean
+        planMode?: boolean
       }): Promise<{ ok: boolean; error?: string }>
       aiAgentCancel(runId: string): Promise<{ ok: boolean }>
       aiAgentReview(changeId: string, decision: 'accept' | 'reject'): Promise<{ ok: boolean }>
+      aiAgentAction(actionId: string, approved: boolean): Promise<{ ok: boolean }>
+      gitProfilesList(): Promise<GitProfile[]>
+      gitProfileSave(input: { label: string; user_name: string; user_email: string; remote_url?: string; gh_account?: string }): Promise<{ ok: boolean; error?: string }>
+      gitProfileDelete(label: string): Promise<{ ok: boolean }>
+      agentSessionList(): Promise<AgentSessionMeta[]>
+      agentSessionLatest(): Promise<AgentSessionRow | null>
+      agentSessionGet(id: number): Promise<AgentSessionRow | null>
+      agentSessionCreate(title: string, items?: string): Promise<{ ok: boolean; id?: number; error?: string }>
+      agentSessionUpdate(id: number, items: string, title?: string): Promise<{ ok: boolean }>
+      agentSessionRename(id: number, title: string): Promise<{ ok: boolean }>
+      agentSessionDelete(id: number): Promise<{ ok: boolean }>
       onAiAgentEvent(runId: string, cb: (e: IdeAgentEvent) => void): () => void
       ideAgentConfigGet(): Promise<{ reviewMode: boolean; allowBash: boolean }>
       ideAgentConfigSet(patch: { reviewMode?: boolean; allowBash?: boolean }): Promise<{ ok: boolean; reviewMode: boolean; allowBash: boolean }>
@@ -400,6 +466,9 @@ declare global {
       orchestrationGet(): Promise<OrchestrationConfig>
       orchestrationSet(patch: Partial<OrchestrationConfig>): Promise<{ ok: boolean; orchestration: OrchestrationConfig }>
       onCoordinatorEvent(cb: (info: { event: string; payload: unknown }) => void): () => void
+      discordConfigGet(): Promise<DiscordConfig>
+      discordConfigSet(patch: Partial<DiscordConfig>): Promise<{ ok: boolean; discord: DiscordConfig }>
+      discordTokenStatus(): Promise<{ hasToken: boolean }>
     }
   }
 }

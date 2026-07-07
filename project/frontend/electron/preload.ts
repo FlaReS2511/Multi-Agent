@@ -186,10 +186,29 @@ const api = {
     openFile?: { path: string; language?: string; content: string }
     selection?: string
     reviewMode?: boolean
+    planMode?: boolean
   }) => ipcRenderer.invoke('ai-agent-run', runId, params),
   aiAgentCancel: (runId: string) => ipcRenderer.invoke('ai-agent-cancel', runId),
   aiAgentReview: (changeId: string, decision: 'accept' | 'reject') =>
     ipcRenderer.invoke('ai-agent-review', changeId, decision),
+  aiAgentAction: (actionId: string, approved: boolean) =>
+    ipcRenderer.invoke('ai-agent-action', actionId, approved),
+
+  // Git account profiles (for the agent's SwitchGitAccount)
+  gitProfilesList: () => ipcRenderer.invoke('git-profiles-list'),
+  gitProfileSave: (input: {
+    label: string; user_name: string; user_email: string; remote_url?: string; gh_account?: string
+  }) => ipcRenderer.invoke('git-profile-save', input),
+  gitProfileDelete: (label: string) => ipcRenderer.invoke('git-profile-delete', label),
+
+  // Agent chat sessions (persistent memory)
+  agentSessionList: () => ipcRenderer.invoke('agent-session-list'),
+  agentSessionLatest: () => ipcRenderer.invoke('agent-session-latest'),
+  agentSessionGet: (id: number) => ipcRenderer.invoke('agent-session-get', id),
+  agentSessionCreate: (title: string, items?: string) => ipcRenderer.invoke('agent-session-create', title, items),
+  agentSessionUpdate: (id: number, items: string, title?: string) => ipcRenderer.invoke('agent-session-update', id, items, title),
+  agentSessionRename: (id: number, title: string) => ipcRenderer.invoke('agent-session-rename', id, title),
+  agentSessionDelete: (id: number) => ipcRenderer.invoke('agent-session-delete', id),
   onAiAgentEvent: (runId: string, cb: (e: unknown) => void) => {
     const channel = `ai-agent-event:${runId}`
     const listener = (_e: unknown, ev: unknown) => cb(ev)
@@ -224,6 +243,11 @@ const api = {
   groupMemory: (groupId: string) => ipcRenderer.invoke('group-memory', groupId),
   orchestrationGet: () => ipcRenderer.invoke('orchestration-get'),
   orchestrationSet: (patch: Record<string, unknown>) => ipcRenderer.invoke('orchestration-set', patch),
+
+  // Discord bot config (token stored via setProviderKey with provider 'discord')
+  discordConfigGet: () => ipcRenderer.invoke('discord-config-get'),
+  discordConfigSet: (patch: Record<string, unknown>) => ipcRenderer.invoke('discord-config-set', patch),
+  discordTokenStatus: () => ipcRenderer.invoke('discord-token-status'),
   onCoordinatorEvent: (cb: (info: { event: string; payload: unknown }) => void) => {
     const listener = (_e: unknown, info: { event: string; payload: unknown }) => cb(info)
     ipcRenderer.on('coordinator-event', listener)

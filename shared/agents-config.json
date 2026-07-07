@@ -123,5 +123,20 @@
       "provider": "vietapi",
       "model": "claude-opus-4.8"
     }
+  },
+  "discord": {
+    "enabled": true,
+    "allowed_user_ids": [
+      "483558731662229504"
+    ],
+    "allowed_channel_ids": [
+      "1446165522956816606"
+    ],
+    "default_worker_role": "backend-engineer",
+    "guild_id": "1446156812008030220",
+    "max_code_bytes": 15000,
+    "agent_provider": "vietapi",
+    "agent_model": "deepseek-v4-flash",
+    "allow_agent_bash": true
   }
 }

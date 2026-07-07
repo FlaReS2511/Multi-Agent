@@ -15,18 +15,35 @@ import {
   FILE_TOOL_SPECS, runFileTool, ToolSpec,
   ChangePreview, previewWrite, previewEdit, applyChange,
 } from './agent-tools'
+import {
+  EXTRA_TOOL_SPECS, EXTRA_TOOL_NAMES, runExtraTool, PendingAction,
+} from './extra-tools'
 import { buildAdapter, ProviderCfgLike } from './adapters'
 import { contextWindowFor } from './context-window'
 import * as db from './db'
 
 const MAX_TURNS = parseInt(process.env.IDE_AGENT_MAX_TURNS || '30', 10)
 
+// File-mutating tools whose success should reload the editor/file-tree.
+const FILE_CHANGED_TOOLS = new Set(['Write', 'Edit', 'MultiEdit', 'Move', 'Delete', 'NotebookEdit', 'DownloadFile'])
+
+// Plan mode: the agent may only investigate (no writes, no side effects) and
+// then present a plan. This is the read-only tool allowlist.
+const PLAN_READONLY_TOOLS = new Set([
+  'Read', 'Grep', 'Glob', 'ListDir', 'GetDiagnostics',
+  'OpenFile', 'GetOpenEditor', 'ShowDiff',
+  'GitStatus', 'GitDiff', 'GitLog', 'GitBranch', 'GitConfigGet', 'GitRemoteGet',
+  'GitHubAuthStatus', 'ListGitProfiles', 'ListPRs', 'ViewPR', 'ListIssues',
+  'WebFetch', 'WebSearch', 'RecallNotes', 'TodoWrite', 'BashOutput',
+  'ReportBlocked',
+])
+
 // Editor round-trip tools (GĐ2). These don't touch fs — main asks the renderer
 // to drive the Monaco editor the user is looking at, then returns the result.
 const EDITOR_TOOL_SPECS: ToolSpec[] = [
   {
     name: 'OpenFile',
-    description: 'Open a file in the editor so the user can see it (like clicking it in the file tree). Optionally jump to a line. Use this to show the user what you are working on.',
+    description: 'Open a file in the editor so the user can see it (like clicking it in the file tree). Optionally jump to a line (the editor scrolls to and flashes that line). When the user asks WHERE something is (a function, symbol, definition, usage), prefer navigating there with OpenFile(path, line) — after Grep-ing for the line — instead of pasting the code into chat.',
     input_schema: {
       type: 'object',
       properties: { path: { type: 'string' }, line: { type: 'integer' } },
@@ -99,6 +116,7 @@ function toolSpecsFor(opts: { allowBash: boolean; orchestrationEnabled: boolean 
   const specs: ToolSpec[] = [
     ...FILE_TOOL_SPECS.filter((s) => opts.allowBash || s.name !== 'Bash'),
     ...EDITOR_TOOL_SPECS,
+    ...EXTRA_TOOL_SPECS,
     REPORT_BLOCKED_SPEC,
   ]
   if (opts.orchestrationEnabled) specs.push(...ORCH_TOOL_SPECS)
@@ -117,6 +135,8 @@ export interface IdeAgentParams {
   // Opt-in capabilities (resolved from config in main before the run).
   allowBash?: boolean
   orchestrationEnabled?: boolean
+  // Plan mode: read-only investigation, then present a plan (no file writes).
+  planMode?: boolean
 }
 
 // Orchestration tools run in main (need db + coordinator), so they're routed
@@ -159,6 +179,9 @@ export type IdeAgentEvent =
   | { type: 'tool_result'; callId: string; name: string; result: string; isError: boolean }
   | { type: 'pending_change'; change: PendingChange }
   | { type: 'change_resolved'; changeId: string; decision: ReviewDecision }
+  | { type: 'pending_action'; action: PendingAction }
+  | { type: 'action_resolved'; actionId: string; approved: boolean }
+  | { type: 'todos'; todos: { content: string; status: string }[] }
   | { type: 'file_changed'; path: string }
   | { type: 'context'; used: number; window: number; turn: number }
   | { type: 'blocked'; reason: string; turns: number }
@@ -196,16 +219,37 @@ function estimateCostUsd(tokensIn: number, tokensOut: number, rates: [number, nu
 function buildSystemPrompt(params: IdeAgentParams, workspaceRoot: string): string {
   let s =
     'You are Orqon, an expert AI coding agent embedded in an IDE. You have tools ' +
-    'to read and modify the user\'s workspace directly: Read, Write, Edit, Grep, Glob. ' +
+    'to read and modify the user\'s workspace directly: Read, Write, Edit, MultiEdit, ' +
+    'Grep, Glob, ListDir, Move, Delete. ' +
     'You also have editor tools to work with what the user sees: OpenFile (show a file ' +
     'in the editor, optionally at a line), GetOpenEditor (get the currently viewed file ' +
     'and selection), and ShowDiff (preview a proposed change without writing it). ' +
+    'For version control you have git tools: GitStatus, GitDiff, GitLog, GitBranch, ' +
+    'GitAdd, GitCommit, GitPush, GitPull, GitCheckout. For managing the git identity / ' +
+    'account you have GitConfigGet/GitConfigSet, GitRemoteGet/GitRemoteSet, and for GitHub: ' +
+    'GitHubAuthStatus, GitHubAuthSwitch, GitHubLogin. You can save reusable account ' +
+    'profiles (SaveGitProfile, ListGitProfiles) and apply one in a single step with ' +
+    'SwitchGitAccount. You can also research online with WebFetch and WebSearch, track ' +
+    'your plan with TodoWrite, and run long processes with BashBackground/BashOutput/KillBash. ' +
+    'Sensitive actions (git mutations, changing the identity, switching accounts, logging ' +
+    'in, background commands) ask the user for confirmation automatically — just call the ' +
+    'tool and the user will approve or decline. ' +
     'Open the relevant file with OpenFile so the user can follow along. ' +
     'Work autonomously: inspect the code with Read/Grep/Glob before changing it, make ' +
     'the smallest correct edit, and prefer Edit over Write for existing files. ' +
     'Paths are relative to the workspace root. When done, give a brief summary of what ' +
-    'you changed. Do not ask for confirmation — the user reviews changes in the editor.\n\n' +
+    'you changed. Do not ask for confirmation in text — the user reviews changes in the editor.\n\n' +
     `Workspace root: ${workspaceRoot}`
+  if (params.planMode) {
+    s =
+      'You are Orqon in PLAN MODE. You may ONLY investigate — read files, search, run ' +
+      'diagnostics, inspect git, browse the web. You must NOT modify anything (no Write/Edit/' +
+      'commits/commands). Your job is to research the request thoroughly, then present a clear, ' +
+      'step-by-step implementation plan: what files to change and how, key decisions, and how to ' +
+      'verify. End your final message with the plan as a numbered list. The user will review it ' +
+      'and approve before any changes are made — so do not ask questions, just produce the best plan.\n\n' +
+      `Workspace root: ${workspaceRoot}`
+  }
   if (params.openFile) {
     const body = params.openFile.content.length > 12000
       ? params.openFile.content.slice(0, 12000) + '\n… (truncated)'
@@ -232,6 +276,7 @@ export async function runIdeAgent(
   requestReview?: (change: PendingChange) => Promise<ReviewDecision>,
   editorBridge?: (op: EditorRequest['op'], args: Record<string, unknown>) => Promise<EditorResponse>,
   orchestrationBridge?: OrchestrationBridge,
+  requestAction?: (action: PendingAction) => Promise<boolean>,
 ): Promise<void> {
   try {
     const providers = loadProviders(sharedDir)
@@ -254,7 +299,9 @@ export async function runIdeAgent(
     const allowBash = Boolean(params.allowBash)
     const orchestrationEnabled = Boolean(params.orchestrationEnabled && orchestrationBridge)
     const contextWindow = contextWindowFor(model, pc)
-    const specs = toolSpecsFor({ allowBash, orchestrationEnabled })
+    const planMode = Boolean(params.planMode)
+    let specs = toolSpecsFor({ allowBash, orchestrationEnabled })
+    if (planMode) specs = specs.filter((s) => PLAN_READONLY_TOOLS.has(s.name))
     const adapter = buildAdapter(pc, key, model, specs)
     const system = buildSystemPrompt(params, workspaceRoot)
     // Seed the conversation with the prior chat turns (user + assistant text).
@@ -321,8 +368,37 @@ export async function runIdeAgent(
         const isMutation = call.name === 'Write' || call.name === 'Edit'
         const isEditorTool = EDITOR_TOOL_NAMES.has(call.name)
         const isOrchTool = ORCH_TOOL_NAMES.has(call.name)
+        const isExtraTool = EXTRA_TOOL_NAMES.has(call.name)
 
-        if (isOrchTool) {
+        if (isExtraTool) {
+          // Git / git-account / web / todo / background tools. Sensitive ones
+          // (mutations, login, account switch) gate on the confirm bridge.
+          const confirm = async (action: Omit<PendingAction, 'actionId'>): Promise<boolean> => {
+            if (!requestAction) return false
+            const actionId = `act-${++actionCounter}-${Date.now()}`
+            const full: PendingAction = { actionId, ...action }
+            emit({ type: 'pending_action', action: full })
+            const approved = await requestAction(full)
+            emit({ type: 'action_resolved', actionId, approved })
+            return approved
+          }
+          try {
+            const r = await runExtraTool(call.name, call.args, {
+              cwd: workspaceRoot,
+              confirm,
+              emitTodos: (todos) => emit({ type: 'todos', todos }),
+            })
+            result = r == null ? `error: unknown tool ${call.name}` : r
+            isError = r == null || r.startsWith('error:')
+          } catch (e: any) {
+            result = `error: ${e?.message || e}`
+            isError = true
+          }
+          // Git mutations may touch tracked files; nudge the tree to refresh.
+          if (!isError && (call.name === 'GitCheckout' || call.name === 'GitPull')) {
+            emit({ type: 'file_changed', path: '' })
+          }
+        } else if (isOrchTool) {
           if (!orchestrationEnabled || !orchestrationBridge) {
             result = 'error: orchestration is disabled — enable it in Backend Settings to hand work to groups'
             isError = true
@@ -369,8 +445,10 @@ export async function runIdeAgent(
             isError = true
           }
           // Auto-apply mode: notify renderer so it reloads the changed file/tree.
-          if (isMutation && !isError) {
-            const rel = (call.args as { path?: string }).path
+          // Covers every file-mutating tool, not just Write/Edit.
+          if (!isError && FILE_CHANGED_TOOLS.has(call.name)) {
+            const a = call.args as { path?: string; to?: string }
+            const rel = a.path || a.to
             if (rel) emit({ type: 'file_changed', path: rel })
           }
         }
@@ -412,6 +490,7 @@ async function runOrchTool(
 }
 
 let changeCounter = 0
+let actionCounter = 0
 
 // In review mode: compute the diff for a Write/Edit call, show it to the user,
 // and only persist if they accept. Returns the tool-result string the model

@@ -12,6 +12,7 @@
 import { spawn, ChildProcess } from 'node:child_process'
 import fs from 'node:fs'
 import * as db from './db'
+import { resolveGroupParams } from './group-params'
 
 export interface OrchestrationConfig {
   enabled: boolean
@@ -93,19 +94,15 @@ export class GroupCoordinator {
   // Public: create a root group for a task (called from an IPC handler / UI).
   async createGroupForTask(taskId: string, workerRole: string): Promise<string> {
     const cfg = await this.deps.readOrchestration()
-    const model = await this.deps.modelForRole(workerRole)
+    // Pre-resolve the two models the shared (sync) helper needs.
     const reviewerRole = cfg.reviewer_for[workerRole] || null
-    const reviewerModel = reviewerRole ? await this.deps.modelForRole(reviewerRole) : null
-    const id = db.createGroup({
-      task_id: taskId,
-      worker_role: workerRole,
-      reviewer_role: reviewerRole,
-      worker_model: model,
-      reviewer_model: reviewerModel,
-      budget_usd: cfg.budget_per_group_usd,
-      depth: 0,
-    })
-    this.log(taskId, `created group ${id} worker=${workerRole} reviewer=${reviewerRole || '-'}`)
+    const modelMap: Record<string, string | null> = {
+      [workerRole]: await this.deps.modelForRole(workerRole),
+    }
+    if (reviewerRole) modelMap[reviewerRole] = await this.deps.modelForRole(reviewerRole)
+    const args = resolveGroupParams(taskId, workerRole, cfg, (r) => modelMap[r] ?? null)
+    const id = db.createGroup(args)
+    this.log(taskId, `created group ${id} worker=${workerRole} reviewer=${args.reviewer_role || '-'}`)
     return id
   }
 
@@ -116,6 +113,15 @@ export class GroupCoordinator {
     try {
       const cfg = await this.deps.readOrchestration()
       if (!cfg.enabled) return
+
+      // 0) Honor cross-process kill requests. A separate process (e.g. the
+      //    Discord bot's /kill) can't reach our in-memory child procs, so it
+      //    sets signal='kill' on the group row; we kill the proc here. Scanned
+      //    across live statuses and BEFORE handleSignals (which ignores groups
+      //    with a running proc).
+      for (const g of db.getGroupsByStatus('pending', 'active', 'reviewing')) {
+        if (g.signal === 'kill') this.killGroupManual(g.id, 'killed via signal')
+      }
 
       // 1) Reap finished child processes (proc exit is handled in onExit, this
       //    is a safety net; nothing to do here beyond it).

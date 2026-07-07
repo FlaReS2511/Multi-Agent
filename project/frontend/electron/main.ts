@@ -3,12 +3,14 @@ import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 import fs from 'node:fs/promises'
 import fsSync from 'node:fs'
-import { execFile } from 'node:child_process'
+import { execFile, spawn, type ChildProcess } from 'node:child_process'
 import { createRequire } from 'node:module'
 import * as db from './db'
 import { streamInlineEdit, stripCodeFence, streamChat, InlineEditParams, ChatParams } from './ai-client'
 import { GroupCoordinator, DEFAULT_ORCHESTRATION, OrchestrationConfig } from './group-coordinator'
+import { normalizeDiscordConfig, type DiscordConfig } from './group-params'
 import { runIdeAgent, IdeAgentParams, IdeAgentEvent, PendingChange, ReviewDecision, EditorRequest, EditorResponse } from './ide-agent'
+import { PendingAction, killAllBackgroundJobs } from './extra-tools'
 const require = createRequire(import.meta.url)
 // node-pty is a native module that must be rebuilt for Electron. If it failed
 // to build (e.g. missing VS Build Tools on Windows), load it lazily so the app
@@ -61,6 +63,9 @@ const PLANNER_DRAFT_PATH = path.join(ROOT, 'agents', 'planner', 'workspace', 'cu
 // The agent runtime is now a Node/TS entry built alongside the main process.
 // It runs as a child process via Electron's own Node (ELECTRON_RUN_AS_NODE=1).
 const AGENT_RUNTIME = path.join(__dirname, 'agent-runtime.js')
+// The Discord bot: another standalone Node entry, spawned as a child process
+// only when discord.enabled=true. See DISCORD_BOT_DESIGN.md / discord-bot.ts.
+const DISCORD_BOT = path.join(__dirname, 'discord-bot.js')
 
 // Provider id is any string key under config.providers (e.g. 'vietapi',
 // 'anthropic'). Secrets are keyed by provider id.
@@ -102,6 +107,9 @@ function createWindow() {
     },
   })
   mainWindow.setMenuBarVisibility(false)
+  if (process.platform === 'darwin') {
+    mainWindow.setWindowButtonVisibility(false)
+  }
 
   mainWindow.on('maximize', () => mainWindow?.webContents.send('window-maximized-changed', true))
   mainWindow.on('unmaximize', () => mainWindow?.webContents.send('window-maximized-changed', false))
@@ -491,6 +499,7 @@ interface AgentEntry {
 interface FullConfig {
   providers?: Record<string, ProviderBlock>
   agents: Record<string, AgentEntry>
+  discord?: Partial<DiscordConfig>
   available_models?: unknown[]
   orchestration?: Partial<OrchestrationConfig>
 }
@@ -613,12 +622,122 @@ ipcMain.handle('set-provider-key', async (_evt, input: { provider: SecretProvide
     const encrypted = safeStorage.encryptString(input.apiKey)
     db.setSecret(input.provider, encrypted.toString('base64'))
   }
+  // The bot's provider keys are injected as env at spawn time (a Node child
+  // can't decrypt safeStorage). If this key is the bot token or the /agent
+  // provider, respawn so the running bot picks up the new value.
+  await restartDiscordBotForKey(input.provider)
   return { ok: true }
 })
 
 ipcMain.handle('clear-provider-key', async (_evt, provider: SecretProvider) => {
   db.deleteSecret(provider)
+  await restartDiscordBotForKey(provider)
   return { ok: true }
+})
+
+// ── Discord bot (child process, DB-bus; see DISCORD_BOT_DESIGN.md) ──────────
+// The bot is spawned only when discord.enabled=true and a token exists. It
+// talks to the coordinator purely through the DB (writes pending groups), so
+// main just manages its process lifecycle.
+let discordProc: ChildProcess | null = null
+let discordRestartTimer: NodeJS.Timeout | null = null
+let discordBackoffMs = 2000
+
+function spawnDiscordBot(botToken: string, providerEnv: Record<string, string>): void {
+  if (discordProc) return
+  const proc = spawn(process.execPath, [DISCORD_BOT], {
+    env: { ...process.env, ...providerEnv, ELECTRON_RUN_AS_NODE: '1', MULTIAGENT_KEY_DISCORD: botToken },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  discordProc = proc
+  proc.stdout?.on('data', (d) => process.stdout.write(`[discord] ${d}`))
+  proc.stderr?.on('data', (d) => process.stderr.write(`[discord!] ${d}`))
+  proc.on('exit', (code) => {
+    if (discordProc === proc) discordProc = null
+    console.error(`[discord] bot exited (code ${code})`)
+    void scheduleDiscordRestart()
+  })
+}
+
+async function scheduleDiscordRestart(): Promise<void> {
+  if (discordRestartTimer) return
+  const cfg = normalizeDiscordConfig((await readConfig()).discord)
+  if (!cfg.enabled) { discordBackoffMs = 2000; return } // clean disable → don't respawn
+  discordRestartTimer = setTimeout(() => {
+    discordRestartTimer = null
+    void ensureDiscordBot()
+  }, discordBackoffMs)
+  discordBackoffMs = Math.min(discordBackoffMs * 2, 30000)
+}
+
+// Spawn the bot if enabled + token present; otherwise ensure it's stopped.
+async function ensureDiscordBot(): Promise<void> {
+  const config = await readConfig()
+  const cfg = normalizeDiscordConfig(config.discord)
+  if (!cfg.enabled) { killDiscordBot(); return }
+  if (discordProc) return
+  const enc = db.getSecret('discord')
+  const botToken = enc ? decryptKey(enc) : ''
+  if (!botToken) {
+    console.error('[discord] enabled but no bot token set — not spawning')
+    return
+  }
+  // Inject the /agent-mode provider's key so the in-channel agent can call it.
+  const providerEnv: Record<string, string> = {}
+  if (cfg.agent_provider) {
+    const pEnc = db.getSecret(cfg.agent_provider)
+    const pKey = pEnc ? decryptKey(pEnc) : ''
+    const pCfg = config.providers?.[cfg.agent_provider]
+    if (pKey) providerEnv[keyEnvName(cfg.agent_provider)] = pKey
+    else if (pCfg?.kind === 'openai-compatible' && pCfg.base_url?.includes('localhost')) {
+      providerEnv[keyEnvName(cfg.agent_provider)] = 'no-key'
+    }
+  }
+  spawnDiscordBot(botToken, providerEnv)
+}
+
+function killDiscordBot(): void {
+  if (discordRestartTimer) { clearTimeout(discordRestartTimer); discordRestartTimer = null }
+  discordBackoffMs = 2000
+  if (discordProc) { try { discordProc.kill() } catch { /* ignore */ } discordProc = null }
+}
+
+// Restart the running bot so it re-reads env (fresh decrypted keys / config).
+async function restartDiscordBot(): Promise<void> {
+  const cfg = normalizeDiscordConfig((await readConfig()).discord)
+  if (!cfg.enabled) { killDiscordBot(); return }
+  killDiscordBot()
+  await ensureDiscordBot()
+}
+
+// Restart only if the changed provider key affects the bot (its token or the
+// /agent provider) and the bot is enabled.
+async function restartDiscordBotForKey(provider: string): Promise<void> {
+  const cfg = normalizeDiscordConfig((await readConfig()).discord)
+  if (!cfg.enabled) return
+  if (provider === 'discord' || provider === cfg.agent_provider) {
+    await restartDiscordBot()
+  }
+}
+
+ipcMain.handle('discord-config-get', async () => {
+  return normalizeDiscordConfig((await readConfig()).discord)
+})
+
+ipcMain.handle('discord-config-set', async (_evt, patch: Partial<DiscordConfig>) => {
+  const config = await readConfig()
+  const merged = normalizeDiscordConfig({ ...normalizeDiscordConfig(config.discord), ...patch })
+  config.discord = merged
+  await writeConfig(config)
+  // Restart (not just ensure) so provider/model/allowlist changes take effect
+  // and the /agent provider key is re-injected into the bot's env.
+  if (merged.enabled) await restartDiscordBot()
+  else killDiscordBot()
+  return { ok: true, discord: merged }
+})
+
+ipcMain.handle('discord-token-status', () => {
+  return { hasToken: !!db.getSecret('discord') }
 })
 
 // ── PTY dispatch (API-only) ─────────────────────────────────
@@ -1666,6 +1785,9 @@ ipcMain.handle('ai-chat-cancel', (_evt, requestId: string) => {
 const agentAborts = new Map<string, AbortController>()
 // changeId → resolver, so the renderer's accept/reject can unblock the agent.
 const pendingReviews = new Map<string, (d: ReviewDecision) => void>()
+// actionId → resolver, so the renderer's approve/decline unblocks a sensitive
+// git/login/background action.
+const pendingActions = new Map<string, (approved: boolean) => void>()
 // requestId → resolver for editor round-trip tools (OpenFile/ShowDiff/…).
 const pendingEditorReqs = new Map<string, (r: EditorResponse) => void>()
 let editorReqCounter = 0
@@ -1713,6 +1835,19 @@ ipcMain.handle('ai-agent-run', async (_evt, runId: string, params: IdeAgentParam
         resolve(d)
       })
     })
+  // Held until the renderer approves/declines a sensitive git/login/background
+  // action. Aborting the run auto-declines any outstanding action.
+  const requestAction = (action: PendingAction): Promise<boolean> =>
+    new Promise((resolve) => {
+      if (ac.signal.aborted) { resolve(false); return }
+      const onAbort = () => { pendingActions.delete(action.actionId); resolve(false) }
+      ac.signal.addEventListener('abort', onAbort, { once: true })
+      pendingActions.set(action.actionId, (approved) => {
+        ac.signal.removeEventListener('abort', onAbort)
+        pendingActions.delete(action.actionId)
+        resolve(approved)
+      })
+    })
   // Ask the renderer to drive the editor; resolves when it replies (or aborts).
   const editorBridge = (op: EditorRequest['op'], args: Record<string, unknown>): Promise<EditorResponse> =>
     new Promise((resolve) => {
@@ -1745,7 +1880,7 @@ ipcMain.handle('ai-agent-run', async (_evt, runId: string, params: IdeAgentParam
       coordinator.createGroupForTask(input.task_id, input.worker_role),
   }
   try {
-    await runIdeAgent(SHARED, runParams, decryptKey, emit, ac.signal, requestReview, editorBridge, orchestrationBridge)
+    await runIdeAgent(SHARED, runParams, decryptKey, emit, ac.signal, requestReview, editorBridge, orchestrationBridge, requestAction)
     return { ok: true }
   } catch (e) {
     const msg = (e as Error).message || String(e)
@@ -1765,6 +1900,12 @@ ipcMain.handle('ai-agent-editor-res', (_evt, resp: EditorResponse) => {
 ipcMain.handle('ai-agent-review', (_evt, changeId: string, decision: ReviewDecision) => {
   const resolve = pendingReviews.get(changeId)
   if (resolve) resolve(decision)
+  return { ok: true }
+})
+
+ipcMain.handle('ai-agent-action', (_evt, actionId: string, approved: boolean) => {
+  const resolve = pendingActions.get(actionId)
+  if (resolve) resolve(approved)
   return { ok: true }
 })
 
@@ -1788,6 +1929,70 @@ ipcMain.handle('ide-agent-config-set', (_evt, patch: { reviewMode?: boolean; all
   const next = { ...cfg, ...patch }
   db.setMeta('ide_agent_config', JSON.stringify(next))
   return { ok: true, reviewMode: Boolean(next.reviewMode), allowBash: Boolean(next.allowBash) }
+})
+
+// ── Git account profiles (used by the IDE agent's SwitchGitAccount) ──
+
+ipcMain.handle('git-profiles-list', () => {
+  return db.listGitProfiles()
+})
+
+ipcMain.handle('git-profile-save', (_evt, input: {
+  label: string; user_name: string; user_email: string; remote_url?: string; gh_account?: string
+}) => {
+  if (!input.label || !input.user_name || !input.user_email) {
+    return { ok: false, error: 'label, user_name and user_email are required' }
+  }
+  db.upsertGitProfile({
+    label: input.label,
+    user_name: input.user_name,
+    user_email: input.user_email,
+    remote_url: input.remote_url ?? null,
+    gh_account: input.gh_account ?? null,
+  })
+  return { ok: true }
+})
+
+ipcMain.handle('git-profile-delete', (_evt, label: string) => {
+  db.deleteGitProfile(label)
+  return { ok: true }
+})
+
+// ── Agent chat sessions (persistent memory, scoped to the workspace) ──
+
+ipcMain.handle('agent-session-list', () => {
+  if (!workspaceRoot) return []
+  return db.listAgentSessions(workspaceRoot)
+})
+
+ipcMain.handle('agent-session-latest', () => {
+  if (!workspaceRoot) return null
+  return db.latestAgentSession(workspaceRoot)
+})
+
+ipcMain.handle('agent-session-get', (_evt, id: number) => {
+  return db.getAgentSession(id)
+})
+
+ipcMain.handle('agent-session-create', (_evt, title: string, items?: string) => {
+  if (!workspaceRoot) return { ok: false, error: 'no workspace open' }
+  const id = db.createAgentSession(workspaceRoot, title || 'New session', items ?? '[]')
+  return { ok: true, id }
+})
+
+ipcMain.handle('agent-session-update', (_evt, id: number, items: string, title?: string) => {
+  db.updateAgentSession(id, items, title)
+  return { ok: true }
+})
+
+ipcMain.handle('agent-session-rename', (_evt, id: number, title: string) => {
+  db.renameAgentSession(id, title)
+  return { ok: true }
+})
+
+ipcMain.handle('agent-session-delete', (_evt, id: number) => {
+  db.deleteAgentSession(id)
+  return { ok: true }
 })
 
 // ── Lifecycle ───────────────────────────────────────────────
@@ -1822,10 +2027,24 @@ app.whenReady().then(async () => {
   // orchestration.enabled is true in agents-config.json, so this is safe to
   // always start.
   coordinator.start()
+  // Start the Discord bot if the user has enabled it + set a token. No-op
+  // otherwise; toggling enable in Settings spawns/kills it live.
+  try {
+    await ensureDiscordBot()
+  } catch (err) {
+    console.error('Failed to start Discord bot:', err)
+  }
 })
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit()
+})
+
+app.on('will-quit', () => {
+  // Stop any background jobs the IDE agent started so they don't outlive the app.
+  try { killAllBackgroundJobs() } catch { /* ignore */ }
+  // Kill the Discord bot child so it doesn't linger after the app closes.
+  try { killDiscordBot() } catch { /* ignore */ }
 })
 
 app.on('activate', () => {
