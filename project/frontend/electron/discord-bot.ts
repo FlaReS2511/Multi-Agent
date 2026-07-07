@@ -37,6 +37,7 @@ import { buildAdapter, type ProviderCfgLike } from './adapters'
 import {
   FILE_TOOL_SPECS, runFileTool, type ToolSpec,
   previewWrite, previewEdit, applyChange,
+  EXCEL_TOOL_SPECS, EXCEL_TOOL_NAMES, EXCEL_MUTATORS, runExcelTool,
 } from './agent-tools'
 import { EXTRA_TOOL_SPECS, EXTRA_TOOL_NAMES, runExtraTool } from './extra-tools'
 
@@ -169,6 +170,7 @@ function buildCommands() {
     new SlashCommandBuilder().setName('stop').setDescription('Dừng lượt agent đang chạy'),
     new SlashCommandBuilder().setName('context').setDescription('Xem token + số lượt của session'),
     new SlashCommandBuilder().setName('undo').setDescription('Hoàn tác các file agent đã sửa trong session'),
+    new SlashCommandBuilder().setName('plan').setDescription('Bật/tắt plan mode (khảo sát read-only rồi Approve)'),
   ].map((c) => c.toJSON())
 }
 
@@ -433,6 +435,8 @@ interface AgentSession {
   busy: boolean
   cancel: boolean          // set by /stop, checked between turns/tools
   model?: string           // per-channel model override (same provider), /model
+  planMode: boolean        // /plan: read-only investigate → PresentPlan → approve
+  pendingPlan?: string     // plan awaiting the Approve button
   changed: Set<string>     // files edited this session (for /undo)
   created: Set<string>     // NEW files created this session (for /undo)
   turns: number
@@ -442,7 +446,20 @@ interface AgentSession {
 const agentSessions = new Map<string, AgentSession>() // channelId → session
 
 function newSession(): AgentSession {
-  return { messages: [], busy: false, cancel: false, changed: new Set(), created: new Set(), turns: 0, tokensIn: 0, tokensOut: 0 }
+  return { messages: [], busy: false, cancel: false, planMode: false, changed: new Set(), created: new Set(), turns: 0, tokensIn: 0, tokensOut: 0 }
+}
+
+// Plan mode (Discord): read-only tools the agent may use while planning.
+const PLAN_READONLY = new Set([
+  'Read', 'Grep', 'Glob', 'ListDir', 'GetDiagnostics',
+  'GitStatus', 'GitDiff', 'GitLog', 'GitBranch', 'GitConfigGet', 'GitRemoteGet',
+  'GitHubAuthStatus', 'ListGitProfiles', 'ListPRs', 'ViewPR', 'ListIssues',
+  'WebFetch', 'WebSearch', 'RecallNotes', 'TodoWrite', 'BashOutput', 'ReportBlocked',
+])
+const PRESENT_PLAN_SPEC: ToolSpec = {
+  name: 'PresentPlan',
+  description: 'Call ONCE when your plan is complete and final to present it for approval. Pass the full step-by-step plan as `plan` (markdown). Do NOT call it while still investigating or if you need to ask the user something.',
+  input_schema: { type: 'object', properties: { plan: { type: 'string' } }, required: ['plan'] },
 }
 
 const TEXT_ATT_RE = /\.(txt|md|log|json|ya?ml|csv|ts|tsx|js|jsx|mjs|cjs|py|java|c|cc|cpp|h|hpp|go|rs|rb|php|sh|bash|zsh|html|css|scss|sql|toml|ini|env|xml|diff|patch)$/i
@@ -502,6 +519,46 @@ const ORCH_TOOL_SPECS: ToolSpec[] = [
 ]
 const ORCH_TOOL_NAMES = new Set(ORCH_TOOL_SPECS.map((s) => s.name))
 const TRACKED_MUTATORS = new Set(['MultiEdit', 'Move', 'Delete'])
+
+// ── Lazy tool loading (mirror of ide-agent) ──────────────────────
+const EXTRA_BY_NAME = new Map(EXTRA_TOOL_SPECS.map((s) => [s.name, s]))
+function pickExtra(names: string[]): ToolSpec[] {
+  return names.map((n) => EXTRA_BY_NAME.get(n)).filter((s): s is ToolSpec => !!s)
+}
+const TOOL_GROUPS: Record<string, ToolSpec[]> = {
+  git: pickExtra(['GitStatus', 'GitDiff', 'GitLog', 'GitBranch', 'GitConfigGet', 'GitConfigSet', 'GitRemoteGet', 'GitRemoteSet', 'GitAdd', 'GitCommit', 'GitPush', 'GitPull', 'GitCheckout', 'SwitchGitAccount', 'SaveGitProfile', 'ListGitProfiles']),
+  github: pickExtra(['GitHubAuthStatus', 'GitHubAuthSwitch', 'GitHubLogin', 'ListPRs', 'ViewPR', 'ListIssues', 'CreatePR', 'CommentIssue']),
+  web: pickExtra(['WebFetch', 'WebSearch', 'Research']),
+  memory: pickExtra(['RememberNote', 'RecallNotes']),
+  background: pickExtra(['BashBackground', 'BashOutput', 'KillBash']),
+  excel: EXCEL_TOOL_SPECS,
+}
+const GROUP_BLURBS: Record<string, string> = {
+  git: 'git (status/diff/commit/push/branch/checkout/config/account)',
+  github: 'github (pull requests & issues via gh)',
+  web: 'web (WebFetch, WebSearch)',
+  memory: 'memory (remember/recall notes)',
+  background: 'background (long-running commands)',
+  excel: 'excel (create/read/edit .xlsx: sheets, ranges, formulas, formatting)',
+}
+const LOAD_GROUP_SPEC: ToolSpec = {
+  name: 'LoadToolGroup',
+  description:
+    'Enable an extra group of tools when the task needs them (hidden until loaded, to save context). Groups: ' +
+    Object.entries(GROUP_BLURBS).map(([k, v]) => `"${k}" = ${v}`).join('; ') +
+    '. Call group=<name> then use its tools. Load only what you need.',
+  input_schema: { type: 'object', properties: { group: { type: 'string', enum: Object.keys(TOOL_GROUPS) } }, required: ['group'] },
+}
+const TODO_SPEC = EXTRA_BY_NAME.get('TodoWrite')
+
+// Core tools sent every turn (Discord). Heavy families load via LoadToolGroup.
+function coreSpecs(allowBash: boolean, orchEnabled: boolean): ToolSpec[] {
+  const specs: ToolSpec[] = [...FILE_TOOL_SPECS.filter((s) => allowBash || s.name !== 'Bash')]
+  if (TODO_SPEC) specs.push(TODO_SPEC)
+  specs.push(REPORT_BLOCKED_SPEC, LOAD_GROUP_SPEC)
+  if (orchEnabled) specs.push(...ORCH_TOOL_SPECS)
+  return specs
+}
 
 // Sensitive-action approval: runExtraTool calls confirm() for gated tools; we
 // post Approve/Decline buttons and resolve via the button interaction.
@@ -564,15 +621,22 @@ function messageToText(m: any): string {
   return text.trim() ? `${role}: ${text.trim()}` : ''
 }
 
-function agentSystemPrompt(ws: string, orchEnabled: boolean): string {
+function agentSystemPrompt(ws: string, orchEnabled: boolean, planMode: boolean): string {
+  if (planMode) {
+    return [
+      'You are Orqon in PLAN MODE over Discord.',
+      `Workspace root: ${ws}`,
+      'You may ONLY investigate: Read, Grep, Glob, ListDir, GetDiagnostics, read-only git, WebFetch/WebSearch. Do NOT modify anything.',
+      'Research the request thoroughly, then call PresentPlan with the full step-by-step plan (files to change, key decisions, how to verify).',
+      'Do NOT call PresentPlan until the plan is final. Keep prose short.',
+    ].join('\n')
+  }
   return [
     'You are Orqon, a coding agent operating on the user\'s workspace over Discord.',
     `Workspace root: ${ws}`,
     'File tools: Read, Write, Edit, MultiEdit, Grep, Glob, ListDir, Move, Delete, NotebookEdit, DownloadFile' + '. Use them to inspect and modify files directly.',
     'After editing code, run GetDiagnostics to typecheck/lint and fix any errors before finishing.',
-    'Git tools (read): GitStatus, GitDiff, GitLog, GitBranch. Git mutations (GitAdd/Commit/Push/Pull/Checkout) and account changes ask the user to approve before running.',
-    'Web tools: WebFetch, WebSearch — for looking up docs or errors.',
-    'Memory: RememberNote saves durable facts across sessions; RecallNotes retrieves them.',
+    'Extra tool groups are NOT loaded by default (to save context): git, github (PRs/issues), web (WebFetch/WebSearch), memory (remember/recall notes), background (long commands), excel (create/read/edit .xlsx). When the task needs one, call LoadToolGroup(group) FIRST, then use its tools. Sensitive git actions ask you to approve before running.',
     'TodoWrite: post a short plan/checklist for multi-step work.',
     orchEnabled ? 'For large multi-step work, CreateTask then CreateGroup to hand it to autonomous worker+reviewer agents.' : '',
     'Make MINIMAL, targeted edits. Prefer Edit/MultiEdit over rewriting whole files with Write.',
@@ -590,7 +654,7 @@ interface Post {
   rich: (content: string, components: unknown[]) => Promise<any>
 }
 
-async function runAgentTurn(post: Post, session: AgentSession, userText: string): Promise<void> {
+async function runAgentTurn(post: Post, session: AgentSession, userText: string, channelId: string): Promise<void> {
   const send = post.text
   const { discord, providers, orch, modelFor } = loadConfig()
   const pc = providers[discord.agent_provider]
@@ -607,14 +671,22 @@ async function runAgentTurn(post: Post, session: AgentSession, userText: string)
     return
   }
 
-  const specs: ToolSpec[] = [
-    ...FILE_TOOL_SPECS.filter((s) => discord.allow_agent_bash || s.name !== 'Bash'),
-    ...EXTRA_TOOL_SPECS,
-    REPORT_BLOCKED_SPEC,
-  ]
-  if (orch.enabled) specs.push(...ORCH_TOOL_SPECS)
-  const adapter = buildAdapter(pc, key, model, specs)
-  const system = agentSystemPrompt(ws, orch.enabled)
+  // Plan mode = curated read-only set; normal = core + LoadToolGroup (lazy).
+  let activeSpecs: ToolSpec[]
+  if (session.planMode) {
+    const all = [
+      ...FILE_TOOL_SPECS.filter((s) => discord.allow_agent_bash || s.name !== 'Bash'),
+      ...EXTRA_TOOL_SPECS, REPORT_BLOCKED_SPEC,
+      ...(orch.enabled ? ORCH_TOOL_SPECS : []),
+    ]
+    activeSpecs = all.filter((s) => PLAN_READONLY.has(s.name))
+    activeSpecs.push(PRESENT_PLAN_SPEC)
+  } else {
+    activeSpecs = coreSpecs(discord.allow_agent_bash, orch.enabled)
+  }
+  let adapter = buildAdapter(pc, key, model, activeSpecs)
+  const loadedGroups = new Set<string>()
+  const system = agentSystemPrompt(ws, orch.enabled, session.planMode)
 
   // Confirmation gate for sensitive extra tools: post buttons, await the click.
   const confirm = async (action: { tool: string; title: string; detail: string }): Promise<boolean> => {
@@ -671,9 +743,32 @@ async function runAgentTurn(post: Post, session: AgentSession, userText: string)
         await send(`🚧 Bị chặn: ${reason}`.slice(0, 1900))
         return
       }
+      if (call.name === 'PresentPlan') {
+        const plan = String((call.args as { plan?: string }).plan || '').trim() || '(empty plan)'
+        session.messages.push(assistantMsg)
+        session.pendingPlan = plan
+        const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+          new ButtonBuilder().setCustomId(`plan-approve:${channelId}`).setLabel('Approve & Run').setStyle(ButtonStyle.Success),
+          new ButtonBuilder().setCustomId(`plan-dismiss:${channelId}`).setLabel('Dismiss').setStyle(ButtonStyle.Secondary),
+        )
+        await post.rich(`📋 **Plan**\n${plan}`.slice(0, 1900), [row])
+        return
+      }
       const args = call.args as Record<string, unknown>
       let result: string
-      if (call.name === 'Write' || call.name === 'Edit') {
+      if (call.name === 'LoadToolGroup') {
+        const g = String((args as { group?: string }).group || '')
+        const grp = TOOL_GROUPS[g]
+        if (!grp) result = `error: unknown group "${g}". Available: ${Object.keys(TOOL_GROUPS).join(', ')}`
+        else if (loadedGroups.has(g)) result = `group "${g}" already loaded`
+        else {
+          loadedGroups.add(g)
+          activeSpecs = [...activeSpecs, ...grp]
+          adapter = buildAdapter(pc, key, model, activeSpecs) // rebuild with new tools
+          result = `loaded ${grp.length} ${g} tools: ${grp.map((s) => s.name).join(', ')}`
+        }
+        await send(`🧩 LoadToolGroup: ${g}`.slice(0, 200))
+      } else if (call.name === 'Write' || call.name === 'Edit') {
         const preview = call.name === 'Write'
           ? previewWrite(ws, args as { path: string; content: string })
           : previewEdit(ws, args as { path: string; old_string: string; new_string: string; replace_all?: boolean })
@@ -694,6 +789,20 @@ async function runAgentTurn(post: Post, session: AgentSession, userText: string)
         // MultiEdit / Move / Delete: apply via runFileTool but capture a diff /
         // note and record for /undo so nothing changes silently.
         result = await runTrackedMutation(ws, call.name, args, session, changed, post)
+      } else if (EXCEL_TOOL_NAMES.has(call.name)) {
+        const p = typeof args.path === 'string' ? args.path : ''
+        const existedBefore = !!p && fs.existsSync(path.resolve(ws, p))
+        try {
+          const r = await runExcelTool(ws, call.name, args)
+          result = r == null ? `error: unknown tool ${call.name}` : r
+        } catch (e) {
+          result = `error: ${(e as Error).message}`
+        }
+        if (!result.startsWith('error') && p && EXCEL_MUTATORS.has(call.name)) {
+          changed.add(p); session.changed.add(p)
+          if (!existedBefore) session.created.add(p)
+        }
+        await send(`📊 ${call.name} ${p}`.slice(0, 300))
       } else if (EXTRA_TOOL_NAMES.has(call.name)) {
         try {
           const r = await runExtraTool(call.name, args, {
@@ -898,6 +1007,16 @@ async function handleStop(i: ChatInputCommandInteraction) {
   await i.reply('🛑 Đang dừng lượt hiện tại…')
 }
 
+async function handleDiscordPlan(i: ChatInputCommandInteraction) {
+  const session = agentSessions.get(i.channelId)
+  if (!session) { await replyNoSession(i); return }
+  session.planMode = !session.planMode
+  session.pendingPlan = undefined
+  await i.reply(session.planMode
+    ? '🧭 Plan mode BẬT: agent chỉ khảo sát (read-only) rồi trình plan để bạn Approve. Gõ `/plan` lần nữa để tắt.'
+    : '✅ Plan mode tắt — agent sửa file trực tiếp lại.')
+}
+
 async function handleContext(i: ChatInputCommandInteraction) {
   const session = agentSessions.get(i.channelId)
   if (!session) { await replyNoSession(i); return }
@@ -975,11 +1094,39 @@ client.on('interactionCreate', async (interaction) => {
         case 'stop': return void handleStop(interaction)
         case 'context': return void handleContext(interaction)
         case 'undo': return void handleUndo(interaction)
+        case 'plan': return void handleDiscordPlan(interaction)
       }
     } else if (interaction.isStringSelectMenu() && interaction.customId === 'browse') {
       return void handleBrowseSelect(interaction)
     } else if (interaction.isButton() && interaction.customId.startsWith('vibe-kill:')) {
       return void handleVibeKill(interaction)
+    } else if (interaction.isButton() && (interaction.customId.startsWith('plan-approve:') || interaction.customId.startsWith('plan-dismiss:'))) {
+      const { discord } = loadConfig()
+      if (!isAuthorized(interaction.user.id, interaction.channelId, discord)) {
+        await interaction.reply({ content: 'Không có quyền.', flags: MessageFlags.Ephemeral }); return
+      }
+      const approve = interaction.customId.startsWith('plan-approve:')
+      const channelId = interaction.customId.split(':')[1]
+      const session = agentSessions.get(channelId)
+      await interaction.update({ content: approve ? '✅ Plan approved — đang chạy…' : '🚫 Đã bỏ plan.', components: [] })
+      if (!session) return
+      if (!approve) { session.pendingPlan = undefined; return }
+      const plan = session.pendingPlan
+      session.pendingPlan = undefined
+      session.planMode = false // execute in normal agent mode
+      if (!plan || session.busy) return
+      const channel = interaction.channel
+      if (!channel?.isSendable()) return
+      session.busy = true
+      const post: Post = { text: (c) => channel.send(c), rich: (c, comp) => channel.send({ content: c, components: comp as never }) }
+      try {
+        await runAgentTurn(post, session, `Implement this approved plan, following it step by step:\n\n${plan}`, channelId)
+      } catch (e) {
+        await post.text(`❌ ${(e as Error).message}`.slice(0, 1900)).catch(() => {})
+      } finally {
+        session.busy = false
+      }
+      return
     } else if (interaction.isButton() && (interaction.customId.startsWith('extra-ok:') || interaction.customId.startsWith('extra-no:'))) {
       const { discord } = loadConfig()
       if (!isAuthorized(interaction.user.id, interaction.channelId, discord)) {
@@ -1022,7 +1169,7 @@ client.on('messageCreate', async (message) => {
     }
     if ('sendTyping' in channel) { channel.sendTyping().catch(() => {}) }
     try {
-      await runAgentTurn(post, session, content)
+      await runAgentTurn(post, session, content, message.channelId)
     } catch (e) {
       await post.text(`❌ ${(e as Error).message}`.slice(0, 1900)).catch(() => {})
     } finally {
