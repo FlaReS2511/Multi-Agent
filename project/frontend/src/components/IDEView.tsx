@@ -38,6 +38,8 @@ import { DiffReviewCard } from './DiffReviewCard'
 import { ConfirmDialog, ConfirmDialogSpec } from './ConfirmDialog'
 import { OrqonLogo } from './OrqonLogo'
 import { useAnimationsEnabled } from '../lib/uiSettings'
+import { toast } from '../lib/toast'
+import { computeLineDiff } from '../lib/lineDiff'
 import { useInlineAIEdit } from './useInlineAIEdit'
 import { activeAgents, AgentsConfig, colorFor, ModelOption, isResidentRole, PendingChange } from '../lib/api'
 
@@ -166,8 +168,13 @@ export function IDEView() {
 
   const editorRef = useRef<any>(null)
   const monacoRef = useRef<any>(null)
+  // Bumped when the (normal) Monaco editor mounts, so effects that need the
+  // editor instance re-run.
+  const [editorReady, setEditorReady] = useState(0)
   // The pulsing "agent revealed this line" decoration; cleared on any click/key.
   const revealDecoRef = useRef<any>(null)
+  // Git gutter decorations (added/modified/deleted vs HEAD) for the active tab.
+  const gitGutterRef = useRef<any>(null)
   const [availableModels, setAvailableModels] = useState<ModelOption[]>([])
 
   // Keep the editor sized in lockstep with the side-panel width animation, and
@@ -441,6 +448,93 @@ export function IDEView() {
     const timer = setInterval(checkFileOnDisk, 2000)
     return () => clearInterval(timer)
   }, [activeTab, fileContents, dirtyFiles])
+
+  // ── Git gutter: mark added/modified/deleted lines vs HEAD ──────────
+  // Recomputed (debounced) from the same before/after pair the DiffEditor
+  // uses, via the dependency-free LCS differ. Rendered as thin colored bars
+  // in Monaco's linesDecorations lane; deletions show a small red triangle.
+  useEffect(() => {
+    const ed = editorRef.current
+    const mon = monacoRef.current
+    if (!ed || !mon || !activeTab || diffMode) {
+      try { gitGutterRef.current?.clear() } catch { /* ignore */ }
+      return
+    }
+    const before = originalContents[activeTab]
+    const after = fileContents[activeTab]
+    const timer = setTimeout(() => {
+      try { gitGutterRef.current?.clear() } catch { /* ignore */ }
+      if (before == null || after == null || before === after) return
+      const rows = computeLineDiff(before, after)
+      const decos: { range: unknown; options: Record<string, unknown> }[] = []
+      let i = 0
+      while (i < rows.length) {
+        if (rows[i].kind === 'context') { i++; continue }
+        // Hunk: consecutive non-context rows.
+        const addLines: number[] = []
+        let delCount = 0
+        while (i < rows.length && rows[i].kind !== 'context') {
+          if (rows[i].kind === 'add' && rows[i].newNo) addLines.push(rows[i].newNo!)
+          else if (rows[i].kind === 'del') delCount++
+          i++
+        }
+        if (addLines.length > 0) {
+          const cls = delCount > 0 ? 'git-gutter-mod' : 'git-gutter-add'
+          // Compress consecutive line numbers into ranges.
+          let start = addLines[0]
+          let prev = addLines[0]
+          for (let k = 1; k <= addLines.length; k++) {
+            const cur = addLines[k]
+            if (cur !== prev + 1) {
+              decos.push({ range: new mon.Range(start, 1, prev, 1), options: { linesDecorationsClassName: cls } })
+              start = cur
+            }
+            prev = cur
+          }
+        } else if (delCount > 0) {
+          // Deletion-only hunk: mark the line where content was removed.
+          const line = rows[i]?.newNo ?? Math.max(1, after.split('\n').length)
+          decos.push({ range: new mon.Range(line, 1, line, 1), options: { linesDecorationsClassName: 'git-gutter-del' } })
+        }
+      }
+      if (decos.length) gitGutterRef.current = ed.createDecorationsCollection(decos)
+    }, 400)
+    return () => clearTimeout(timer)
+  }, [activeTab, fileContents, originalContents, diffMode, editorReady])
+
+  // Discard a file's uncommitted changes (Git panel) after confirmation.
+  const handleDiscardFile = useCallback((file: string) => {
+    setDialog({
+      title: `Discard changes in "${file.split('/').pop()}"?`,
+      message: `${file}\n\nThe file will be restored to its last committed state (untracked files are deleted).`,
+      buttons: [
+        {
+          label: 'Discard', kind: 'danger',
+          onClick: async () => {
+            setDialog(null)
+            const res = await window.api.workspaceGitRestoreFiles([file])
+            if (res.ok) {
+              toast(`Discarded changes in ${file.split('/').pop()}`, 'success')
+              // Reload the buffer if it's open.
+              const disk = await window.api.workspaceReadFile(file)
+              if (disk.ok) {
+                setFileContents((p) => ({ ...p, [file]: disk.content }))
+                setDirtyFiles((p) => ({ ...p, [file]: false }))
+              } else {
+                // Untracked file was deleted by the restore.
+                setOpenTabs((tabs) => tabs.filter((t) => t !== file))
+                setActiveTab((t) => (t === file ? null : t))
+              }
+              await refreshWorkspace()
+            } else {
+              toast(res.failed?.length ? `Could not discard: ${res.failed.join(', ')}` : 'Discard failed', 'error')
+            }
+          },
+        },
+        { label: 'Cancel', onClick: () => setDialog(null) },
+      ],
+    })
+  }, [refreshWorkspace])
 
   // Handle open a file
   const openFile = async (relPath: string) => {
@@ -848,6 +942,7 @@ export function IDEView() {
   const handleEditorDidMount = (editor: any, monaco: any) => {
     editorRef.current = editor
     monacoRef.current = monaco
+    setEditorReady((n) => n + 1)
     // Set custom HSL dark theme values
     monaco.editor.defineTheme('vscode-dark-harmony', {
       base: 'vs-dark',
@@ -1107,7 +1202,7 @@ export function IDEView() {
             )}
 
             {activeSidebar === 'git' && (
-              <GitPanel onOpenFile={openFile} onChanged={refreshWorkspace} />
+              <GitPanel onOpenFile={openFile} onChanged={refreshWorkspace} onDiscard={handleDiscardFile} />
             )}
 
             {activeSidebar === 'agents' && (

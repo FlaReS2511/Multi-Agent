@@ -158,6 +158,34 @@ html, body, #root {
   animation: plan-bottom-in 0.9s ease-out;
 }
 
+/* Git gutter — thin bars in Monaco's linesDecorations lane marking lines
+   changed vs HEAD: emerald = added, blue = modified, red triangle = deletion. */
+.git-gutter-add {
+  background: #10b981;
+  width: 3px !important;
+  margin-left: 4px;
+  border-radius: 2px;
+}
+.git-gutter-mod {
+  background: #3b82f6;
+  width: 3px !important;
+  margin-left: 4px;
+  border-radius: 2px;
+}
+.git-gutter-del {
+  width: 0 !important;
+  margin-left: 1px;
+  position: relative;
+}
+.git-gutter-del::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: -4px;
+  border: 5px solid transparent;
+  border-left: 7px solid #f43f5e;
+}
+
 /* Agent navigation (OpenFile with a line): pulse the target line bright↔dim
    like a warning so it's easy to spot. Keeps pulsing until the user clicks or
    types (JS removes the decoration then). Blue = distinct from the green

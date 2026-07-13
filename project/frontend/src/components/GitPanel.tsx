@@ -8,6 +8,7 @@ import {
   Minus,
   Check,
   RefreshCw,
+  Undo2,
 } from 'lucide-react'
 
 interface StatusEntry {
@@ -19,6 +20,8 @@ interface StatusEntry {
 interface Props {
   onOpenFile: (file: string) => void
   onChanged?: () => void
+  /** Discard a file's working-tree changes (confirmed by the host). */
+  onDiscard?: (file: string) => void
 }
 
 function basename(p: string): string {
@@ -45,7 +48,7 @@ function truncate(s: string, n = 200): string {
   return s.slice(0, n) + '…'
 }
 
-export function GitPanel({ onOpenFile, onChanged }: Props) {
+export function GitPanel({ onOpenFile, onChanged, onDiscard }: Props) {
   const [status, setStatus] = useState<StatusEntry[]>([])
   const [branch, setBranch] = useState<{ current: string; branches: string[] }>({
     current: '',
@@ -158,6 +161,15 @@ export function GitPanel({ onOpenFile, onChanged }: Props) {
           {dirname(entry.file)}
         </span>
       </button>
+      {!isStaged && onDiscard && (
+        <button
+          onClick={() => onDiscard(entry.file)}
+          title="Discard changes"
+          className="opacity-0 group-hover:opacity-100 text-zinc-400 hover:text-rose-400 shrink-0"
+        >
+          <Undo2 className="w-3.5 h-3.5" />
+        </button>
+      )}
       <button
         onClick={() => (isStaged ? unstage(entry.file) : stage(entry.file))}
         title={isStaged ? 'Unstage' : 'Stage'}
