@@ -1298,37 +1298,35 @@ export function IDEView() {
           smoothly alongside it. The inner content keeps a fixed width and is
           clipped by overflow-hidden, so it never reflows/repaints while the
           outer width animates (that clipping is what stops Monaco flicker). */}
-      <AnimatePresence>
-        {chatOpen && (
-          <motion.aside
-            className="relative border-l border-zinc-800 bg-zinc-950 flex-shrink-0 overflow-hidden"
-            initial={animationsOn ? { width: 0 } : false}
-            animate={{ width: chatWidth }}
-            exit={{ width: 0 }}
-            transition={{ duration: draggingChatRef.current ? 0 : 0.26, ease: 'easeInOut' }}
-            onAnimationStart={startLayoutSync}
-            onAnimationComplete={stopLayoutSync}
-          >
-            {/* Drag handle: resize the chat panel from its left edge. */}
-            <div
-              onMouseDown={startChatResize}
-              className="absolute left-0 top-0 h-full w-1.5 z-20 cursor-col-resize hover:bg-blue-500/50 transition-colors"
-              title="Drag to resize"
-            />
-            <div style={{ width: chatWidth }} className="h-full">
-              <ChatPanel
-                models={availableModels}
-                getContext={getChatContext}
-                onFileChanged={onAgentFileChanged}
-                onPendingChange={onPendingChange}
-                onChangeResolved={onChangeResolved}
-                onEditorRequest={onEditorRequest}
-                windup={animationsOn}
-              />
-            </div>
-          </motion.aside>
-        )}
-      </AnimatePresence>
+      {/* Always mounted (like the sidebar) so an in-flight agent run keeps
+          streaming when the user closes/reopens the chat — only the width
+          animates to 0. */}
+      <motion.aside
+        className="relative border-l border-zinc-800 bg-zinc-950 flex-shrink-0 overflow-hidden"
+        initial={false}
+        animate={{ width: chatOpen ? chatWidth : 0 }}
+        transition={{ duration: draggingChatRef.current ? 0 : 0.26, ease: 'easeInOut' }}
+        onAnimationStart={startLayoutSync}
+        onAnimationComplete={stopLayoutSync}
+      >
+        {/* Drag handle: resize the chat panel from its left edge. */}
+        <div
+          onMouseDown={startChatResize}
+          className="absolute left-0 top-0 h-full w-1.5 z-20 cursor-col-resize hover:bg-blue-500/50 transition-colors"
+          title="Drag to resize"
+        />
+        <div style={{ width: chatWidth }} className="h-full">
+          <ChatPanel
+            models={availableModels}
+            getContext={getChatContext}
+            onFileChanged={onAgentFileChanged}
+            onPendingChange={onPendingChange}
+            onChangeResolved={onChangeResolved}
+            onEditorRequest={onEditorRequest}
+            windup={animationsOn}
+          />
+        </div>
+      </motion.aside>
 
       <CommandPalette
         open={paletteOpen}

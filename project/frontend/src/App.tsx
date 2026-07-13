@@ -11,6 +11,7 @@ import { CostBadge } from './components/CostBadge'
 import { CostDashboardModal } from './components/CostDashboardModal'
 import { IDEView } from './components/IDEView'
 import { OrqonLogo } from './components/OrqonLogo'
+import { ToastHost } from './components/ToastHost'
 import { useAnimationsEnabled } from './lib/uiSettings'
 import { Task, InboxSummary, AgentsConfig, activeAgents } from './lib/api'
 
@@ -254,6 +255,7 @@ export default function App() {
         open={showCostDashboard}
         onClose={() => setShowCostDashboard(false)}
       />
+      <ToastHost />
     </div>
   )
 }
