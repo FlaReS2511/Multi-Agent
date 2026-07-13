@@ -177,6 +177,32 @@ export function IDEView() {
   // Bottom dock panel state
   const [isBottomOpen, setIsBottomOpen] = useState(true)
   const [bottomTab, setBottomTab] = useState<'terminal' | 'shell' | 'logs'>('terminal')
+
+  // Multiple user shells (tabs in the dock). All stay mounted (hidden when
+  // inactive) so their buffers survive switching.
+  const [shells, setShells] = useState<{ id: string; name: string }[]>([{ id: 'shell-1', name: 'shell 1' }])
+  const [activeShell, setActiveShell] = useState('shell-1')
+  const shellCounterRef = useRef(1)
+  const [renamingShell, setRenamingShell] = useState<string | null>(null)
+  const [shellNameDraft, setShellNameDraft] = useState('')
+
+  const addShell = () => {
+    const n = ++shellCounterRef.current
+    const id = `shell-${n}`
+    setShells((prev) => [...prev, { id, name: `shell ${n}` }])
+    setActiveShell(id)
+    setBottomTab('shell')
+    setIsBottomOpen(true)
+  }
+
+  const closeShell = (id: string) => {
+    window.api.shellKill(id).catch(() => {})
+    setShells((prev) => {
+      const next = prev.filter((s) => s.id !== id)
+      if (activeShell === id && next.length) setActiveShell(next[next.length - 1].id)
+      return next
+    })
+  }
   const [selectedAgent, setSelectedAgent] = useState<string>('orchestrator')
   const [agentsConfig, setAgentsConfig] = useState<AgentsConfig | null>(null)
   const [agentLogs, setAgentLogs] = useState<Record<string, string[]>>({})
@@ -1583,6 +1609,58 @@ export function IDEView() {
                 </span>
               </button>
 
+              {/* Shell tabs: switch / rename (double-click) / close / add */}
+              {bottomTab === 'shell' && isBottomOpen && (
+                <div className="flex items-center gap-1 pl-1 border-l border-zinc-800">
+                  {shells.map((s) => (
+                    <div
+                      key={s.id}
+                      onClick={() => setActiveShell(s.id)}
+                      onDoubleClick={() => { setRenamingShell(s.id); setShellNameDraft(s.name) }}
+                      className={`group/shell flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-mono cursor-pointer ${
+                        s.id === activeShell ? 'bg-zinc-800 text-zinc-100' : 'text-zinc-500 hover:text-zinc-300'
+                      }`}
+                    >
+                      {renamingShell === s.id ? (
+                        <input
+                          autoFocus
+                          value={shellNameDraft}
+                          onChange={(e) => setShellNameDraft(e.target.value)}
+                          onClick={(e) => e.stopPropagation()}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') {
+                              const name = shellNameDraft.trim()
+                              if (name) setShells((prev) => prev.map((x) => (x.id === s.id ? { ...x, name } : x)))
+                              setRenamingShell(null)
+                            } else if (e.key === 'Escape') setRenamingShell(null)
+                            e.stopPropagation()
+                          }}
+                          onBlur={() => setRenamingShell(null)}
+                          className="w-16 px-1 bg-zinc-950 border border-blue-500/60 rounded text-[10px] text-zinc-100 focus:outline-none"
+                        />
+                      ) : (
+                        <span>{s.name}</span>
+                      )}
+                      {shells.length > 1 && (
+                        <button
+                          onClick={(e) => { e.stopPropagation(); closeShell(s.id) }}
+                          className="opacity-0 group-hover/shell:opacity-100 text-zinc-600 hover:text-rose-400"
+                        >
+                          <X size={9} />
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                  <button
+                    onClick={addShell}
+                    title="New terminal"
+                    className="px-1 text-zinc-500 hover:text-zinc-200 text-xs leading-none"
+                  >
+                    +
+                  </button>
+                </div>
+              )}
+
               <button
                 onClick={() => {
                   setBottomTab('logs')
@@ -1629,7 +1707,15 @@ export function IDEView() {
                 </div>
               ) : bottomTab === 'shell' ? (
                 <div className="h-full w-full relative">
-                  <ShellTerminal id="main-shell" active={isBottomOpen && bottomTab === 'shell'} />
+                  {shells.map((s) => (
+                    <div
+                      key={s.id}
+                      className="absolute inset-0"
+                      style={{ display: s.id === activeShell ? 'block' : 'none' }}
+                    >
+                      <ShellTerminal id={s.id} active={isBottomOpen && bottomTab === 'shell' && s.id === activeShell} />
+                    </div>
+                  ))}
                 </div>
               ) : (
                 <div className="h-full w-full bg-zinc-950 p-2 overflow-y-auto font-mono text-[11px] text-zinc-400 select-text scrollbar-thin">

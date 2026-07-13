@@ -122,7 +122,7 @@ const api = {
   workspaceDelete: (relPath: string) => ipcRenderer.invoke('workspace-delete', relPath),
 
   // Search
-  workspaceSearch: (query: string, opts?: { caseSensitive?: boolean; regex?: boolean; maxResults?: number }) =>
+  workspaceSearch: (query: string, opts?: { caseSensitive?: boolean; regex?: boolean; maxResults?: number; include?: string; exclude?: string }) =>
     ipcRenderer.invoke('workspace-search', query, opts),
   workspaceReplaceInFile: (relPath: string, find: string, replace: string, opts?: { regex?: boolean; caseSensitive?: boolean }) =>
     ipcRenderer.invoke('workspace-replace-in-file', relPath, find, replace, opts),
