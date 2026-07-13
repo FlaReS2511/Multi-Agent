@@ -1664,6 +1664,7 @@ export function IDEView() {
             onChangeResolved={onChangeResolved}
             onEditorRequest={onEditorRequest}
             windup={animationsOn}
+            files={flatFiles}
             onRunStateChange={setAgentBusy}
             onContextUsage={setChatCtxUsage}
             onRunFinished={(info) => {

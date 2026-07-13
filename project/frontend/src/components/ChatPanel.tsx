@@ -14,7 +14,7 @@ import {
   FileText, FilePen, FilePlus2, Search, FolderSearch, Wrench, CheckCircle2, XCircle, ShieldCheck,
   TerminalSquare, ListPlus, Boxes, Undo2, AlertTriangle,
   GitBranch, GitCommitHorizontal, GitPullRequestArrow, UserCog, Globe, ListChecks, FolderTree, Trash, FileInput,
-  History, Plus, Archive, Telescope, Copy, Check,
+  History, Plus, Archive, Telescope, Copy, Check, ArrowDown, Pencil, AtSign,
 } from 'lucide-react'
 import { ModelOption, IdeAgentEvent, PendingChange, PendingAction, AgentTodo, AgentSessionMeta } from '../lib/api'
 
@@ -156,6 +156,8 @@ interface Props {
   // Fired when an agent run reaches a terminal state (for toast/badge when
   // the chat panel is closed).
   onRunFinished?: (info: { kind: 'done' | 'error' | 'blocked' | 'plan' }) => void
+  // Workspace file list for @file mentions (relPaths).
+  files?: string[]
 }
 
 // Wind-up choreography: the frame slides open first (handled by the parent),
@@ -171,7 +173,7 @@ const itemVariants = {
   show: { opacity: 1, y: 0, transition: { duration: 0.28, ease: 'easeOut' } },
 }
 
-export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, onChangeResolved, onEditorRequest, windup = true, onRunStateChange, onContextUsage, onRunFinished }: Props) {
+export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, onChangeResolved, onEditorRequest, windup = true, onRunStateChange, onContextUsage, onRunFinished, files = [] }: Props) {
   const [mode, setMode] = useState<'ask' | 'agent'>('ask')
   // Plan mode is a toggle WITHIN agent mode (via /plan): runs read-only and
   // presents a plan to approve instead of editing directly.
@@ -239,9 +241,25 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
     }
   }, [models, provider])
 
-  // Auto-scroll to the bottom as content streams in.
+  // Scroll pinning: auto-scroll while the user is at the bottom; once they
+  // scroll up to read, streaming no longer yanks the view down. A floating ↓
+  // button jumps back (and re-pins).
+  const [atBottom, setAtBottom] = useState(true)
+  const atBottomRef = useRef(true)
+  const handleTranscriptScroll = () => {
+    const el = scrollRef.current
+    if (!el) return
+    const near = el.scrollHeight - el.scrollTop - el.clientHeight < 60
+    atBottomRef.current = near
+    setAtBottom(near)
+  }
+  const jumpToBottom = () => {
+    atBottomRef.current = true
+    setAtBottom(true)
+    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' })
+  }
   useEffect(() => {
-    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight })
+    if (atBottomRef.current) scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight })
   }, [messages, agentItems, streaming])
 
   // Load the persisted review-mode preference once.
@@ -323,6 +341,18 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
   const deleteSession = async (id: number) => {
     try { await window.api.agentSessionDelete(id) } catch { /* ignore */ }
     if (sessionIdRef.current === id) newSession()
+    refreshSessions()
+  }
+
+  // Inline session rename (pencil in the History dropdown).
+  const [renamingSession, setRenamingSession] = useState<number | null>(null)
+  const [renameValue, setRenameValue] = useState('')
+  const commitRename = async () => {
+    const id = renamingSession
+    const title = renameValue.trim()
+    setRenamingSession(null)
+    if (id == null || !title) return
+    try { await window.api.agentSessionRename(id, title) } catch { /* ignore */ }
     refreshSessions()
   }
 
@@ -410,11 +440,23 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
   const providerIds = Array.from(new Set(models.map((m) => m.provider)))
   const providerModels = models.filter((m) => m.provider === provider)
 
-  const send = () => {
+  const send = async () => {
     const text = input.trim()
     if (!text || streaming) return
 
     const ctx = useFileContext ? getContext() : null
+
+    // Attach @mentioned workspace files as extra context (ask mode).
+    const mentionFiles: { path: string; language?: string; content: string }[] = []
+    for (const rel of extractMentions(text)) {
+      if (ctx && ctx.path === rel) continue // already attached as the open file
+      try {
+        const disk = await window.api.workspaceReadFile(rel)
+        if (disk.ok) {
+          mentionFiles.push({ path: rel, content: disk.content.slice(0, 12000) })
+        }
+      } catch { /* skip */ }
+    }
     const nextMessages: Msg[] = [...messages, { role: 'user', content: text }]
     setMessages([...nextMessages, { role: 'assistant', content: '' }])
     setInput('')
@@ -450,11 +492,15 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
       }
     })
 
+    const contextFiles = [
+      ...(ctx ? [{ path: ctx.path, language: ctx.language, content: ctx.content }] : []),
+      ...mentionFiles,
+    ]
     window.api.aiChat(requestId, {
       provider,
       model: model || undefined,
       messages: nextMessages,
-      contextFiles: ctx ? [{ path: ctx.path, language: ctx.language, content: ctx.content }] : undefined,
+      contextFiles: contextFiles.length ? contextFiles : undefined,
       selection: ctx?.selection,
     })
   }
@@ -710,6 +756,47 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
   // Reset selection/dismissal whenever the query changes.
   useEffect(() => { setSlashIndex(0); setSlashDismissed(false) }, [slashQuery])
 
+  // ── @file mention popup ─────────────────────────────────────────
+  // Typing "@token" at the end of the input opens a fuzzy file picker; picking
+  // inserts "@path ". In ask mode the mentioned files are attached as context
+  // at send time; in agent mode the agent Reads them itself.
+  const [mentionIndex, setMentionIndex] = useState(0)
+  const [mentionDismissed, setMentionDismissed] = useState(false)
+  const mentionMatch = /(^|\s)@([^\s@]*)$/.exec(input)
+  const mentionQuery = mentionMatch ? mentionMatch[2].toLowerCase() : null
+  const mentionMatches = mentionQuery != null
+    ? files
+        .filter((f) => f.toLowerCase().includes(mentionQuery))
+        .sort((a, b) => {
+          const ab = a.split('/').pop()!.toLowerCase().startsWith(mentionQuery) ? 0 : 1
+          const bb = b.split('/').pop()!.toLowerCase().startsWith(mentionQuery) ? 0 : 1
+          return ab - bb || a.length - b.length
+        })
+        .slice(0, 8)
+    : []
+  const mentionOpen = mentionMatches.length > 0 && !mentionDismissed
+  const mentionSel = Math.min(mentionIndex, Math.max(0, mentionMatches.length - 1))
+  useEffect(() => { setMentionIndex(0); setMentionDismissed(false) }, [mentionQuery])
+
+  const pickMention = (path: string) => {
+    setInput((cur) => cur.replace(/(^|\s)@[^\s@]*$/, (_m, pre) => `${pre}@${path} `))
+  }
+
+  // Insert an "@path " mention (used by drag-drop from the file tree).
+  const insertMention = (path: string) => {
+    setInput((cur) => `${cur}${cur && !cur.endsWith(' ') ? ' ' : ''}@${path} `)
+  }
+
+  // Extract mentioned workspace files from a prompt (known files only).
+  const extractMentions = (text: string): string[] => {
+    const known = new Set(files)
+    const out: string[] = []
+    for (const m of text.matchAll(/@([^\s@]+)/g)) {
+      if (known.has(m[1]) && !out.includes(m[1])) out.push(m[1])
+    }
+    return out.slice(0, 5)
+  }
+
   // Plan and research are mutually exclusive read-only modes.
   const togglePlan = () => { const next = !planMode; setPlanMode(next); if (next) setResearchMode(false) }
   const toggleResearch = () => { const next = !researchMode; setResearchMode(next); if (next) setPlanMode(false) }
@@ -850,10 +937,33 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
                           className={`group flex items-center gap-1.5 px-2.5 py-1.5 hover:bg-zinc-800/60 cursor-pointer ${
                             s.id === sessionId ? 'bg-zinc-800/40' : ''
                           }`}
-                          onClick={() => loadSession(s.id)}
+                          onClick={() => { if (renamingSession !== s.id) loadSession(s.id) }}
                         >
-                          <span className="flex-1 min-w-0 truncate text-[11px] text-zinc-300">{s.title}</span>
+                          {renamingSession === s.id ? (
+                            <input
+                              autoFocus
+                              value={renameValue}
+                              onChange={(e) => setRenameValue(e.target.value)}
+                              onClick={(e) => e.stopPropagation()}
+                              onKeyDown={(e) => {
+                                if (e.key === 'Enter') { e.preventDefault(); commitRename() }
+                                else if (e.key === 'Escape') { e.preventDefault(); setRenamingSession(null) }
+                                e.stopPropagation()
+                              }}
+                              onBlur={() => setRenamingSession(null)}
+                              className="flex-1 min-w-0 px-1 py-0.5 bg-zinc-950 border border-blue-500/60 rounded text-[11px] text-zinc-100 focus:outline-none"
+                            />
+                          ) : (
+                            <span className="flex-1 min-w-0 truncate text-[11px] text-zinc-300">{s.title}</span>
+                          )}
                           <span className="text-[9px] text-zinc-600 flex-shrink-0">{s.updated_at.slice(5, 16)}</span>
+                          <button
+                            onClick={(e) => { e.stopPropagation(); setRenamingSession(s.id); setRenameValue(s.title) }}
+                            title="Rename session"
+                            className="opacity-0 group-hover:opacity-100 text-zinc-600 hover:text-zinc-200 flex-shrink-0"
+                          >
+                            <Pencil size={11} />
+                          </button>
                           <button
                             onClick={(e) => { e.stopPropagation(); deleteSession(s.id) }}
                             title="Delete session"
@@ -881,9 +991,20 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
       </motion.div>
 
       {/* Messages */}
+      <div className="relative flex-1 min-h-0 flex flex-col">
+      {!atBottom && (
+        <button
+          onClick={jumpToBottom}
+          title="Jump to latest"
+          className="absolute bottom-3 right-3 z-30 p-1.5 rounded-full bg-zinc-800/95 border border-zinc-600 text-zinc-300 hover:text-white hover:border-zinc-500 shadow-lg"
+        >
+          <ArrowDown size={13} />
+        </button>
+      )}
       <motion.div
         variants={windup ? itemVariants : undefined}
         ref={scrollRef}
+        onScroll={handleTranscriptScroll}
         className="flex-1 min-h-0 overflow-y-auto px-3 py-3 space-y-4"
       >
         {mode === 'ask' ? (
@@ -932,6 +1053,7 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
           </>
         )}
       </motion.div>
+      </div>
 
       {/* Thinking dock — reasoning lives here, not in the chat flow */}
       {mode !== 'ask' && latestReasoning && (
@@ -1127,10 +1249,40 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
               ))}
             </div>
           )}
+          {mentionOpen && !slashOpen && (
+            <div className="absolute bottom-full left-0 right-0 mb-1 z-20 bg-zinc-900 border border-zinc-700 rounded-md shadow-xl overflow-hidden">
+              <div className="px-2 py-1 text-[9px] uppercase tracking-wider text-zinc-600 border-b border-zinc-800 flex items-center gap-1">
+                <AtSign size={9} /> Attach file
+              </div>
+              {mentionMatches.map((f, i) => (
+                <button
+                  key={f}
+                  type="button"
+                  onMouseDown={(e) => { e.preventDefault(); pickMention(f) }}
+                  onMouseEnter={() => setMentionIndex(i)}
+                  className={`w-full flex items-baseline gap-2 px-2 py-1.5 text-left ${i === mentionSel ? 'bg-blue-600/20' : 'hover:bg-zinc-800/60'}`}
+                >
+                  <span className="text-xs font-mono text-blue-300 flex-shrink-0">{f.split('/').pop()}</span>
+                  <span className="text-[10px] text-zinc-500 truncate">{f}</span>
+                </button>
+              ))}
+            </div>
+          )}
           <textarea
             value={input}
             onChange={(e) => setInput(e.target.value)}
+            onDragOver={(e) => { if (e.dataTransfer.types.includes('text/orqon-path')) e.preventDefault() }}
+            onDrop={(e) => {
+              const p = e.dataTransfer.getData('text/orqon-path')
+              if (p) { e.preventDefault(); insertMention(p) }
+            }}
             onKeyDown={(e) => {
+              if (mentionOpen && !slashOpen) {
+                if (e.key === 'ArrowDown') { e.preventDefault(); setMentionIndex((i) => Math.min(i + 1, mentionMatches.length - 1)); return }
+                if (e.key === 'ArrowUp') { e.preventDefault(); setMentionIndex((i) => Math.max(i - 1, 0)); return }
+                if (e.key === 'Escape') { e.preventDefault(); setMentionDismissed(true); return }
+                if (e.key === 'Tab' || (e.key === 'Enter' && !e.shiftKey)) { e.preventDefault(); pickMention(mentionMatches[mentionSel]); return }
+              }
               if (slashOpen) {
                 if (e.key === 'ArrowDown') { e.preventDefault(); setSlashIndex((i) => Math.min(i + 1, slashMatches.length - 1)); return }
                 if (e.key === 'ArrowUp') { e.preventDefault(); setSlashIndex((i) => Math.max(i - 1, 0)); return }
@@ -1265,6 +1417,29 @@ function CopyButton({ getText }: { getText: () => string }) {
   )
 }
 
+// Fenced code block with its own hover copy button (copies just the code).
+function PreBlock(props: React.HTMLAttributes<HTMLPreElement>) {
+  const preRef = useRef<HTMLPreElement>(null)
+  const [copied, setCopied] = useState(false)
+  return (
+    <div className="relative group/code">
+      <pre ref={preRef} {...props} />
+      <button
+        onClick={() => {
+          const code = preRef.current?.innerText ?? ''
+          navigator.clipboard.writeText(code)
+            .then(() => { setCopied(true); setTimeout(() => setCopied(false), 1200) })
+            .catch(() => {})
+        }}
+        title="Copy code"
+        className="absolute top-1.5 right-1.5 p-1 rounded bg-zinc-800/90 border border-zinc-700 text-zinc-400 hover:text-zinc-100 opacity-0 group-hover/code:opacity-100 transition-opacity"
+      >
+        {copied ? <Check size={11} className="text-emerald-400" /> : <Copy size={11} />}
+      </button>
+    </div>
+  )
+}
+
 // Full markdown renderer (GFM: tables, lists, code, links, headings, hr…).
 // Styling lives in `.md-body` in index.css; wide tables/code scroll inside the
 // bubble so nothing overflows.
@@ -1273,7 +1448,10 @@ function MessageContent({ text }: { text: string }) {
     <div className="md-body">
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
-        components={{ a: ({ node: _n, ...p }) => <a {...p} target="_blank" rel="noreferrer" /> }}
+        components={{
+          a: ({ node: _n, ...p }) => <a {...p} target="_blank" rel="noreferrer" />,
+          pre: ({ node: _n, ...p }) => <PreBlock {...p} />,
+        }}
       >
         {text}
       </ReactMarkdown>
