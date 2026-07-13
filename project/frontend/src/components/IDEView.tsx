@@ -21,6 +21,8 @@ import {
   FilePlus,
   FolderPlus,
   Boxes,
+  Crosshair,
+  ChevronsDownUp,
 } from 'lucide-react'
 import { IDEFileTree } from './IDEFileTree'
 import { AgentTerminal } from './AgentTerminal'
@@ -715,48 +717,79 @@ export function IDEView() {
     }
   }
 
-  // ── File operations (create / rename / delete) ──────────────
-  const createFilePrompt = useCallback(async (parentDir: string) => {
-    const name = window.prompt(`New file name${parentDir ? ' in ' + parentDir : ''}:`)
-    if (!name) return
+  // ── File operations (inline create / rename / move / delete) ──────────────
+  // Inline-create request forwarded to the tree (input row appears in place).
+  const [createReq, setCreateReq] = useState<{ parentDir: string; isDir: boolean; nonce: number } | null>(null)
+  const [revealNonce, setRevealNonce] = useState(0)
+  const [collapseNonce, setCollapseNonce] = useState(0)
+
+  // Header buttons / palette: open the inline-create input in the explorer.
+  const createFilePrompt = useCallback((parentDir: string) => {
+    setActiveSidebar('explorer'); setIsSidebarOpen(true)
+    setCreateReq({ parentDir, isDir: false, nonce: Date.now() })
+  }, [])
+
+  const createFolderPrompt = useCallback((parentDir: string) => {
+    setActiveSidebar('explorer'); setIsSidebarOpen(true)
+    setCreateReq({ parentDir, isDir: true, nonce: Date.now() })
+  }, [])
+
+  const handleCreateCommit = useCallback(async (parentDir: string, name: string, isDir: boolean) => {
     const rel = parentDir ? `${parentDir}/${name}` : name
-    const res = await window.api.workspaceCreateFile(rel)
+    const res = isDir
+      ? await window.api.workspaceCreateFolder(rel)
+      : await window.api.workspaceCreateFile(rel)
     if (!res.ok) { alert(res.error); return }
     await refreshWorkspace()
-    openFile(rel)
+    if (!isDir) openFile(rel)
   }, [refreshWorkspace])
 
-  const createFolderPrompt = useCallback(async (parentDir: string) => {
-    const name = window.prompt(`New folder name${parentDir ? ' in ' + parentDir : ''}:`)
-    if (!name) return
-    const rel = parentDir ? `${parentDir}/${name}` : name
-    const res = await window.api.workspaceCreateFolder(rel)
-    if (!res.ok) { alert(res.error); return }
-    await refreshWorkspace()
-  }, [refreshWorkspace])
-
-  const renamePrompt = useCallback(async (relPath: string) => {
-    const parts = relPath.split('/')
-    const cur = parts[parts.length - 1]
-    const next = window.prompt('Rename to:', cur)
-    if (!next || next === cur) return
-    parts[parts.length - 1] = next
-    const toRel = parts.join('/')
+  // Rename a file/folder (or move it via toRel override) and fix open tabs.
+  const applyRename = useCallback(async (relPath: string, toRel: string) => {
     const res = await window.api.workspaceRename(relPath, toRel)
     if (!res.ok) { alert(res.error); return }
-    // Update any open tab pointing at the renamed file.
-    setOpenTabs((tabs) => tabs.map((t) => (t === relPath ? toRel : t)))
-    setActiveTab((t) => (t === relPath ? toRel : t))
+    // Update any open tab pointing at the renamed file or inside the folder.
+    const remap = (t: string) =>
+      t === relPath ? toRel : t.startsWith(relPath + '/') ? toRel + t.slice(relPath.length) : t
+    setOpenTabs((tabs) => tabs.map(remap))
+    setActiveTab((t) => (t ? remap(t) : t))
+    setFileContents((prev) => Object.fromEntries(Object.entries(prev).map(([k, v]) => [remap(k), v])))
+    setOriginalContents((prev) => Object.fromEntries(Object.entries(prev).map(([k, v]) => [remap(k), v])))
+    setDirtyFiles((prev) => Object.fromEntries(Object.entries(prev).map(([k, v]) => [remap(k), v])))
     await refreshWorkspace()
   }, [refreshWorkspace])
 
-  const deletePrompt = useCallback(async (relPath: string) => {
-    if (!window.confirm(`Delete "${relPath}"? This cannot be undone.`)) return
-    const res = await window.api.workspaceDelete(relPath)
-    if (!res.ok) { alert(res.error); return }
-    setOpenTabs((tabs) => tabs.filter((t) => t !== relPath))
-    setActiveTab((t) => (t === relPath ? null : t))
-    await refreshWorkspace()
+  const handleRenameCommit = useCallback(async (relPath: string, newName: string) => {
+    const parts = relPath.split('/')
+    parts[parts.length - 1] = newName
+    await applyRename(relPath, parts.join('/'))
+  }, [applyRename])
+
+  // Drag-drop move into a directory ('' = workspace root).
+  const handleMove = useCallback(async (fromRel: string, toDir: string) => {
+    const base = fromRel.split('/').pop()!
+    await applyRename(fromRel, toDir ? `${toDir}/${base}` : base)
+  }, [applyRename])
+
+  const deletePrompt = useCallback((relPath: string) => {
+    setDialog({
+      title: `Delete "${relPath.split('/').pop()}"?`,
+      message: `${relPath}\n\nThis cannot be undone.`,
+      buttons: [
+        {
+          label: 'Delete', kind: 'danger',
+          onClick: async () => {
+            setDialog(null)
+            const res = await window.api.workspaceDelete(relPath)
+            if (!res.ok) { alert(res.error); return }
+            setOpenTabs((tabs) => tabs.filter((t) => t !== relPath && !t.startsWith(relPath + '/')))
+            setActiveTab((t) => (t === relPath || t?.startsWith(relPath + '/') ? null : t))
+            await refreshWorkspace()
+          },
+        },
+        { label: 'Cancel', onClick: () => setDialog(null) },
+      ],
+    })
   }, [refreshWorkspace])
 
   // Keyboard shortcuts: save / save-all, close / reopen tab, palette, search.
@@ -1026,6 +1059,12 @@ export function IDEView() {
                   <button onClick={() => createFolderPrompt('')} title="New Folder" className="text-zinc-500 hover:text-zinc-200 p-0.5">
                     <FolderPlus size={13} />
                   </button>
+                  <button onClick={() => setRevealNonce((n) => n + 1)} title="Reveal Active File" className="text-zinc-500 hover:text-zinc-200 p-0.5">
+                    <Crosshair size={12} />
+                  </button>
+                  <button onClick={() => setCollapseNonce((n) => n + 1)} title="Collapse All" className="text-zinc-500 hover:text-zinc-200 p-0.5">
+                    <ChevronsDownUp size={12} />
+                  </button>
                   <button onClick={refreshWorkspace} title="Refresh" className="text-zinc-500 hover:text-zinc-200 p-0.5">
                     <RefreshCw size={12} className={loadingWorkspace ? 'animate-spin text-blue-400' : ''} />
                   </button>
@@ -1053,10 +1092,13 @@ export function IDEView() {
                 selectedFile={activeTab}
                 onSelectFile={openFile}
                 gitChanges={gitChanges}
-                onRename={renamePrompt}
+                onRenameCommit={handleRenameCommit}
                 onDelete={deletePrompt}
-                onNewFile={createFilePrompt}
-                onNewFolder={createFolderPrompt}
+                onCreateCommit={handleCreateCommit}
+                onMove={handleMove}
+                createRequest={createReq}
+                revealNonce={revealNonce}
+                collapseNonce={collapseNonce}
               />
             )}
 
