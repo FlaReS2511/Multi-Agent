@@ -33,6 +33,7 @@ import { CommandPalette, Command } from './CommandPalette'
 import { ChatPanel } from './ChatPanel'
 import { GroupsPanel } from './GroupsPanel'
 import { DiffReviewCard } from './DiffReviewCard'
+import { ConfirmDialog, ConfirmDialogSpec } from './ConfirmDialog'
 import { OrqonLogo } from './OrqonLogo'
 import { useAnimationsEnabled } from '../lib/uiSettings'
 import { useInlineAIEdit } from './useInlineAIEdit'
@@ -126,6 +127,7 @@ export function IDEView() {
 
   // Workspace root
   const [workspaceName, setWorkspaceName] = useState<string>('')
+  const [workspaceRootPath, setWorkspaceRootPath] = useState<string>('')
   const [recentWorkspaces, setRecentWorkspaces] = useState<string[]>([])
   const [showWorkspaceMenu, setShowWorkspaceMenu] = useState(false)
 
@@ -137,7 +139,13 @@ export function IDEView() {
   // Editor Tabs State
   const [openTabs, setOpenTabs] = useState<string[]>([])
   const [activeTab, setActiveTab] = useState<string | null>(null)
-  
+  // Recently closed tabs (Cmd+Shift+T reopens), newest last.
+  const closedTabsRef = useRef<string[]>([])
+  // Tab currently being drag-reordered.
+  const dragTabRef = useRef<string | null>(null)
+  // Shared confirm dialog (dirty-close, deletes, discards).
+  const [dialog, setDialog] = useState<ConfirmDialogSpec | null>(null)
+
   // File Contents State
   const [fileContents, setFileContents] = useState<Record<string, string>>({})
   const [originalContents, setOriginalContents] = useState<Record<string, string>>({})
@@ -268,14 +276,62 @@ export function IDEView() {
     setGitChanges(changes)
   }
 
-  // Load workspace root info
-  const loadWorkspaceInfo = useCallback(async () => {
+  // Load workspace root info. Returns the root path (session-restore key).
+  const loadWorkspaceInfo = useCallback(async (): Promise<string> => {
     const info = await window.api.workspaceGetRoot()
     setWorkspaceName(info.name)
+    setWorkspaceRootPath(info.root)
     setRecentWorkspaces(info.recent ?? [])
+    return info.root
   }, [])
 
-  // Switch to a different workspace folder, then reset editor state.
+  // ── Session restore (per-workspace) ─────────────────────────
+  // Open tabs + layout are persisted per workspace root so a restart (or a
+  // workspace switch) puts the IDE back exactly where it was.
+  interface WorkspaceSession {
+    openTabs: string[]
+    activeTab: string | null
+    activeSidebar: typeof activeSidebar
+    isSidebarOpen: boolean
+    chatOpen: boolean
+    bottomTab: typeof bottomTab
+    isBottomOpen: boolean
+  }
+  // Gate persisting until the initial restore ran, so an early render doesn't
+  // overwrite the saved session with empty state.
+  const sessionReadyRef = useRef(false)
+
+  const restoreSession = useCallback(async (root: string) => {
+    try {
+      const raw = localStorage.getItem('orqon.session.' + root)
+      if (!raw) return
+      const s = JSON.parse(raw) as Partial<WorkspaceSession>
+      if (s.activeSidebar) setActiveSidebar(s.activeSidebar)
+      if (typeof s.isSidebarOpen === 'boolean') setIsSidebarOpen(s.isSidebarOpen)
+      if (typeof s.chatOpen === 'boolean') setChatOpen(s.chatOpen)
+      if (s.bottomTab) setBottomTab(s.bottomTab)
+      if (typeof s.isBottomOpen === 'boolean') setIsBottomOpen(s.isBottomOpen)
+      // Reopen tabs that still exist on disk.
+      const tabs: string[] = []
+      for (const t of s.openTabs ?? []) {
+        try {
+          const disk = await window.api.workspaceReadFile(t)
+          if (!disk.ok) continue
+          tabs.push(t)
+          setFileContents((p) => ({ ...p, [t]: disk.content }))
+          const head = await window.api.workspaceGitShowHead(t)
+          setOriginalContents((p) => ({ ...p, [t]: head.ok ? head.content : '' }))
+        } catch { /* skip */ }
+      }
+      if (tabs.length) {
+        setOpenTabs(tabs)
+        setActiveTab(s.activeTab && tabs.includes(s.activeTab) ? s.activeTab : tabs[tabs.length - 1])
+      }
+    } catch { /* corrupted session — start clean */ }
+  }, [])
+
+  // Switch to a different workspace folder, then reset editor state and
+  // restore that workspace's own session.
   const switchWorkspace = useCallback(async (dir?: string) => {
     const res = dir
       ? await window.api.workspaceSetRoot(dir)
@@ -287,9 +343,11 @@ export function IDEView() {
     setFileContents({})
     setOriginalContents({})
     setDirtyFiles({})
-    await loadWorkspaceInfo()
+    closedTabsRef.current = []
+    const root = await loadWorkspaceInfo()
     await refreshWorkspace()
-  }, [loadWorkspaceInfo])
+    if (root) await restoreSession(root)
+  }, [loadWorkspaceInfo, restoreSession])
 
   // Load agents config to get the list of active agents
   useEffect(() => {
@@ -297,9 +355,29 @@ export function IDEView() {
       setAgentsConfig(cfg)
       setAvailableModels(cfg.available_models ?? [])
     })
-    loadWorkspaceInfo()
+    loadWorkspaceInfo().then(async (root) => {
+      if (root && !sessionReadyRef.current) {
+        await restoreSession(root)
+        sessionReadyRef.current = true
+      }
+    })
     refreshWorkspace()
-  }, [refreshWorkspace, loadWorkspaceInfo])
+  }, [refreshWorkspace, loadWorkspaceInfo, restoreSession])
+
+  // Persist the session (debounced) whenever layout/tabs change.
+  useEffect(() => {
+    if (!workspaceRootPath || !sessionReadyRef.current) return
+    const timer = setTimeout(() => {
+      const s: WorkspaceSession = { openTabs, activeTab, activeSidebar, isSidebarOpen, chatOpen, bottomTab, isBottomOpen }
+      try { localStorage.setItem('orqon.session.' + workspaceRootPath, JSON.stringify(s)) } catch { /* ignore */ }
+    }, 400)
+    return () => clearTimeout(timer)
+  }, [workspaceRootPath, openTabs, activeTab, activeSidebar, isSidebarOpen, chatOpen, bottomTab, isBottomOpen])
+
+  // Window title reflects the workspace.
+  useEffect(() => {
+    document.title = workspaceName ? `${workspaceName} — Orqon` : 'Orqon'
+  }, [workspaceName])
 
   // Get active agents list
   const agentsList = activeAgents(agentsConfig)
@@ -558,19 +636,50 @@ export function IDEView() {
   const [paletteOpen, setPaletteOpen] = useState(false)
   const [paletteMode, setPaletteMode] = useState<'commands' | 'files'>('files')
 
-  // Handle close tab
-  const closeTab = (e: React.MouseEvent, relPath: string) => {
-    e.stopPropagation()
+  // Close a tab unconditionally (dirty state already resolved by the caller).
+  const doCloseTab = (relPath: string) => {
     const nextTabs = openTabs.filter((t) => t !== relPath)
     setOpenTabs(nextTabs)
-
     if (activeTab === relPath) {
-      if (nextTabs.length > 0) {
-        setActiveTab(nextTabs[nextTabs.length - 1])
-      } else {
-        setActiveTab(null)
-      }
+      setActiveTab(nextTabs.length > 0 ? nextTabs[nextTabs.length - 1] : null)
     }
+    closedTabsRef.current = [...closedTabsRef.current.filter((t) => t !== relPath), relPath].slice(-10)
+    // Drop the dirty flag so a later reopen re-reads from disk cleanly.
+    setDirtyFiles((prev) => {
+      const next = { ...prev }
+      delete next[relPath]
+      return next
+    })
+  }
+
+  // Close a tab, guarding unsaved changes with a Save / Discard / Cancel dialog.
+  const requestCloseTab = (relPath: string) => {
+    if (!dirtyFiles[relPath]) { doCloseTab(relPath); return }
+    const name = relPath.split('/').pop()
+    setDialog({
+      title: `Close "${name}"?`,
+      message: 'This file has unsaved changes.',
+      buttons: [
+        {
+          label: 'Save & Close', kind: 'primary',
+          onClick: async () => {
+            setDialog(null)
+            if (await saveFile(relPath)) doCloseTab(relPath)
+          },
+        },
+        {
+          label: 'Discard', kind: 'danger',
+          onClick: () => { setDialog(null); doCloseTab(relPath) },
+        },
+        { label: 'Cancel', onClick: () => setDialog(null) },
+      ],
+    })
+  }
+
+  // Reopen the most recently closed tab (Cmd+Shift+T).
+  const reopenClosedTab = () => {
+    const relPath = closedTabsRef.current.pop()
+    if (relPath) openFile(relPath)
   }
 
   // Handle file edit inside Editor
@@ -580,18 +689,29 @@ export function IDEView() {
     setDirtyFiles((prev) => ({ ...prev, [activeTab]: true }))
   }
 
-  // Handle save file
+  // Save one file (any tab, not just the active one).
+  const saveFile = async (relPath: string): Promise<boolean> => {
+    const content = fileContents[relPath] ?? ''
+    const res = await window.api.workspaceWriteFile(relPath, content)
+    if (res.ok) {
+      setDirtyFiles((prev) => ({ ...prev, [relPath]: false }))
+      refreshWorkspace()
+      return true
+    }
+    alert(`Error saving file: ${res.error}`)
+    return false
+  }
+
   const saveActiveFile = async () => {
     if (!activeTab || !dirtyFiles[activeTab]) return
-    const content = fileContents[activeTab] || ''
-    const res = await window.api.workspaceWriteFile(activeTab, content)
-    if (res.ok) {
-      setDirtyFiles((prev) => ({ ...prev, [activeTab]: false }))
-      // Update original baseline post-save to match git if we commit, or just keep it
-      // Let's refresh workspace to update Git changes state
-      refreshWorkspace()
-    } else {
-      alert(`Error saving file: ${res.error}`)
+    await saveFile(activeTab)
+  }
+
+  // Save every dirty tab (Save All button / Cmd+Alt+S).
+  const dirtyCount = openTabs.filter((t) => dirtyFiles[t]).length
+  const saveAllFiles = async () => {
+    for (const t of openTabs) {
+      if (dirtyFiles[t]) await saveFile(t)
     }
   }
 
@@ -639,13 +759,24 @@ export function IDEView() {
     await refreshWorkspace()
   }, [refreshWorkspace])
 
-  // Handle keyboard shortcut for Save (Cmd+S / Ctrl+S) + palette shortcuts.
+  // Keyboard shortcuts: save / save-all, close / reopen tab, palette, search.
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       const mod = e.metaKey || e.ctrlKey
-      if (mod && e.key === 's') {
+      if (mod && e.altKey && e.code === 'KeyS') {
+        // Cmd+Alt+S — Save All (e.code: macOS Alt+S types 'ß' in e.key)
+        e.preventDefault()
+        saveAllFiles()
+      } else if (mod && e.key === 's') {
         e.preventDefault()
         saveActiveFile()
+      } else if (mod && !e.shiftKey && (e.key === 'w' || e.key === 'W')) {
+        // Cmd+W — close active tab (app menu is null, so this is ours)
+        e.preventDefault()
+        if (activeTab) requestCloseTab(activeTab)
+      } else if (mod && e.shiftKey && (e.key === 'T' || e.key === 't')) {
+        e.preventDefault()
+        reopenClosedTab()
       } else if (mod && e.shiftKey && (e.key === 'P' || e.key === 'p')) {
         e.preventDefault()
         setPaletteMode('commands'); setPaletteOpen(true)
@@ -659,11 +790,16 @@ export function IDEView() {
     }
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [activeTab, fileContents, dirtyFiles])
+  }, [activeTab, fileContents, dirtyFiles, openTabs])
 
-  // Commands for the palette.
-  const paletteCommands: Command[] = useMemo(() => [
+  // Commands for the palette. Intentionally NOT memoized: the actions close
+  // over live editor state (activeTab, dirtyFiles, …) and a memo made "File:
+  // Save" run against stale state.
+  const paletteCommands: Command[] = [
     { id: 'save', label: 'File: Save', hint: 'Ctrl+S', run: () => saveActiveFile() },
+    { id: 'saveall', label: 'File: Save All', hint: 'Ctrl+Alt+S', run: () => saveAllFiles() },
+    { id: 'closetab', label: 'File: Close Tab', hint: 'Ctrl+W', run: () => { if (activeTab) requestCloseTab(activeTab) } },
+    { id: 'reopentab', label: 'File: Reopen Closed Tab', hint: 'Ctrl+Shift+T', run: () => reopenClosedTab() },
     { id: 'newfile', label: 'File: New File', run: () => createFilePrompt('') },
     { id: 'newfolder', label: 'File: New Folder', run: () => createFolderPrompt('') },
     { id: 'openfolder', label: 'Workspace: Open Folder…', run: () => switchWorkspace() },
@@ -672,7 +808,7 @@ export function IDEView() {
     { id: 'explorer', label: 'View: Explorer', run: () => { setActiveSidebar('explorer'); setIsSidebarOpen(true) } },
     { id: 'refresh', label: 'Workspace: Refresh', run: () => refreshWorkspace() },
     { id: 'quickopen', label: 'Go to File…', hint: 'Ctrl+P', run: () => { setPaletteMode('files'); setPaletteOpen(true) } },
-  ], [createFilePrompt, createFolderPrompt, switchWorkspace, refreshWorkspace])
+  ]
 
 
   // Custom theme initialization for Monaco
@@ -999,21 +1135,42 @@ export function IDEView() {
               return (
                 <div
                   key={tab}
+                  draggable
+                  onDragStart={() => { dragTabRef.current = tab }}
+                  onDragEnd={() => { dragTabRef.current = null }}
+                  onDragOver={(e) => {
+                    // Live-reorder: as the dragged tab passes over another, swap positions.
+                    e.preventDefault()
+                    const from = dragTabRef.current
+                    if (!from || from === tab) return
+                    setOpenTabs((tabs) => {
+                      const next = tabs.filter((t) => t !== from)
+                      next.splice(next.indexOf(tab), 0, from)
+                      return next
+                    })
+                  }}
                   onClick={() => openFile(tab)}
-                  className={`h-8 px-3 border-b-2 flex items-center gap-2 cursor-pointer transition-all text-xs font-mono select-none rounded-t ${tabColor}`}
+                  onAuxClick={(e) => {
+                    // Middle-click closes (through the dirty guard).
+                    if (e.button === 1) { e.preventDefault(); requestCloseTab(tab) }
+                  }}
+                  className={`group/tab h-8 px-3 border-b-2 flex items-center gap-2 cursor-pointer transition-all text-xs font-mono select-none rounded-t ${tabColor}`}
                 >
                   <span className="truncate max-w-[140px]">{tab.split('/').pop()}</span>
-                  
-                  {isDirty ? (
-                    <span className="size-1.5 rounded-full bg-blue-400 animate-pulse flex-shrink-0" />
-                  ) : (
-                    <button
-                      onClick={(e) => closeTab(e, tab)}
-                      className="text-zinc-600 hover:text-zinc-300 p-0.5 rounded-full flex-shrink-0 transition-colors"
-                    >
-                      <X size={10} />
-                    </button>
+
+                  {/* Dirty dot swaps to an X on hover so dirty tabs stay closable. */}
+                  {isDirty && (
+                    <span className="size-1.5 rounded-full bg-blue-400 animate-pulse flex-shrink-0 group-hover/tab:hidden" />
                   )}
+                  <button
+                    onClick={(e) => { e.stopPropagation(); requestCloseTab(tab) }}
+                    title="Close (Cmd+W)"
+                    className={`text-zinc-600 hover:text-zinc-300 p-0.5 rounded-full flex-shrink-0 transition-colors ${
+                      isDirty ? 'hidden group-hover/tab:block' : ''
+                    }`}
+                  >
+                    <X size={10} />
+                  </button>
                 </div>
               )
             })}
@@ -1039,6 +1196,18 @@ export function IDEView() {
               >
                 <Save size={14} />
               </button>
+
+              {/* Save All (visible when more than one tab is dirty) */}
+              {dirtyCount > 1 && (
+                <button
+                  onClick={saveAllFiles}
+                  title="Save All (Cmd+Alt+S)"
+                  className="px-2 py-1.5 rounded border border-blue-500/40 bg-blue-500/10 text-blue-300 hover:bg-blue-500/20 transition-all flex items-center gap-1"
+                >
+                  <Save size={13} />
+                  <span className="text-[10px] font-semibold">All ({dirtyCount})</span>
+                </button>
+              )}
 
               {/* Diff Toggle Button */}
               <button
@@ -1336,6 +1505,8 @@ export function IDEView() {
         onClose={() => setPaletteOpen(false)}
         onOpenFile={openFile}
       />
+
+      <ConfirmDialog dialog={dialog} />
     </div>
   )
 }
