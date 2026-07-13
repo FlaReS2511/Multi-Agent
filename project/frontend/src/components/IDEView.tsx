@@ -38,7 +38,7 @@ import { DiffReviewCard } from './DiffReviewCard'
 import { ConfirmDialog, ConfirmDialogSpec } from './ConfirmDialog'
 import { StatusBar } from './StatusBar'
 import { OrqonLogo } from './OrqonLogo'
-import { useAnimationsEnabled } from '../lib/uiSettings'
+import { useAnimationsEnabled, useUiSettings, setUiSetting } from '../lib/uiSettings'
 import { toast } from '../lib/toast'
 import { computeLineDiff } from '../lib/lineDiff'
 import { useInlineAIEdit } from './useInlineAIEdit'
@@ -126,6 +126,12 @@ export function IDEView() {
     window.addEventListener('mouseup', onUp)
   }
   const animationsOn = useAnimationsEnabled()
+  const ui = useUiSettings()
+
+  // Whole-app zoom (persisted). Applied on mount and whenever it changes.
+  useEffect(() => {
+    try { window.api.setZoomFactor?.(ui.zoom) } catch { /* ignore */ }
+  }, [ui.zoom])
   // Minimap is hidden while a side panel animates its width (it flickers on
   // frame-by-frame relayout) and restored once the animation settles.
   const [minimapOn, setMinimapOn] = useState(true)
@@ -936,11 +942,21 @@ export function IDEView() {
       } else if (mod && e.shiftKey && (e.key === 'F' || e.key === 'f')) {
         e.preventDefault()
         setActiveSidebar('search'); setIsSidebarOpen(true)
+      } else if (mod && (e.key === '=' || e.key === '+')) {
+        // Cmd+= — zoom in
+        e.preventDefault()
+        setUiSetting('zoom', Math.min(1.5, Math.round((ui.zoom + 0.1) * 10) / 10))
+      } else if (mod && e.key === '-') {
+        e.preventDefault()
+        setUiSetting('zoom', Math.max(0.5, Math.round((ui.zoom - 0.1) * 10) / 10))
+      } else if (mod && e.key === '0') {
+        e.preventDefault()
+        setUiSetting('zoom', 1)
       }
     }
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [activeTab, fileContents, dirtyFiles, openTabs])
+  }, [activeTab, fileContents, dirtyFiles, openTabs, ui.zoom])
 
   // Commands for the palette. Intentionally NOT memoized: the actions close
   // over live editor state (activeTab, dirtyFiles, …) and a memo made "File:
@@ -1427,12 +1443,12 @@ export function IDEView() {
                       renderSideBySide,
                       originalEditable: false,
                       readOnly: false,
-                      fontSize: 13,
+                      fontSize: ui.editorFontSize,
                       lineHeight: 1.5,
                       fontFamily: 'ui-monospace, SF Mono, JetBrains Mono, Consolas, monospace',
                       minimap: { enabled: false },
                       scrollBeyondLastLine: false,
-                      wordWrap: 'on',
+                      wordWrap: ui.wordWrap ? 'on' : 'off',
                     }}
                   />
                 </div>
@@ -1446,12 +1462,14 @@ export function IDEView() {
                     onMount={handleEditorDidMount}
                     theme="vscode-dark-harmony"
                     options={{
-                      fontSize: 13,
+                      fontSize: ui.editorFontSize,
                       lineHeight: 1.5,
                       fontFamily: 'ui-monospace, SF Mono, JetBrains Mono, Consolas, monospace',
-                      minimap: { enabled: minimapOn },
+                      // minimapOn = the flicker-avoidance toggle during panel
+                      // animations; ui.minimap = the user's persisted setting.
+                      minimap: { enabled: minimapOn && ui.minimap },
                       scrollBeyondLastLine: false,
-                      wordWrap: 'on',
+                      wordWrap: ui.wordWrap ? 'on' : 'off',
                       tabSize: 4,
                       insertSpaces: true,
                     }}

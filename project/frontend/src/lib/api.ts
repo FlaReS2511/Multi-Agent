@@ -468,6 +468,7 @@ declare global {
       orchestrationGet(): Promise<OrchestrationConfig>
       orchestrationSet(patch: Partial<OrchestrationConfig>): Promise<{ ok: boolean; orchestration: OrchestrationConfig }>
       onCoordinatorEvent(cb: (info: { event: string; payload: unknown }) => void): () => void
+      setZoomFactor(factor: number): void
       discordConfigGet(): Promise<DiscordConfig>
       discordConfigSet(patch: Partial<DiscordConfig>): Promise<{ ok: boolean; discord: DiscordConfig }>
       discordTokenStatus(): Promise<{ hasToken: boolean }>

@@ -17,6 +17,7 @@ import {
   History, Plus, Archive, Telescope, Copy, Check, ArrowDown, Pencil, AtSign,
 } from 'lucide-react'
 import { ModelOption, IdeAgentEvent, PendingChange, PendingAction, AgentTodo, AgentSessionMeta } from '../lib/api'
+import { useUiSettings } from '../lib/uiSettings'
 
 // Slash commands available in agent mode. Typing "/" pops up a filtered menu.
 const AGENT_SLASH_COMMANDS: { name: string; desc: string }[] = [
@@ -174,6 +175,7 @@ const itemVariants = {
 }
 
 export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, onChangeResolved, onEditorRequest, windup = true, onRunStateChange, onContextUsage, onRunFinished, files = [] }: Props) {
+  const { chatFontSize } = useUiSettings()
   const [mode, setMode] = useState<'ask' | 'agent'>('ask')
   // Plan mode is a toggle WITHIN agent mode (via /plan): runs read-only and
   // presents a plan to approve instead of editing directly.
@@ -860,6 +862,7 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
   return (
     <motion.div
       className="h-full flex flex-col bg-zinc-950 relative overflow-hidden"
+      style={{ '--chat-font-size': `${chatFontSize}px` } as React.CSSProperties}
       variants={windup ? containerVariants : undefined}
       initial={windup ? 'hidden' : false}
       animate={windup ? 'show' : false}

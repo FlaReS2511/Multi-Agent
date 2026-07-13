@@ -10,7 +10,7 @@ import {
   OrchestrationConfig,
   DiscordConfig,
 } from '../lib/api'
-import { useAnimationsEnabled, setAnimationsEnabled } from '../lib/uiSettings'
+import { useAnimationsEnabled, setAnimationsEnabled, useUiSettings, setUiSetting } from '../lib/uiSettings'
 
 const PROVIDER_KINDS: ProviderKind[] = ['openai-compatible', 'anthropic', 'openai', 'google']
 
@@ -223,7 +223,10 @@ export function BackendSettingsModal({ open, onClose }: Props) {
         {/* Interface */}
         <section className="px-5 pb-6 border-t border-zinc-800 pt-5">
           <h3 className="text-[11px] uppercase tracking-wider text-zinc-500 mb-3">Interface</h3>
-          <label className="flex items-center justify-between gap-4 cursor-pointer group">
+
+          <AppearanceRows />
+
+          <label className="flex items-center justify-between gap-4 cursor-pointer group mt-4">
             <div>
               <div className="text-xs text-zinc-200 font-medium">Animations</div>
               <div className="text-[11px] text-zinc-500 mt-0.5">
@@ -622,6 +625,81 @@ function IdListEditor({ label, hint, ids, onChange }: { label: string; hint: str
         ))}
       </div>
       <span className="text-[10px] text-zinc-600">{hint}</span>
+    </div>
+  )
+}
+
+// ── Appearance (persisted UI settings) ───────────────────────────
+
+function SettingSwitch({ label, hint, checked, onToggle }: { label: string; hint: string; checked: boolean; onToggle: () => void }) {
+  return (
+    <label className="flex items-center justify-between gap-4 cursor-pointer">
+      <div>
+        <div className="text-xs text-zinc-200 font-medium">{label}</div>
+        <div className="text-[11px] text-zinc-500 mt-0.5">{hint}</div>
+      </div>
+      <button
+        type="button"
+        role="switch"
+        aria-checked={checked}
+        onClick={onToggle}
+        className={`relative w-10 h-5 rounded-full flex-shrink-0 p-0.5 flex items-center transition-colors ${checked ? 'bg-blue-600' : 'bg-zinc-700'}`}
+      >
+        <span className={`size-4 rounded-full bg-white shadow-sm transition-transform will-change-transform ${checked ? 'translate-x-5' : 'translate-x-0'}`} />
+      </button>
+    </label>
+  )
+}
+
+function AppearanceRows() {
+  const ui = useUiSettings()
+  return (
+    <div className="space-y-4">
+      <div className="grid grid-cols-3 gap-x-4">
+        <NumberField
+          label="Editor font size"
+          hint="Monaco editor (px)"
+          value={ui.editorFontSize}
+          step={1}
+          onCommit={(v) => setUiSetting('editorFontSize', Math.min(24, Math.max(10, Math.round(v))))}
+        />
+        <NumberField
+          label="Chat font size"
+          hint="AI chat messages (px)"
+          value={ui.chatFontSize}
+          step={1}
+          onCommit={(v) => setUiSetting('chatFontSize', Math.min(16, Math.max(10, Math.round(v))))}
+        />
+        <label className="flex flex-col gap-1">
+          <span className="text-[11px] text-zinc-300 font-medium">UI zoom</span>
+          <div className="flex items-center gap-1">
+            <button
+              type="button"
+              onClick={() => setUiSetting('zoom', Math.max(0.5, Math.round((ui.zoom - 0.1) * 10) / 10))}
+              className="px-2 py-1 rounded border border-zinc-700 text-zinc-300 hover:text-white text-xs"
+            >−</button>
+            <span className="flex-1 text-center text-xs font-mono text-zinc-200">{Math.round(ui.zoom * 100)}%</span>
+            <button
+              type="button"
+              onClick={() => setUiSetting('zoom', Math.min(1.5, Math.round((ui.zoom + 0.1) * 10) / 10))}
+              className="px-2 py-1 rounded border border-zinc-700 text-zinc-300 hover:text-white text-xs"
+            >+</button>
+          </div>
+          <span className="text-[10px] text-zinc-600">Cmd +/− · Cmd 0 resets</span>
+        </label>
+      </div>
+      <SettingSwitch
+        label="Word wrap"
+        hint="Wrap long lines in the editor instead of horizontal scrolling."
+        checked={ui.wordWrap}
+        onToggle={() => setUiSetting('wordWrap', !ui.wordWrap)}
+      />
+      <SettingSwitch
+        label="Minimap"
+        hint="Show the code minimap on the right side of the editor."
+        checked={ui.minimap}
+        onToggle={() => setUiSetting('minimap', !ui.minimap)}
+      />
     </div>
   )
 }

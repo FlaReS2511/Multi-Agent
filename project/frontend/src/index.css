@@ -41,7 +41,7 @@ html, body, #root {
 
 /* Markdown rendering for chat messages (react-markdown + remark-gfm). Wide
    tables and code scroll inside the bubble so nothing overflows. */
-.md-body { font-size: 12px; line-height: 1.55; word-break: break-word; overflow-wrap: anywhere; }
+.md-body { font-size: var(--chat-font-size, 12px); line-height: 1.55; word-break: break-word; overflow-wrap: anywhere; }
 .md-body > :first-child { margin-top: 0; }
 .md-body > :last-child { margin-bottom: 0; }
 .md-body p { margin: 0.4em 0; }

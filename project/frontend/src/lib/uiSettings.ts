@@ -21,7 +21,7 @@ export const DEFAULT_UI_SETTINGS: UiSettings = {
   animationsEnabled: true,
   editorFontSize: 13,
   chatFontSize: 12,
-  wordWrap: false,
+  wordWrap: true, // matches the editor's original hardcoded 'on'
   minimap: true,
   zoom: 1,
 }
