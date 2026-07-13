@@ -10,6 +10,7 @@ import {
   RefreshCw,
   Undo2,
 } from 'lucide-react'
+import { toast } from '../lib/toast'
 
 interface StatusEntry {
   file: string
@@ -102,9 +103,11 @@ export function GitPanel({ onOpenFile, onChanged, onDiscard }: Props) {
       if (res.ok) {
         setCommitMsg('')
         setOpStatus(res.output ? truncate(res.output) : 'Committed')
+        toast('Committed', 'success')
         await afterMutation()
       } else {
         setOpStatus(res.error || 'Commit failed')
+        toast(res.error || 'Commit failed', 'error')
       }
     } finally {
       setCommitting(false)
@@ -115,7 +118,9 @@ export function GitPanel({ onOpenFile, onChanged, onDiscard }: Props) {
     setPulling(true)
     try {
       const res = await window.api.workspaceGitPull()
-      setOpStatus(res.output ? truncate(res.output) : 'Pulled')
+      setOpStatus(res.output ? truncate(res.output) : res.ok ? 'Pulled' : 'Pull failed')
+      if (res.ok) toast('Pulled', 'success')
+      else toast(res.output ? truncate(res.output, 200) : 'Pull failed', 'error')
       await afterMutation()
     } finally {
       setPulling(false)
@@ -126,7 +131,9 @@ export function GitPanel({ onOpenFile, onChanged, onDiscard }: Props) {
     setPushing(true)
     try {
       const res = await window.api.workspaceGitPush()
-      setOpStatus(res.output ? truncate(res.output) : 'Pushed')
+      setOpStatus(res.output ? truncate(res.output) : res.ok ? 'Pushed' : 'Push failed')
+      if (res.ok) toast('Pushed', 'success')
+      else toast(res.output ? truncate(res.output, 200) : 'Push failed', 'error')
     } finally {
       setPushing(false)
     }

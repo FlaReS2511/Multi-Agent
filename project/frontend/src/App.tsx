@@ -234,11 +234,7 @@ export default function App() {
         </AnimatePresence>
       </div>
 
-      {/* Footer */}
-      <footer className="h-6 px-3 border-t border-zinc-800 flex items-center justify-between text-[10px] text-zinc-600 bg-zinc-950 flex-shrink-0">
-        <span>API-only · SQLite state · polling {POLL_MS}ms</span>
-        <span>Orqon v0.4</span>
-      </footer>
+      {/* (Footer replaced by the live StatusBar inside IDEView.) */}
 
       <NewTaskDialog
         open={showNewTask}

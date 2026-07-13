@@ -36,6 +36,7 @@ import { ChatPanel } from './ChatPanel'
 import { GroupsPanel } from './GroupsPanel'
 import { DiffReviewCard } from './DiffReviewCard'
 import { ConfirmDialog, ConfirmDialogSpec } from './ConfirmDialog'
+import { StatusBar } from './StatusBar'
 import { OrqonLogo } from './OrqonLogo'
 import { useAnimationsEnabled } from '../lib/uiSettings'
 import { toast } from '../lib/toast'
@@ -139,6 +140,14 @@ export function IDEView() {
   const [files, setFiles] = useState<FileNode[]>([])
   const [gitChanges, setGitChanges] = useState<GitChange[]>([])
   const [loadingWorkspace, setLoadingWorkspace] = useState(false)
+  const [branchName, setBranchName] = useState('')
+
+  // Status-bar signals
+  const [cursorPos, setCursorPos] = useState<{ line: number; col: number } | null>(null)
+  const [agentBusy, setAgentBusy] = useState(false)
+  const [chatCtxUsage, setChatCtxUsage] = useState<{ used: number; window: number } | null>(null)
+  // Chat badge: an agent run finished while the chat panel was closed.
+  const [chatUnread, setChatUnread] = useState(false)
 
   // Editor Tabs State
   const [openTabs, setOpenTabs] = useState<string[]>([])
@@ -396,12 +405,16 @@ export function IDEView() {
   // full agentsList so a resident agent's terminal stays reachable.
   const residentAgents = agentsList.filter(isResidentRole)
 
-  // Periodically refresh Git status and live logs
+  // Periodically refresh Git status, current branch and live logs
   useEffect(() => {
     const tick = async () => {
-      // Refresh git changes
+      // Refresh git changes + branch (status bar)
       const changes = await window.api.workspaceGitStatus()
       setChangesList(changes)
+      try {
+        const b = await window.api.workspaceGitBranch()
+        setBranchName(b.current || '')
+      } catch { /* not a repo */ }
 
       // Refresh logs
       const allLogs = await window.api.getLogs()
@@ -415,6 +428,16 @@ export function IDEView() {
     tick()
     const i = setInterval(tick, 2000)
     return () => clearInterval(i)
+  }, [])
+
+  // Toast orchestration group outcomes (passed/failed/killed).
+  useEffect(() => {
+    return window.api.onCoordinatorEvent(({ event, payload }) => {
+      const p = payload as { group?: string; task?: string; reason?: string }
+      if (event === 'group-passed') toast(`Group ${p.group} passed — task ${p.task} done`, 'success')
+      else if (event === 'group-failed') toast(`Group ${p.group} failed${p.reason ? `: ${p.reason}` : ''}`, 'error')
+      else if (event === 'group-killed') toast(`Group ${p.group} killed${p.reason ? `: ${p.reason}` : ''}`, 'info')
+    })
   }, [])
 
   // Live-reload logic when AI modifies files on disk
@@ -794,7 +817,7 @@ export function IDEView() {
       refreshWorkspace()
       return true
     }
-    alert(`Error saving file: ${res.error}`)
+    toast(`Save failed: ${res.error}`, 'error')
     return false
   }
 
@@ -833,7 +856,7 @@ export function IDEView() {
     const res = isDir
       ? await window.api.workspaceCreateFolder(rel)
       : await window.api.workspaceCreateFile(rel)
-    if (!res.ok) { alert(res.error); return }
+    if (!res.ok) { toast(res.error || 'Create failed', 'error'); return }
     await refreshWorkspace()
     if (!isDir) openFile(rel)
   }, [refreshWorkspace])
@@ -841,7 +864,7 @@ export function IDEView() {
   // Rename a file/folder (or move it via toRel override) and fix open tabs.
   const applyRename = useCallback(async (relPath: string, toRel: string) => {
     const res = await window.api.workspaceRename(relPath, toRel)
-    if (!res.ok) { alert(res.error); return }
+    if (!res.ok) { toast(res.error || 'Rename failed', 'error'); return }
     // Update any open tab pointing at the renamed file or inside the folder.
     const remap = (t: string) =>
       t === relPath ? toRel : t.startsWith(relPath + '/') ? toRel + t.slice(relPath.length) : t
@@ -875,7 +898,7 @@ export function IDEView() {
           onClick: async () => {
             setDialog(null)
             const res = await window.api.workspaceDelete(relPath)
-            if (!res.ok) { alert(res.error); return }
+            if (!res.ok) { toast(res.error || 'Delete failed', 'error'); return }
             setOpenTabs((tabs) => tabs.filter((t) => t !== relPath && !t.startsWith(relPath + '/')))
             setActiveTab((t) => (t === relPath || t?.startsWith(relPath + '/') ? null : t))
             await refreshWorkspace()
@@ -943,6 +966,10 @@ export function IDEView() {
     editorRef.current = editor
     monacoRef.current = monaco
     setEditorReady((n) => n + 1)
+    // Status bar: track the caret position.
+    editor.onDidChangeCursorPosition((e: any) => {
+      setCursorPos({ line: e.position.lineNumber, col: e.position.column })
+    })
     // Set custom HSL dark theme values
     monaco.editor.defineTheme('vscode-dark-harmony', {
       base: 'vs-dark',
@@ -972,7 +999,8 @@ export function IDEView() {
   }
 
   return (
-    <div className="h-full flex bg-zinc-950 text-zinc-200 overflow-hidden select-none font-sans">
+    <div className="h-full flex flex-col bg-zinc-950 text-zinc-200 overflow-hidden select-none font-sans">
+    <div className="flex-1 min-h-0 flex overflow-hidden">
       {/* 1. Icon-only Activity Bar */}
       <nav className="w-12 border-r border-zinc-800 bg-zinc-950 flex flex-col items-center py-3 gap-6 flex-shrink-0">
         <ActivityButton
@@ -1050,12 +1078,18 @@ export function IDEView() {
           }}
         />
         <div className="mt-auto flex flex-col gap-4">
-          <ActivityButton
-            icon={<MessagesSquare size={20} />}
-            label="AI Chat"
-            active={chatOpen}
-            onClick={() => setChatOpen((v) => !v)}
-          />
+          <div className="relative">
+            <ActivityButton
+              icon={<MessagesSquare size={20} />}
+              label="AI Chat"
+              active={chatOpen}
+              onClick={() => { setChatOpen((v) => !v); setChatUnread(false) }}
+            />
+            {/* Unread badge: an agent run finished while the chat was closed. */}
+            {chatUnread && !chatOpen && (
+              <span className="absolute top-0 right-0.5 size-2 rounded-full bg-emerald-400 ring-2 ring-zinc-950 animate-pulse" />
+            )}
+          </div>
           <ActivityButton
             icon={<RefreshCw size={18} className={loadingWorkspace ? 'animate-spin text-blue-400' : ''} />}
             label="Refresh Workspace"
@@ -1630,9 +1664,31 @@ export function IDEView() {
             onChangeResolved={onChangeResolved}
             onEditorRequest={onEditorRequest}
             windup={animationsOn}
+            onRunStateChange={setAgentBusy}
+            onContextUsage={setChatCtxUsage}
+            onRunFinished={(info) => {
+              if (chatOpen) return
+              setChatUnread(true)
+              if (info.kind === 'done') toast('Agent finished', 'success')
+              else if (info.kind === 'plan') toast('Plan ready for review', 'info')
+              else if (info.kind === 'blocked') toast('Agent blocked — see chat', 'error')
+              else toast('Agent run failed — see chat', 'error')
+            }}
           />
         </div>
       </motion.aside>
+    </div>
+
+      {/* Status bar spans the full window width below all panels. */}
+      <StatusBar
+        branch={branchName}
+        dirtyCount={dirtyCount}
+        workspaceName={workspaceName}
+        cursor={activeTab ? cursorPos : null}
+        language={activeTab ? detectLanguage(activeTab) : ''}
+        agentBusy={agentBusy}
+        ctxUsage={chatCtxUsage}
+      />
 
       <CommandPalette
         open={paletteOpen}

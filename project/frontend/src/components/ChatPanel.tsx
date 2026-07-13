@@ -150,6 +150,12 @@ interface Props {
   // When true, inner elements fade/slide in with a staggered "wind-up" after
   // the panel frame has slid open. When false, everything renders instantly.
   windup?: boolean
+  // Status-bar signals for the host IDE.
+  onRunStateChange?: (busy: boolean) => void
+  onContextUsage?: (u: { used: number; window: number } | null) => void
+  // Fired when an agent run reaches a terminal state (for toast/badge when
+  // the chat panel is closed).
+  onRunFinished?: (info: { kind: 'done' | 'error' | 'blocked' | 'plan' }) => void
 }
 
 // Wind-up choreography: the frame slides open first (handled by the parent),
@@ -165,7 +171,7 @@ const itemVariants = {
   show: { opacity: 1, y: 0, transition: { duration: 0.28, ease: 'easeOut' } },
 }
 
-export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, onChangeResolved, onEditorRequest, windup = true }: Props) {
+export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, onChangeResolved, onEditorRequest, windup = true, onRunStateChange, onContextUsage, onRunFinished }: Props) {
   const [mode, setMode] = useState<'ask' | 'agent'>('ask')
   // Plan mode is a toggle WITHIN agent mode (via /plan): runs read-only and
   // presents a plan to approve instead of editing directly.
@@ -196,6 +202,14 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
   const [agentItems, setAgentItems] = useState<AgentItem[]>([])
   const [input, setInput] = useState('')
   const [streaming, setStreaming] = useState(false)
+
+  // Host-IDE signals. onRunFinished goes through a ref so the event callback
+  // registered at run start always sees the latest prop (chatOpen may change
+  // mid-run in the host).
+  const onRunFinishedRef = useRef(onRunFinished)
+  onRunFinishedRef.current = onRunFinished
+  useEffect(() => { onRunStateChange?.(streaming) }, [streaming, onRunStateChange])
+  useEffect(() => { onContextUsage?.(ctxUsage) }, [ctxUsage, onContextUsage])
   // Slash-command popup (agent mode): highlighted index + Esc-dismissed flag.
   const [slashIndex, setSlashIndex] = useState(0)
   const [slashDismissed, setSlashDismissed] = useState(false)
@@ -573,6 +587,7 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
       })
       if (e.type === 'file_changed') { runFilesRef.current.add(e.path); onFileChanged?.(e.path) }
       if (e.type === 'done' || e.type === 'error' || e.type === 'blocked' || e.type === 'plan') {
+        onRunFinishedRef.current?.({ kind: e.type })
         off()
         offEditor()
         reqIdRef.current = null
