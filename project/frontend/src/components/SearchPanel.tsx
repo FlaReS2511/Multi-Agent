@@ -186,7 +186,9 @@ export function SearchPanel({ onOpenResult }: Props) {
               <ChevronRight className="w-3.5 h-3.5" />
             )}
           </button>
-          <div className="flex-1 space-y-1.5">
+          {/* min-w-0 lets the inputs shrink below their intrinsic width so the
+              column never overflows the 256px sidebar. */}
+          <div className="flex-1 min-w-0 space-y-1.5">
             <div className="flex items-center gap-1 px-2 bg-zinc-900 border border-zinc-700 rounded focus-within:border-blue-500">
               <Search className="w-3.5 h-3.5 text-zinc-500 shrink-0" />
               <input
@@ -245,23 +247,22 @@ export function SearchPanel({ onOpenResult }: Props) {
               </div>
             )}
 
-            {/* Include / exclude glob filters (comma-separated, rg -g syntax) */}
-            <div className="flex items-center gap-1.5">
-              <input
-                type="text"
-                value={includeGlob}
-                onChange={(e) => setIncludeGlob(e.target.value)}
-                placeholder="files to include (e.g. src/**/*.ts)"
-                className="flex-1 min-w-0 px-2 py-0.5 bg-zinc-900 border border-zinc-800 rounded text-[10px] text-zinc-200 placeholder-zinc-600 focus:outline-none focus:border-blue-500"
-              />
-              <input
-                type="text"
-                value={excludeGlob}
-                onChange={(e) => setExcludeGlob(e.target.value)}
-                placeholder="exclude (e.g. *.test.ts)"
-                className="flex-1 min-w-0 px-2 py-0.5 bg-zinc-900 border border-zinc-800 rounded text-[10px] text-zinc-200 placeholder-zinc-600 focus:outline-none focus:border-blue-500"
-              />
-            </div>
+            {/* Include / exclude glob filters (comma-separated, rg -g syntax).
+                Stacked vertically — the sidebar is only 256px wide. */}
+            <input
+              type="text"
+              value={includeGlob}
+              onChange={(e) => setIncludeGlob(e.target.value)}
+              placeholder="include: src/**/*.ts"
+              className="w-full min-w-0 px-2 py-0.5 bg-zinc-900 border border-zinc-800 rounded text-[10px] text-zinc-200 placeholder-zinc-600 focus:outline-none focus:border-blue-500"
+            />
+            <input
+              type="text"
+              value={excludeGlob}
+              onChange={(e) => setExcludeGlob(e.target.value)}
+              placeholder="exclude: *.test.ts"
+              className="w-full min-w-0 px-2 py-0.5 bg-zinc-900 border border-zinc-800 rounded text-[10px] text-zinc-200 placeholder-zinc-600 focus:outline-none focus:border-blue-500"
+            />
           </div>
         </div>
 
