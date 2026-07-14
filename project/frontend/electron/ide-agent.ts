@@ -412,19 +412,44 @@ export async function runIdeAgent(
 
     let finalText = ''
     let turns = 0
+    let anyActivity = false // any tool call ran this run
 
     for (let i = 0; i < MAX_TURNS; i++) {
       if (signal.aborted) { emit({ type: 'error', error: 'cancelled' }); return }
       const turn = turns
-      const { text, toolCalls, assistantMsg, usage } = await adapter.chatStream(
-        messages,
-        system,
-        {
-          onText: (delta) => emit({ type: 'token', delta, turn }),
-          onReasoning: (delta) => emit({ type: 'reasoning', delta, turn }),
-        },
-        signal,
-      )
+
+      // Call the provider with retries. Two failure modes we recover from, as
+      // long as nothing has streamed yet this turn (retrying after partial
+      // output would duplicate it):
+      //  - transient errors (429 / 5xx / network drop)
+      //  - "silent" empty completions (gateway drops the stream and returns
+      //    nothing) — previously these ended the run with no reply at all.
+      let streamedThisTurn = false
+      const handlers = {
+        onText: (delta: string) => { streamedThisTurn = true; emit({ type: 'token', delta, turn }) },
+        onReasoning: (delta: string) => { streamedThisTurn = true; emit({ type: 'reasoning', delta, turn }) },
+      }
+      let res: Awaited<ReturnType<typeof adapter.chatStream>>
+      for (let attempt = 0; ; attempt++) {
+        try {
+          res = await adapter.chatStream(messages, system, handlers, signal)
+        } catch (e: any) {
+          const msg = String(e?.message || e)
+          const transient = /HTTP (429|5\d\d)|fetch failed|network|ECONN|ETIMEDOUT|socket|timed? ?out/i.test(msg)
+          if (transient && !streamedThisTurn && attempt < 2 && !signal.aborted) {
+            await new Promise((r) => setTimeout(r, 1500 * (attempt + 1)))
+            continue
+          }
+          throw e
+        }
+        if (!res.text && res.toolCalls.length === 0 && !streamedThisTurn && attempt < 2 && !signal.aborted) {
+          // Empty completion — retry quietly.
+          await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)))
+          continue
+        }
+        break
+      }
+      const { text, toolCalls, assistantMsg, usage } = res
       turns++
 
       // Record cost under a virtual role so it shows in the dashboard.
@@ -444,7 +469,16 @@ export async function runIdeAgent(
       }
 
       if (text) finalText = text
-      if (toolCalls.length === 0) break
+      if (toolCalls.length === 0) {
+        // Still empty after retries, nothing streamed, no tools ever ran →
+        // surface it instead of silently ending the run with no reply at all.
+        if (!finalText && !streamedThisTurn && !anyActivity) {
+          emit({ type: 'error', error: 'provider returned an empty response (stream dropped) — please send again' })
+          return
+        }
+        break
+      }
+      anyActivity = true
 
       const reviewOn = Boolean(params.reviewMode && requestReview)
       const results: string[] = []
