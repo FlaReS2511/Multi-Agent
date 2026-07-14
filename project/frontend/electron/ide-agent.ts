@@ -471,6 +471,11 @@ export async function runIdeAgent(
         break
       }
       const { text, toolCalls, assistantMsg, usage } = res
+      // Upstream closed the stream without a finish marker after partial
+      // output — flag it visibly instead of passing the cut-off reply as done.
+      if (res.dropped && streamedThisTurn && toolCalls.length === 0) {
+        emit({ type: 'token', delta: '\n\n⚠ [stream dropped — reply may be truncated]', turn })
+      }
       turns++
 
       // Record cost under a virtual role so it shows in the dashboard.
