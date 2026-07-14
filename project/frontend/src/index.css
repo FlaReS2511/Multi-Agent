@@ -158,6 +158,58 @@ html, body, #root {
   animation: plan-bottom-in 0.9s ease-out;
 }
 
+/* Review-mode activation wave — the Apple Intelligence "power-on": a narrow
+   bright emerald comet sweeps ONCE around the chat rim (same conic+xor-mask
+   rim technique as .plan-glow, but the ring is transparent except one arc)
+   while the edges bloom, then everything fades. One-shot; the element is
+   removed on animationend. */
+.review-wave {
+  position: absolute;
+  inset: 0;
+  z-index: 30;
+  pointer-events: none;
+  border-radius: inherit;
+}
+.review-wave::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  padding: 3px;
+  /* Transparent ring with one bright multicolor arc — the comet. The arc sits
+     at the end of the turn so its head leads as --plan-angle grows. */
+  background: conic-gradient(from var(--plan-angle),
+    transparent 0deg, transparent 270deg,
+    rgba(16, 185, 129, 0.0) 278deg, rgba(52, 211, 153, 0.45) 305deg,
+    #34d399 326deg, #a7f3d0 342deg, #ffffff 352deg, transparent 360deg);
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+          mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+          mask-composite: exclude;
+  filter: blur(5px);
+  animation: review-wave-sweep 1.5s cubic-bezier(0.3, 0.1, 0.25, 1) forwards;
+}
+/* Edge bloom that swells as the comet travels, then dies down with it. */
+.review-wave::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  box-shadow: inset 0 0 36px rgba(52, 211, 153, 0.45);
+  animation: review-wave-bloom 1.5s ease-out forwards;
+}
+@keyframes review-wave-sweep {
+  0% { --plan-angle: 0deg; opacity: 0; }
+  10% { opacity: 1; }
+  78% { opacity: 1; }
+  100% { --plan-angle: 360deg; opacity: 0; }
+}
+@keyframes review-wave-bloom {
+  0% { opacity: 0; }
+  30% { opacity: 1; }
+  100% { opacity: 0; }
+}
+
 /* Git gutter — thin bars in Monaco's linesDecorations lane marking lines
    changed vs HEAD: emerald = added, blue = modified, red triangle = deletion. */
 .git-gutter-add {

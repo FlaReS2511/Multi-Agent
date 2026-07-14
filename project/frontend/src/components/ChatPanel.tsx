@@ -226,6 +226,7 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
   // Plan text stashed while a git-dirty warning is shown before running it.
   const pendingPlanRef = useRef<string | null>(null)
   const [reviewMode, setReviewMode] = useState(false)
+  const [reviewWave, setReviewWave] = useState(false) // one-shot activation sweep
   // Files the current agent run has written (for the "Undo run" affordance).
   const runFilesRef = useRef<Set<string>>(new Set())
   const [lastRunFiles, setLastRunFiles] = useState<string[]>([])
@@ -469,6 +470,13 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
     const next = !reviewMode
     setReviewMode(next)
     window.api.ideAgentConfigSet({ reviewMode: next }).catch(() => {})
+    // Turning review ON plays the activation wave once (Apple-Intelligence
+    // style sweep). Timeout is a fallback in case the CSS animation never
+    // runs (e.g. animations disabled) so the overlay can't get stuck.
+    if (next) {
+      setReviewWave(true)
+      window.setTimeout(() => setReviewWave(false), 1600)
+    }
   }
 
   // Revert every file the last run wrote (git checkout tracked, delete new).
@@ -1444,6 +1452,17 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
           </motion.div>
         )}
       </AnimatePresence>
+
+      {/* Review-mode activation wave: a bright emerald comet sweeps once
+          around the chat rim while the edges bloom, then fades — review's
+          resting indicator stays the shield badge, no permanent glow. */}
+      {reviewWave && (
+        <div
+          className="review-wave"
+          aria-hidden="true"
+          onAnimationEnd={() => setReviewWave(false)}
+        />
+      )}
     </motion.div>
   )
 }
