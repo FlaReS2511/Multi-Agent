@@ -15,6 +15,7 @@ import {
   FILE_TOOL_SPECS, runFileTool, ToolSpec,
   ChangePreview, previewWrite, previewEdit, applyChange,
   EXCEL_TOOL_SPECS, EXCEL_TOOL_NAMES, EXCEL_MUTATORS, runExcelTool,
+  isOutsideRoot, allowOutsidePath,
 } from './agent-tools'
 import {
   EXTRA_TOOL_SPECS, EXTRA_TOOL_NAMES, runExtraTool, PendingAction,
@@ -27,6 +28,26 @@ const MAX_TURNS = parseInt(process.env.IDE_AGENT_MAX_TURNS || '30', 10)
 
 // File-mutating tools whose success should reload the editor/file-tree.
 const FILE_CHANGED_TOOLS = new Set(['Write', 'Edit', 'MultiEdit', 'Move', 'Delete', 'NotebookEdit', 'DownloadFile'])
+
+// Tools whose path args are guarded against escaping the workspace. When a
+// call targets an outside path we ASK the user (Approve/Decline) instead of
+// hard-failing; approval whitelists that directory for the rest of the session.
+const ESCAPE_GUARDED_TOOLS = new Set([
+  ...FILE_TOOL_SPECS.map((s) => s.name).filter((n) => n !== 'Bash'),
+  ...EXCEL_TOOL_SPECS.map((s) => s.name),
+])
+
+function escapingPaths(cwd: string, name: string, args: Record<string, unknown>): string[] {
+  const keys = name === 'Move' ? ['from', 'to'] : ['path']
+  const out: string[] = []
+  for (const k of keys) {
+    const rel = args?.[k]
+    if (typeof rel !== 'string' || !rel) continue
+    const abs = isOutsideRoot(cwd, rel)
+    if (abs) out.push(abs)
+  }
+  return out
+}
 
 // Plan mode: the agent may only investigate (no writes, no side effects) and
 // then present a plan. This is the read-only tool allowlist.
@@ -482,6 +503,18 @@ export async function runIdeAgent(
 
       const reviewOn = Boolean(params.reviewMode && requestReview)
       const results: string[] = []
+
+      // Ask the user to approve a sensitive action (shared by the extra-tools
+      // gate and the outside-workspace gate below).
+      const confirm = async (action: Omit<PendingAction, 'actionId'>): Promise<boolean> => {
+        if (!requestAction) return false
+        const actionId = `act-${++actionCounter}-${Date.now()}`
+        const full: PendingAction = { actionId, ...action }
+        emit({ type: 'pending_action', action: full })
+        const approved = await requestAction(full)
+        emit({ type: 'action_resolved', actionId, approved })
+        return approved
+      }
       for (const call of toolCalls) {
         if (signal.aborted) { emit({ type: 'error', error: 'cancelled' }); return }
         const callId = call.id || `${call.name}-${Date.now()}`
@@ -533,6 +566,29 @@ export async function runIdeAgent(
           continue
         }
 
+        // Outside-workspace path? Ask instead of hard-failing. Approving
+        // whitelists that file's directory for the rest of the app session.
+        if (ESCAPE_GUARDED_TOOLS.has(call.name)) {
+          const outside = escapingPaths(workspaceRoot, call.name, call.args as Record<string, unknown>)
+          if (outside.length > 0) {
+            const ok = await confirm({
+              tool: call.name,
+              title: 'Access OUTSIDE the workspace',
+              detail: `${call.name}:\n${outside.join('\n')}`,
+            })
+            if (!ok) {
+              const denied = `denied by user: ${call.name} on a path outside the workspace root was not allowed`
+              results.push(denied)
+              emit({ type: 'tool_result', callId, name: call.name, result: denied, isError: true })
+              continue
+            }
+            for (const abs of outside) {
+              allowOutsidePath(abs)
+              allowOutsidePath(path.dirname(abs))
+            }
+          }
+        }
+
         let result: string
         let isError = false
         const isMutation = call.name === 'Write' || call.name === 'Edit'
@@ -557,16 +613,7 @@ export async function runIdeAgent(
           }
         } else if (isExtraTool) {
           // Git / git-account / web / todo / background tools. Sensitive ones
-          // (mutations, login, account switch) gate on the confirm bridge.
-          const confirm = async (action: Omit<PendingAction, 'actionId'>): Promise<boolean> => {
-            if (!requestAction) return false
-            const actionId = `act-${++actionCounter}-${Date.now()}`
-            const full: PendingAction = { actionId, ...action }
-            emit({ type: 'pending_action', action: full })
-            const approved = await requestAction(full)
-            emit({ type: 'action_resolved', actionId, approved })
-            return approved
-          }
+          // (mutations, login, account switch) gate on the shared confirm above.
           try {
             const r = await runExtraTool(call.name, call.args, {
               cwd: workspaceRoot,
