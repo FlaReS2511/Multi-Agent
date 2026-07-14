@@ -56,6 +56,12 @@ async function readSse(
       if (trimmed.startsWith('data:')) onData(trimmed.slice(5).trim())
     }
   }
+  // Flush the tail: buffering proxies may close the stream right after a final
+  // `data:` line WITHOUT a trailing newline — dropping it here silently lost
+  // the end of long replies. Also flush the decoder (pending multibyte chars).
+  buffer += decoder.decode()
+  const tail = buffer.trim()
+  if (tail.startsWith('data:')) onData(tail.slice(5).trim())
 }
 
 export class OpenAIAdapter implements Adapter {
