@@ -274,10 +274,13 @@ async function streamOpenAIChat(
     throw new Error(`provider HTTP ${resp.status}: ${errText.slice(0, 300)}`)
   }
   let full = ''
+  let finish = ''
+  let sawDone = false
   await readSse(resp.body, (data) => {
-    if (data === '[DONE]') return
+    if (data === '[DONE]') { sawDone = true; return }
     try {
       const json = JSON.parse(data)
+      if (json.choices?.[0]?.finish_reason) finish = json.choices[0].finish_reason
       const delta = json.choices?.[0]?.delta?.content
       if (delta) {
         full += delta
@@ -287,6 +290,9 @@ async function streamOpenAIChat(
       /* ignore keep-alive / partial */
     }
   })
+  // Surface silent truncation (marker goes to the UI only, not into history).
+  if (finish === 'length') onChunk('\n\n⚠ [reply hit the output limit]')
+  else if (!sawDone && !finish && full) onChunk('\n\n⚠ [stream dropped — reply may be truncated]')
   return full
 }
 
@@ -305,7 +311,7 @@ async function streamAnthropicChat(
     },
     body: JSON.stringify({
       model,
-      max_tokens: 4096,
+      max_tokens: 8192,
       system,
       messages,
       stream: true,
@@ -317,6 +323,8 @@ async function streamAnthropicChat(
     throw new Error(`provider HTTP ${resp.status}: ${errText.slice(0, 300)}`)
   }
   let full = ''
+  let stopReason = ''
+  let stopped = false
   await readSse(resp.body, (data) => {
     try {
       const json = JSON.parse(data)
@@ -324,10 +332,15 @@ async function streamAnthropicChat(
         full += json.delta.text
         onChunk(json.delta.text)
       }
+      if (json.type === 'message_delta' && json.delta?.stop_reason) stopReason = json.delta.stop_reason
+      if (json.type === 'message_stop') stopped = true
     } catch {
       /* ignore */
     }
   })
+  // Surface silent truncation (marker goes to the UI only, not into history).
+  if (stopReason === 'max_tokens') onChunk('\n\n⚠ [reply hit the output limit]')
+  else if (!stopped && full) onChunk('\n\n⚠ [stream dropped — reply may be truncated]')
   return full
 }
 

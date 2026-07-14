@@ -434,6 +434,8 @@ export async function runIdeAgent(
     let finalText = ''
     let turns = 0
     let anyActivity = false // any tool call ran this run
+    let lengthContinues = 0 // auto-continuations after hitting the output cap
+    let continuing = false  // this turn continues a capped reply
 
     for (let i = 0; i < MAX_TURNS; i++) {
       if (signal.aborted) { emit({ type: 'error', error: 'cancelled' }); return }
@@ -476,11 +478,6 @@ export async function runIdeAgent(
       if (res.dropped && streamedThisTurn && toolCalls.length === 0) {
         emit({ type: 'token', delta: '\n\n⚠ [stream dropped — reply may be truncated]', turn })
       }
-      // Hit the output token cap: the reply is cut mid-sentence but the stream
-      // "finished" legally — tell the user they can ask it to continue.
-      if ((res.finishReason === 'length' || res.finishReason === 'max_tokens') && toolCalls.length === 0) {
-        emit({ type: 'token', delta: '\n\n⚠ [reply hit the output limit — say "continue" to resume]', turn })
-      }
       turns++
 
       // Record cost under a virtual role so it shows in the dashboard.
@@ -499,8 +496,23 @@ export async function runIdeAgent(
         emit({ type: 'context', used: usage.input, window: contextWindow, turn })
       }
 
-      if (text) finalText = text
+      if (text) finalText = continuing ? finalText + text : text
+      continuing = false
       if (toolCalls.length === 0) {
+        // Output cap cut the reply mid-sentence: push the partial answer back
+        // and ask the model to continue seamlessly (up to 2 continuations).
+        const capped = res.finishReason === 'length' || res.finishReason === 'max_tokens'
+        if (capped && lengthContinues < 2 && !signal.aborted) {
+          lengthContinues++
+          continuing = true
+          messages.push(assistantMsg)
+          messages.push({
+            role: 'user',
+            content: 'Your reply was cut off by the output token limit. Continue EXACTLY where it stopped — do not repeat any earlier text.',
+          })
+          continue
+        }
+        if (capped) emit({ type: 'token', delta: '\n\n⚠ [reply hit the output limit — say "continue" to resume]', turn })
         // Still empty after retries, nothing streamed, no tools ever ran →
         // surface it instead of silently ending the run with no reply at all.
         if (!finalText && !streamedThisTurn && !anyActivity) {
