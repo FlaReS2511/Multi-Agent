@@ -1567,6 +1567,175 @@ export function IDEView() {
           )}
         </div>
 
+        {/* 4. Collapsible Integrated Agent Dock (Terminal & Logs) */}
+        <div
+          className={`flex flex-col border-t border-zinc-800 bg-zinc-950/80 backdrop-blur-md transition-all duration-300 flex-shrink-0 ${
+            isBottomOpen ? 'h-64' : 'h-8'
+          }`}
+        >
+          {/* Header Panel Control */}
+          <div
+            onClick={() => setIsBottomOpen(!isBottomOpen)}
+            className="h-8 px-3 border-b border-zinc-900 bg-zinc-950 flex items-center justify-between cursor-pointer select-none text-zinc-500 hover:text-zinc-300"
+          >
+            <div className="flex items-center gap-4 text-xs font-semibold tracking-wide" onClick={(e) => e.stopPropagation()}>
+              <button
+                onClick={() => {
+                  setBottomTab('terminal')
+                  setIsBottomOpen(true)
+                }}
+                className={`py-1 px-2 rounded-md transition-all ${
+                  bottomTab === 'terminal' && isBottomOpen ? 'text-white bg-zinc-800 font-bold' : 'text-zinc-500 hover:text-zinc-300'
+                }`}
+              >
+                <span className="flex items-center gap-1">
+                  <TerminalIcon size={12} />
+                  Agent Live Terminal ({selectedAgent})
+                </span>
+              </button>
+
+              <button
+                onClick={() => {
+                  setBottomTab('shell')
+                  setIsBottomOpen(true)
+                }}
+                className={`py-1 px-2 rounded-md transition-all ${
+                  bottomTab === 'shell' && isBottomOpen ? 'text-white bg-zinc-800 font-bold' : 'text-zinc-500 hover:text-zinc-300'
+                }`}
+              >
+                <span className="flex items-center gap-1">
+                  <TerminalIcon size={12} />
+                  Shell
+                </span>
+              </button>
+
+              {/* Shell tabs: switch / rename (double-click) / close / add */}
+              {bottomTab === 'shell' && isBottomOpen && (
+                <div className="flex items-center gap-1 pl-1 border-l border-zinc-800">
+                  {shells.map((s) => (
+                    <div
+                      key={s.id}
+                      onClick={() => setActiveShell(s.id)}
+                      onDoubleClick={() => { setRenamingShell(s.id); setShellNameDraft(s.name) }}
+                      className={`group/shell flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-mono cursor-pointer ${
+                        s.id === activeShell ? 'bg-zinc-800 text-zinc-100' : 'text-zinc-500 hover:text-zinc-300'
+                      }`}
+                    >
+                      {renamingShell === s.id ? (
+                        <input
+                          autoFocus
+                          value={shellNameDraft}
+                          onChange={(e) => setShellNameDraft(e.target.value)}
+                          onClick={(e) => e.stopPropagation()}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') {
+                              const name = shellNameDraft.trim()
+                              if (name) setShells((prev) => prev.map((x) => (x.id === s.id ? { ...x, name } : x)))
+                              setRenamingShell(null)
+                            } else if (e.key === 'Escape') setRenamingShell(null)
+                            e.stopPropagation()
+                          }}
+                          onBlur={() => setRenamingShell(null)}
+                          className="w-16 px-1 bg-zinc-950 border border-blue-500/60 rounded text-[10px] text-zinc-100 focus:outline-none"
+                        />
+                      ) : (
+                        <span>{s.name}</span>
+                      )}
+                      {shells.length > 1 && (
+                        <button
+                          onClick={(e) => { e.stopPropagation(); closeShell(s.id) }}
+                          className="opacity-0 group-hover/shell:opacity-100 text-zinc-600 hover:text-rose-400"
+                        >
+                          <X size={9} />
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                  <button
+                    onClick={addShell}
+                    title="New terminal"
+                    className="px-1 text-zinc-500 hover:text-zinc-200 text-xs leading-none"
+                  >
+                    +
+                  </button>
+                </div>
+              )}
+
+              <button
+                onClick={() => {
+                  setBottomTab('logs')
+                  setIsBottomOpen(true)
+                }}
+                className={`py-1 px-2 rounded-md transition-all ${
+                  bottomTab === 'logs' && isBottomOpen ? 'text-white bg-zinc-800 font-bold' : 'text-zinc-500 hover:text-zinc-300'
+                }`}
+              >
+                <span className="flex items-center gap-1">
+                  <Eye size={12} />
+                  Logs Viewer
+                </span>
+              </button>
+            </div>
+
+            <div className="flex items-center gap-3">
+              {/* Agent Selector Dropdown */}
+              <div onClick={(e) => e.stopPropagation()} className="flex items-center gap-1.5">
+                <span className="text-[10px] text-zinc-500 uppercase tracking-wider font-semibold font-mono">Agent:</span>
+                <select
+                  value={selectedAgent}
+                  onChange={(e) => setSelectedAgent(e.target.value)}
+                  className="bg-zinc-900 border border-zinc-800 text-zinc-300 text-[10px] font-mono px-2 py-0.5 rounded focus:outline-none focus:border-zinc-600 select-none cursor-pointer"
+                >
+                  {agentsList.map((agent) => (
+                    <option key={agent} value={agent}>
+                      {agent}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              
+              {isBottomOpen ? <ChevronDown size={14} /> : <ChevronUp size={14} />}
+            </div>
+          </div>
+
+          {/* Bottom Dock Workspace Content */}
+          {isBottomOpen && (
+            <div className="flex-1 min-h-0 relative bg-zinc-950 overflow-hidden">
+              {bottomTab === 'terminal' ? (
+                <div className="h-full w-full relative">
+                  <AgentTerminal key={selectedAgent} agent={selectedAgent} active={isBottomOpen && bottomTab === 'terminal'} />
+                </div>
+              ) : bottomTab === 'shell' ? (
+                <div className="h-full w-full relative">
+                  {shells.map((s) => (
+                    <div
+                      key={s.id}
+                      className="absolute inset-0"
+                      style={{ display: s.id === activeShell ? 'block' : 'none' }}
+                    >
+                      <ShellTerminal id={s.id} active={isBottomOpen && bottomTab === 'shell' && s.id === activeShell} />
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="h-full w-full bg-zinc-950 p-2 overflow-y-auto font-mono text-[11px] text-zinc-400 select-text scrollbar-thin">
+                  {agentLogs[selectedAgent] && agentLogs[selectedAgent].length > 0 ? (
+                    agentLogs[selectedAgent].map((line, idx) => (
+                      <div key={idx} className="hover:bg-zinc-900/60 py-0.5 px-2 border-l border-zinc-800">
+                        {line}
+                      </div>
+                    ))
+                  ) : (
+                    <div className="h-full flex items-center justify-center text-zinc-600 italic">
+                      No logs recorded for {selectedAgent} in this session.
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+
       </section>
 
       {/* AI Chat side panel — animates its width so the editor (flex-1) shrinks
@@ -1615,177 +1784,6 @@ export function IDEView() {
         </div>
       </motion.aside>
     </div>
-
-      {/* 4. Bottom dock — FULL WIDTH (below editor AND chat) so opening/closing
-          side panels never resizes the terminals (a PTY resize makes the shell
-          reprint its prompt). */}
-      <div
-        className={`flex flex-col border-t border-zinc-800 bg-zinc-950/80 backdrop-blur-md transition-all duration-300 flex-shrink-0 ${
-          isBottomOpen ? 'h-64' : 'h-8'
-        }`}
-      >
-        {/* Header Panel Control */}
-        <div
-          onClick={() => setIsBottomOpen(!isBottomOpen)}
-          className="h-8 px-3 border-b border-zinc-900 bg-zinc-950 flex items-center justify-between cursor-pointer select-none text-zinc-500 hover:text-zinc-300"
-        >
-          <div className="flex items-center gap-4 text-xs font-semibold tracking-wide" onClick={(e) => e.stopPropagation()}>
-            <button
-              onClick={() => {
-                setBottomTab('terminal')
-                setIsBottomOpen(true)
-              }}
-              className={`py-1 px-2 rounded-md transition-all ${
-                bottomTab === 'terminal' && isBottomOpen ? 'text-white bg-zinc-800 font-bold' : 'text-zinc-500 hover:text-zinc-300'
-              }`}
-            >
-              <span className="flex items-center gap-1">
-                <TerminalIcon size={12} />
-                Agent Live Terminal ({selectedAgent})
-              </span>
-            </button>
-
-            <button
-              onClick={() => {
-                setBottomTab('shell')
-                setIsBottomOpen(true)
-              }}
-              className={`py-1 px-2 rounded-md transition-all ${
-                bottomTab === 'shell' && isBottomOpen ? 'text-white bg-zinc-800 font-bold' : 'text-zinc-500 hover:text-zinc-300'
-              }`}
-            >
-              <span className="flex items-center gap-1">
-                <TerminalIcon size={12} />
-                Shell
-              </span>
-            </button>
-
-            {/* Shell tabs: switch / rename (double-click) / close / add */}
-            {bottomTab === 'shell' && isBottomOpen && (
-              <div className="flex items-center gap-1 pl-1 border-l border-zinc-800">
-                {shells.map((s) => (
-                  <div
-                    key={s.id}
-                    onClick={() => setActiveShell(s.id)}
-                    onDoubleClick={() => { setRenamingShell(s.id); setShellNameDraft(s.name) }}
-                    className={`group/shell flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-mono cursor-pointer ${
-                      s.id === activeShell ? 'bg-zinc-800 text-zinc-100' : 'text-zinc-500 hover:text-zinc-300'
-                    }`}
-                  >
-                    {renamingShell === s.id ? (
-                      <input
-                        autoFocus
-                        value={shellNameDraft}
-                        onChange={(e) => setShellNameDraft(e.target.value)}
-                        onClick={(e) => e.stopPropagation()}
-                        onKeyDown={(e) => {
-                          if (e.key === 'Enter') {
-                            const name = shellNameDraft.trim()
-                            if (name) setShells((prev) => prev.map((x) => (x.id === s.id ? { ...x, name } : x)))
-                            setRenamingShell(null)
-                          } else if (e.key === 'Escape') setRenamingShell(null)
-                          e.stopPropagation()
-                        }}
-                        onBlur={() => setRenamingShell(null)}
-                        className="w-16 px-1 bg-zinc-950 border border-blue-500/60 rounded text-[10px] text-zinc-100 focus:outline-none"
-                      />
-                    ) : (
-                      <span>{s.name}</span>
-                    )}
-                    {shells.length > 1 && (
-                      <button
-                        onClick={(e) => { e.stopPropagation(); closeShell(s.id) }}
-                        className="opacity-0 group-hover/shell:opacity-100 text-zinc-600 hover:text-rose-400"
-                      >
-                        <X size={9} />
-                      </button>
-                    )}
-                  </div>
-                ))}
-                <button
-                  onClick={addShell}
-                  title="New terminal"
-                  className="px-1 text-zinc-500 hover:text-zinc-200 text-xs leading-none"
-                >
-                  +
-                </button>
-              </div>
-            )}
-
-            <button
-              onClick={() => {
-                setBottomTab('logs')
-                setIsBottomOpen(true)
-              }}
-              className={`py-1 px-2 rounded-md transition-all ${
-                bottomTab === 'logs' && isBottomOpen ? 'text-white bg-zinc-800 font-bold' : 'text-zinc-500 hover:text-zinc-300'
-              }`}
-            >
-              <span className="flex items-center gap-1">
-                <Eye size={12} />
-                Logs Viewer
-              </span>
-            </button>
-          </div>
-
-          <div className="flex items-center gap-3">
-            {/* Agent Selector Dropdown */}
-            <div onClick={(e) => e.stopPropagation()} className="flex items-center gap-1.5">
-              <span className="text-[10px] text-zinc-500 uppercase tracking-wider font-semibold font-mono">Agent:</span>
-              <select
-                value={selectedAgent}
-                onChange={(e) => setSelectedAgent(e.target.value)}
-                className="bg-zinc-900 border border-zinc-800 text-zinc-300 text-[10px] font-mono px-2 py-0.5 rounded focus:outline-none focus:border-zinc-600 select-none cursor-pointer"
-              >
-                {agentsList.map((agent) => (
-                  <option key={agent} value={agent}>
-                    {agent}
-                  </option>
-                ))}
-              </select>
-            </div>
-            
-            {isBottomOpen ? <ChevronDown size={14} /> : <ChevronUp size={14} />}
-          </div>
-        </div>
-
-        {/* Bottom Dock Workspace Content */}
-        {isBottomOpen && (
-          <div className="flex-1 min-h-0 relative bg-zinc-950 overflow-hidden">
-            {bottomTab === 'terminal' ? (
-              <div className="h-full w-full relative">
-                <AgentTerminal key={selectedAgent} agent={selectedAgent} active={isBottomOpen && bottomTab === 'terminal'} />
-              </div>
-            ) : bottomTab === 'shell' ? (
-              <div className="h-full w-full relative">
-                {shells.map((s) => (
-                  <div
-                    key={s.id}
-                    className="absolute inset-0"
-                    style={{ display: s.id === activeShell ? 'block' : 'none' }}
-                  >
-                    <ShellTerminal id={s.id} active={isBottomOpen && bottomTab === 'shell' && s.id === activeShell} />
-                  </div>
-                ))}
-              </div>
-            ) : (
-              <div className="h-full w-full bg-zinc-950 p-2 overflow-y-auto font-mono text-[11px] text-zinc-400 select-text scrollbar-thin">
-                {agentLogs[selectedAgent] && agentLogs[selectedAgent].length > 0 ? (
-                  agentLogs[selectedAgent].map((line, idx) => (
-                    <div key={idx} className="hover:bg-zinc-900/60 py-0.5 px-2 border-l border-zinc-800">
-                      {line}
-                    </div>
-                  ))
-                ) : (
-                  <div className="h-full flex items-center justify-center text-zinc-600 italic">
-                    No logs recorded for {selectedAgent} in this session.
-                  </div>
-                )}
-              </div>
-            )}
-          </div>
-        )}
-      </div>
 
       {/* Status bar spans the full window width below all panels. */}
       <StatusBar
