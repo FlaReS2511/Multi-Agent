@@ -713,15 +713,23 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
         else if (e.type === 'done' && usePlan && e.text?.trim()) setPlanApproval({ text: e.text.trim(), explicit: false })
         // Snap every streaming item to its full received text — append the
         // remaining tail as one final glowing chunk, no lingering typewriter.
+        // Tails MUST be computed before the setState: updaters must stay pure
+        // (StrictMode double-invokes them) — advancing shownRef inside meant
+        // the second invocation saw shown==target and returned the item
+        // WITHOUT its tail, silently eating the end of the reply from the
+        // display, the persisted session and the next turn's history.
+        const tails = new Map<string, string>()
+        for (const [tid, target] of targetRef.current) {
+          const shown = shownRef.current.get(tid) ?? 0
+          if (shown < target.length) {
+            tails.set(tid, target.slice(shown))
+            shownRef.current.set(tid, target.length)
+          }
+        }
         setAgentItems((prev) => {
           const copy = prev.map((it) => {
-            if ((it.kind === 'text' || it.kind === 'reasoning') && it.id) {
-              const target = targetRef.current.get(it.id)
-              const shown = shownRef.current.get(it.id) ?? 0
-              if (target != null && shown < target.length) {
-                shownRef.current.set(it.id, target.length)
-                return { ...it, chunks: [...(it.chunks ?? []), target.slice(shown)] }
-              }
+            if ((it.kind === 'text' || it.kind === 'reasoning') && it.id && tails.has(it.id)) {
+              return { ...it, chunks: [...(it.chunks ?? []), tails.get(it.id) as string] }
             }
             return it
           })
@@ -779,15 +787,20 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
       else window.api.aiChatCancel(reqIdRef.current)
     }
     if (rafRef.current != null) { cancelAnimationFrame(rafRef.current); rafRef.current = null }
-    // Snap streaming items to whatever text has arrived so far.
+    // Snap streaming items to whatever text has arrived so far. Tails are
+    // computed outside the updater — see the identical snap in the run-end
+    // handler for why (StrictMode double-invoke ate the tail).
+    const tails = new Map<string, string>()
+    for (const [tid, target] of targetRef.current) {
+      const shown = shownRef.current.get(tid) ?? 0
+      if (shown < target.length) {
+        tails.set(tid, target.slice(shown))
+        shownRef.current.set(tid, target.length)
+      }
+    }
     setAgentItems((prev) => prev.map((it) => {
-      if ((it.kind === 'text' || it.kind === 'reasoning') && it.id) {
-        const target = targetRef.current.get(it.id)
-        const shown = shownRef.current.get(it.id) ?? 0
-        if (target != null && shown < target.length) {
-          shownRef.current.set(it.id, target.length)
-          return { ...it, chunks: [...(it.chunks ?? []), target.slice(shown)] }
-        }
+      if ((it.kind === 'text' || it.kind === 'reasoning') && it.id && tails.has(it.id)) {
+        return { ...it, chunks: [...(it.chunks ?? []), tails.get(it.id) as string] }
       }
       return it
     }))
