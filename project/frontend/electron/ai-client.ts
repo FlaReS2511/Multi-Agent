@@ -122,7 +122,7 @@ export async function streamInlineEdit(
 
 function buildChatSystem(params: ChatParams): string {
   let system =
-    'You are Orqon, an expert AI coding assistant embedded in an IDE. ' +
+    'You are an expert AI coding assistant embedded in an IDE. ' +
     'Help the user understand, write, and improve code. Be concise and precise. ' +
     'When you output code, always use fenced code blocks with a language tag. ' +
     'Reference file names and line numbers when relevant.'

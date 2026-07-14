@@ -319,7 +319,7 @@ function estimateCostUsd(tokensIn: number, tokensOut: number, rates: [number, nu
 
 function buildSystemPrompt(params: IdeAgentParams, workspaceRoot: string): string {
   let s =
-    'You are Orqon, an expert AI coding agent embedded in an IDE. You have tools ' +
+    'You are an expert AI coding agent embedded in an IDE. You have tools ' +
     'to read and modify the user\'s workspace directly: Read, Write, Edit, MultiEdit, ' +
     'Grep, Glob, ListDir, Move, Delete. ' +
     'You also have editor tools to work with what the user sees: OpenFile (show a file ' +
@@ -341,7 +341,7 @@ function buildSystemPrompt(params: IdeAgentParams, workspaceRoot: string): strin
     `Workspace root: ${workspaceRoot}`
   if (params.planMode) {
     s =
-      'You are Orqon in PLAN MODE. You may ONLY investigate — read files, search, run ' +
+      'You are in PLAN MODE. You may ONLY investigate — read files, search, run ' +
       'diagnostics, inspect git, browse the web. You must NOT modify anything (no Write/Edit/' +
       'commits/commands). Research the request thoroughly FIRST. Only when your plan is complete ' +
       'and final, call the PresentPlan tool with the full step-by-step plan (files to change and how, ' +
@@ -353,7 +353,7 @@ function buildSystemPrompt(params: IdeAgentParams, workspaceRoot: string): strin
       `Workspace root: ${workspaceRoot}`
   } else if (params.researchMode) {
     s =
-      'You are Orqon in RESEARCH mode. Investigate the question DEEPLY and strictly READ-ONLY. You may ' +
+      'You are in RESEARCH mode. Investigate the question DEEPLY and strictly READ-ONLY. You may ' +
       'read the codebase (Read/Grep/Glob/ListDir/GetDiagnostics), inspect git history (GitStatus/Diff/Log), ' +
       'and research the web with WebSearch, WebFetch, and Research (a one-call multi-source deep dive). ' +
       'Do NOT modify anything. Go DEEP: call Research with 2–4 sub-queries covering different angles of the ' +
