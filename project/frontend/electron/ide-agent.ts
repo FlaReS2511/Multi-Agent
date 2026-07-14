@@ -473,6 +473,12 @@ export async function runIdeAgent(
         break
       }
       const { text, toolCalls, assistantMsg, usage } = res
+      // One-line turn trace (main-process stdout) — how did the stream end?
+      // Lets us tell apart: clean finish vs output cap vs dropped stream.
+      console.log(
+        `[agent] turn=${turns + 1} finish=${res.finishReason || '-'} dropped=${!!res.dropped} ` +
+        `tools=${toolCalls.length} textLen=${text.length} in=${usage.input} out=${usage.output}`,
+      )
       // Upstream closed the stream without a finish marker after partial
       // output — flag it visibly instead of passing the cut-off reply as done.
       if (res.dropped && streamedThisTurn && toolCalls.length === 0) {
