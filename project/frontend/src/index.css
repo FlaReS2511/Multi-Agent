@@ -158,16 +158,52 @@ html, body, #root {
   animation: plan-bottom-in 0.9s ease-out;
 }
 
-/* Review-mode activation wave — the Apple Intelligence "power-on": a narrow
-   bright emerald comet sweeps ONCE around the chat rim (same conic+xor-mask
-   rim technique as .plan-glow, but the ring is transparent except one arc)
-   while the edges bloom, then everything fades. One-shot; the element is
-   removed on animationend. */
-.review-wave {
+/* Review-mode glow — persistent while review is ON (same shape as plan/
+   research), SKY-BLUE palette. Reuses the plan keyframes. */
+.review-glow {
   position: absolute;
   inset: 0;
   z-index: 30;
   pointer-events: none;
+  border-radius: inherit;
+  box-shadow: inset 0 0 20px rgba(56, 189, 248, 0.26);
+  animation: plan-glow-breathe 3s ease-in-out infinite;
+}
+.review-glow::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  padding: 2px;
+  background: conic-gradient(from var(--plan-angle),
+    #0284c7, #38bdf8, #ffffff, #0ea5e9, #e0f2fe, #0369a1, #7dd3fc, #0284c7);
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+          mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+          mask-composite: exclude;
+  filter: blur(4px);
+  animation: plan-glow-spin 6s linear infinite;
+}
+.review-glow::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 12%;
+  background: linear-gradient(to top, rgba(56, 189, 248, 0.5), rgba(14, 165, 233, 0.14) 50%, transparent);
+  filter: blur(6px);
+  animation: plan-bottom-in 0.9s ease-out;
+}
+
+/* Review-mode activation wave — the Apple Intelligence "power-on": a narrow
+   bright sky-blue comet sweeps ONCE around the chat rim (same conic+xor-mask
+   rim technique as .plan-glow, but the ring is transparent except one arc)
+   while the edges bloom; it fades into the persistent .review-glow. One-shot;
+   the element is removed on animationend. */
+.review-wave {
+  position: absolute;
+  inset: 0;
   border-radius: inherit;
 }
 .review-wave::before {
@@ -180,8 +216,8 @@ html, body, #root {
      at the end of the turn so its head leads as --plan-angle grows. */
   background: conic-gradient(from var(--plan-angle),
     transparent 0deg, transparent 270deg,
-    rgba(16, 185, 129, 0.0) 278deg, rgba(52, 211, 153, 0.45) 305deg,
-    #34d399 326deg, #a7f3d0 342deg, #ffffff 352deg, transparent 360deg);
+    rgba(14, 165, 233, 0.0) 278deg, rgba(56, 189, 248, 0.45) 305deg,
+    #38bdf8 326deg, #bae6fd 342deg, #ffffff 352deg, transparent 360deg);
   -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
           mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
   -webkit-mask-composite: xor;
@@ -195,8 +231,18 @@ html, body, #root {
   position: absolute;
   inset: 0;
   border-radius: inherit;
-  box-shadow: inset 0 0 36px rgba(52, 211, 153, 0.45);
+  box-shadow: inset 0 0 36px rgba(56, 189, 248, 0.45);
   animation: review-wave-bloom 1.5s ease-out forwards;
+}
+/* Center wash — the light wave that rolls across the MIDDLE of the panel on
+   activation (Apple lights the display's center too, not just the rim). */
+.review-wave-center {
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(58% 46% at 50% 55%,
+    rgba(186, 230, 253, 0.30), rgba(56, 189, 248, 0.16) 45%, transparent 72%);
+  filter: blur(10px);
+  animation: review-wave-center 1.5s ease-out forwards;
 }
 @keyframes review-wave-sweep {
   0% { --plan-angle: 0deg; opacity: 0; }
@@ -208,6 +254,11 @@ html, body, #root {
   0% { opacity: 0; }
   30% { opacity: 1; }
   100% { opacity: 0; }
+}
+@keyframes review-wave-center {
+  0% { opacity: 0; transform: scale(0.72); }
+  35% { opacity: 1; }
+  100% { opacity: 0; transform: scale(1.16); }
 }
 
 /* Git gutter — thin bars in Monaco's linesDecorations lane marking lines

@@ -1439,29 +1439,36 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
           enter and DIMS OUT on exit (the wrapper animates opacity; the inner
           rim/breathe keep their own CSS animation). Clipped, no pointer. */}
       <AnimatePresence>
-        {mode === 'agent' && (planMode || researchMode) && (
+        {mode === 'agent' && (planMode || researchMode || reviewMode) && (
           <motion.div
-            key={planMode ? 'plan-glow' : 'research-glow'}
+            key={planMode ? 'plan-glow' : researchMode ? 'research-glow' : 'review-glow'}
             className="absolute inset-0 z-30 pointer-events-none"
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
             transition={{ duration: 0.6, ease: 'easeInOut' }}
           >
-            <div className={planMode ? 'plan-glow' : 'research-glow'} aria-hidden="true" />
+            <div
+              className={planMode ? 'plan-glow' : researchMode ? 'research-glow' : 'review-glow'}
+              aria-hidden="true"
+            />
           </motion.div>
         )}
       </AnimatePresence>
 
-      {/* Review-mode activation wave: a bright emerald comet sweeps once
-          around the chat rim while the edges bloom, then fades — review's
-          resting indicator stays the shield badge, no permanent glow. */}
+      {/* Review-mode activation wave: an emerald comet sweeps once around the
+          rim while a soft wash blooms across the CENTER (the Apple
+          Intelligence power-on), then both fade into the persistent
+          .review-glow above. */}
       {reviewWave && (
         <div
-          className="review-wave"
+          className="absolute inset-0 z-30 pointer-events-none"
           aria-hidden="true"
           onAnimationEnd={() => setReviewWave(false)}
-        />
+        >
+          <div className="review-wave" />
+          <div className="review-wave-center" />
+        </div>
       )}
     </motion.div>
   )
