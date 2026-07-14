@@ -657,7 +657,11 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
 
     const off = window.api.onAiAgentEvent(runId, (e: IdeAgentEvent) => {
       if (e.type === 'reasoning' || e.type === 'token') {
-        const id = `${e.type}-${e.turn}`
+        // Namespace ids by runId: turns restart at 0 every run, so a bare
+        // `token-0` collided with the PREVIOUS run's bubble — new text got
+        // appended into the old bubble and the real bubble froze mid-word
+        // (its reveal cursor was consumed/cleared by the id collision).
+        const id = `${runId}-${e.type}-${e.turn}`
         targetRef.current.set(id, (targetRef.current.get(id) ?? '') + e.delta)
         setAgentItems((prev) => {
           const idx = prev.findIndex((it) => (it.kind === 'text' || it.kind === 'reasoning') && it.id === id)
