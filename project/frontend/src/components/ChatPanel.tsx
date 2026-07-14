@@ -226,7 +226,7 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
   // Plan text stashed while a git-dirty warning is shown before running it.
   const pendingPlanRef = useRef<string | null>(null)
   const [reviewMode, setReviewMode] = useState(false)
-  const [reviewWave, setReviewWave] = useState(false) // one-shot activation sweep
+  const [planWave, setPlanWave] = useState(false) // one-shot activation sweep
   // Files the current agent run has written (for the "Undo run" affordance).
   const runFilesRef = useRef<Set<string>>(new Set())
   const [lastRunFiles, setLastRunFiles] = useState<string[]>([])
@@ -470,14 +470,18 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
     const next = !reviewMode
     setReviewMode(next)
     window.api.ideAgentConfigSet({ reviewMode: next }).catch(() => {})
-    // Turning review ON plays the activation wave once (Apple-Intelligence
-    // style sweep). Timeout is a fallback in case the CSS animation never
-    // runs (e.g. animations disabled) so the overlay can't get stuck.
-    if (next) {
-      setReviewWave(true)
-      window.setTimeout(() => setReviewWave(false), 1600)
-    }
   }
+
+  // Entering plan mode plays the activation wave once (Apple-Intelligence
+  // power-on), then the persistent plan-glow carries on. Timeout is a
+  // fallback in case the CSS animation never runs (e.g. animations disabled)
+  // so the overlay can't get stuck.
+  useEffect(() => {
+    if (!planMode) return
+    setPlanWave(true)
+    const t = window.setTimeout(() => setPlanWave(false), 1600)
+    return () => window.clearTimeout(t)
+  }, [planMode])
 
   // Revert every file the last run wrote (git checkout tracked, delete new).
   const undoLastRun = async () => {
@@ -1439,35 +1443,32 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
           enter and DIMS OUT on exit (the wrapper animates opacity; the inner
           rim/breathe keep their own CSS animation). Clipped, no pointer. */}
       <AnimatePresence>
-        {mode === 'agent' && (planMode || researchMode || reviewMode) && (
+        {mode === 'agent' && (planMode || researchMode) && (
           <motion.div
-            key={planMode ? 'plan-glow' : researchMode ? 'research-glow' : 'review-glow'}
+            key={planMode ? 'plan-glow' : 'research-glow'}
             className="absolute inset-0 z-30 pointer-events-none"
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
             transition={{ duration: 0.6, ease: 'easeInOut' }}
           >
-            <div
-              className={planMode ? 'plan-glow' : researchMode ? 'research-glow' : 'review-glow'}
-              aria-hidden="true"
-            />
+            <div className={planMode ? 'plan-glow' : 'research-glow'} aria-hidden="true" />
           </motion.div>
         )}
       </AnimatePresence>
 
-      {/* Review-mode activation wave: an emerald comet sweeps once around the
-          rim while a soft wash blooms across the CENTER (the Apple
+      {/* Plan-mode activation wave: light wraps up from the bottom edge along
+          both sides while a soft wash blooms across the CENTER (the Apple
           Intelligence power-on), then both fade into the persistent
-          .review-glow above. */}
-      {reviewWave && (
+          .plan-glow above. */}
+      {planWave && (
         <div
           className="absolute inset-0 z-30 pointer-events-none"
           aria-hidden="true"
-          onAnimationEnd={() => setReviewWave(false)}
+          onAnimationEnd={() => setPlanWave(false)}
         >
-          <div className="review-wave" />
-          <div className="review-wave-center" />
+          <div className="plan-wave" />
+          <div className="plan-wave-center" />
         </div>
       )}
     </motion.div>

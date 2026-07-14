@@ -75,8 +75,8 @@ html, body, #root {
   initial-value: 0deg;
   inherits: false;
 }
-/* Lit span of the review activation wrap (see .review-wave::before). */
-@property --review-wrap {
+/* Lit span of the plan activation wrap (see .plan-wave::before). */
+@property --plan-wrap {
   syntax: '<angle>';
   initial-value: 0deg;
   inherits: false;
@@ -164,112 +164,71 @@ html, body, #root {
   animation: plan-bottom-in 0.9s ease-out;
 }
 
-/* Review-mode glow — persistent while review is ON (same shape as plan/
-   research), SKY-BLUE palette. Reuses the plan keyframes. */
-.review-glow {
-  position: absolute;
-  inset: 0;
-  z-index: 30;
-  pointer-events: none;
-  border-radius: inherit;
-  box-shadow: inset 0 0 20px rgba(56, 189, 248, 0.26);
-  animation: plan-glow-breathe 3s ease-in-out infinite;
-}
-.review-glow::before {
-  content: '';
-  position: absolute;
-  inset: 0;
-  border-radius: inherit;
-  padding: 2px;
-  background: conic-gradient(from var(--plan-angle),
-    #0284c7, #38bdf8, #ffffff, #0ea5e9, #e0f2fe, #0369a1, #7dd3fc, #0284c7);
-  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
-          mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
-  -webkit-mask-composite: xor;
-          mask-composite: exclude;
-  filter: blur(4px);
-  animation: plan-glow-spin 6s linear infinite;
-}
-.review-glow::after {
-  content: '';
-  position: absolute;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  height: 12%;
-  background: linear-gradient(to top, rgba(56, 189, 248, 0.5), rgba(14, 165, 233, 0.14) 50%, transparent);
-  filter: blur(6px);
-  animation: plan-bottom-in 0.9s ease-out;
-}
-
-/* Review-mode activation wave — the Apple Intelligence "power-on": a narrow
-   bright sky-blue comet sweeps ONCE around the chat rim (same conic+xor-mask
-   rim technique as .plan-glow, but the ring is transparent except one arc)
-   while the edges bloom; it fades into the persistent .review-glow. One-shot;
-   the element is removed on animationend. */
-.review-wave {
+/* Plan-mode activation wave — the Apple Intelligence "power-on" that plays
+   ONCE when plan mode turns on, then melts into the persistent .plan-glow.
+   Light wraps up from the BOTTOM edge along both sides at once and meets at
+   the top, while the edges bloom. The element is removed on animationend. */
+.plan-wave {
   position: absolute;
   inset: 0;
   border-radius: inherit;
 }
-.review-wave::before {
+.plan-wave::before {
   content: '';
   position: absolute;
   inset: 0;
   border-radius: inherit;
   padding: 3px;
-  /* Light wraps up from the BOTTOM edge along both sides at once and meets at
-     the top — the real Apple Intelligence power-on, not a comet lap. The lit
-     span is ±--review-wrap around the bottom (conic from 180deg = bottom),
+  /* Lit span is ±--plan-wrap around the bottom (conic from 180deg = bottom),
      with a soft 30deg leading edge on each side. */
   background: conic-gradient(from 180deg,
     #ffffff 0deg,
-    #7dd3fc var(--review-wrap),
-    transparent calc(var(--review-wrap) + 30deg),
-    transparent calc(330deg - var(--review-wrap)),
-    #7dd3fc calc(360deg - var(--review-wrap)),
+    #60a5fa var(--plan-wrap),
+    transparent calc(var(--plan-wrap) + 30deg),
+    transparent calc(330deg - var(--plan-wrap)),
+    #60a5fa calc(360deg - var(--plan-wrap)),
     #ffffff 360deg);
   -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
           mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
   -webkit-mask-composite: xor;
           mask-composite: exclude;
   filter: blur(5px);
-  animation: review-wave-wrap 1.4s cubic-bezier(0.3, 0.1, 0.25, 1) forwards;
+  animation: plan-wave-wrap 1.5s cubic-bezier(0.3, 0.1, 0.25, 1) forwards;
 }
-/* Edge bloom that swells as the comet travels, then dies down with it. */
-.review-wave::after {
+/* Edge bloom that swells as the light wraps, then dies down with it. */
+.plan-wave::after {
   content: '';
   position: absolute;
   inset: 0;
   border-radius: inherit;
-  box-shadow: inset 0 0 36px rgba(56, 189, 248, 0.45);
-  animation: review-wave-bloom 1.5s ease-out forwards;
+  box-shadow: inset 0 0 36px rgba(96, 165, 250, 0.45);
+  animation: plan-wave-bloom 1.5s ease-out forwards;
 }
 /* Center wash — the light wave that rolls across the MIDDLE of the panel on
    activation (Apple lights the display's center too, not just the rim). */
-.review-wave-center {
+.plan-wave-center {
   position: absolute;
   inset: 0;
   background: radial-gradient(58% 46% at 50% 55%,
-    rgba(186, 230, 253, 0.30), rgba(56, 189, 248, 0.16) 45%, transparent 72%);
+    rgba(219, 234, 254, 0.30), rgba(96, 165, 250, 0.16) 45%, transparent 72%);
   filter: blur(10px);
-  animation: review-wave-center 1.5s ease-out forwards;
+  animation: plan-wave-center 1.5s ease-out forwards;
 }
-@keyframes review-wave-wrap {
+@keyframes plan-wave-wrap {
   /* Wrap stops at 150deg: each side carries a 30deg soft edge, so the two
      edges meet exactly at the top (150+30 = 180) without crossing — crossed
      stops clamp and draw a hard seam. */
-  0% { --review-wrap: 0deg; opacity: 0; }
+  0% { --plan-wrap: 0deg; opacity: 0; }
   10% { opacity: 1; }
-  62% { --review-wrap: 150deg; opacity: 1; }
-  100% { --review-wrap: 150deg; opacity: 0; } /* hold, then melt into .review-glow */
+  62% { --plan-wrap: 150deg; opacity: 1; }
+  100% { --plan-wrap: 150deg; opacity: 0; } /* hold, then melt into .plan-glow */
 }
-@keyframes review-wave-bloom {
+@keyframes plan-wave-bloom {
   0% { opacity: 0; }
   30% { opacity: 1; }
   100% { opacity: 0; }
 }
-@keyframes review-wave-center {
+@keyframes plan-wave-center {
   0% { opacity: 0; transform: scale(0.72); }
   35% { opacity: 1; }
   100% { opacity: 0; transform: scale(1.16); }
