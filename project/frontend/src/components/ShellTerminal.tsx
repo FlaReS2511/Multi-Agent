@@ -75,8 +75,16 @@ export function ShellTerminal({ id, active }: Props) {
     const dataDisposable = term.onData((data) => window.api.shellWrite(id, data))
     const resizeDisposable = term.onResize(({ cols, rows }) => window.api.shellResize(id, cols, rows))
 
+    // Debounced refit: panel width animations fire ResizeObserver dozens of
+    // times; refitting (and SIGWINCH-ing the PTY) on each tick makes the shell
+    // redraw its prompt at every intermediate width, spraying junk lines.
+    // Fit once, after the size has settled.
+    let fitTimer: ReturnType<typeof setTimeout> | null = null
     const ro = new ResizeObserver(() => {
-      try { fit.fit() } catch { /* ignore */ }
+      if (fitTimer) clearTimeout(fitTimer)
+      fitTimer = setTimeout(() => {
+        try { fit.fit() } catch { /* ignore */ }
+      }, 150)
     })
     ro.observe(containerRef.current)
 
@@ -85,6 +93,7 @@ export function ShellTerminal({ id, active }: Props) {
       offExit()
       dataDisposable.dispose()
       resizeDisposable.dispose()
+      if (fitTimer) clearTimeout(fitTimer)
       ro.disconnect()
       term.dispose()
       termRef.current = null
