@@ -162,6 +162,9 @@ interface Props {
   onRunFinished?: (info: { kind: 'done' | 'error' | 'blocked' | 'plan' }) => void
   // Workspace file list for @file mentions (relPaths).
   files?: string[]
+  // Current workspace root — the panel reloads its session when this changes
+  // (it stays mounted across workspace switches).
+  workspaceRoot?: string
 }
 
 // Wind-up choreography: the frame slides open first (handled by the parent),
@@ -177,7 +180,7 @@ const itemVariants = {
   show: { opacity: 1, y: 0, transition: { duration: 0.28, ease: 'easeOut' } },
 }
 
-export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, onChangeResolved, onEditorRequest, windup = true, visible = true, onRunStateChange, onContextUsage, onRunFinished, files = [] }: Props) {
+export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, onChangeResolved, onEditorRequest, windup = true, visible = true, onRunStateChange, onContextUsage, onRunFinished, files = [], workspaceRoot = '' }: Props) {
   const { chatFontSize } = useUiSettings()
   const [mode, setMode] = useState<'ask' | 'agent'>('ask')
   // Plan mode is a toggle WITHIN agent mode (via /plan): runs read-only and
@@ -276,24 +279,44 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
   useEffect(() => { agentItemsRef.current = agentItems }, [agentItems])
   useEffect(() => { sessionIdRef.current = sessionId }, [sessionId])
 
-  // Restore the most recent session for this workspace on mount, so the agent
-  // remembers earlier conversations across app restarts.
+  // Restore the most recent session for the CURRENT workspace — on first load
+  // and again whenever the workspace changes (the panel stays mounted across
+  // switches; without this the old workspace's conversation bled into the new
+  // one and confused the model).
+  const restoredRootRef = useRef<string | null>(null)
   useEffect(() => {
+    if (!workspaceRoot || restoredRootRef.current === workspaceRoot) return
+    const isSwitch = restoredRootRef.current !== null
+    restoredRootRef.current = workspaceRoot
     let cancelled = false
-    window.api.agentSessionLatest().then((s) => {
-      if (cancelled || !s) return
-      try {
-        const items = JSON.parse(s.items) as AgentItem[]
-        if (Array.isArray(items) && items.length > 0) {
-          setAgentItems(items)
-          agentItemsRef.current = items
-        }
-        setSessionId(s.id)
-        sessionIdRef.current = s.id
-      } catch { /* ignore malformed */ }
-    }).catch(() => {})
+    ;(async () => {
+      if (isSwitch) {
+        // Workspace switched: end any in-flight run and clear the transcript
+        // before loading the new workspace's latest session.
+        if (reqIdRef.current) stop()
+        setMessages([])
+        setTodos([])
+        setPlanApproval(null)
+        setLastRunFiles([])
+        setCtxUsage(null)
+      }
+      const s = await window.api.agentSessionLatest().catch(() => null)
+      if (cancelled) return
+      let items: AgentItem[] = []
+      if (s) {
+        try {
+          const parsed = JSON.parse(s.items) as AgentItem[]
+          if (Array.isArray(parsed)) items = parsed
+        } catch { /* malformed — start clean */ }
+      }
+      setAgentItems(items)
+      agentItemsRef.current = items
+      setSessionId(s?.id ?? null)
+      sessionIdRef.current = s?.id ?? null
+    })()
     return () => { cancelled = true }
-  }, [])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [workspaceRoot])
 
   // Refresh the session list (for the picker dropdown).
   const refreshSessions = () => {
