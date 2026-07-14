@@ -177,6 +177,33 @@ export function IDEView() {
   // Bottom dock panel state
   const [isBottomOpen, setIsBottomOpen] = useState(true)
   const [bottomTab, setBottomTab] = useState<'terminal' | 'shell' | 'logs'>('terminal')
+  // Resizable dock height (drag the top edge), persisted.
+  const [dockHeight, setDockHeight] = useState(() => {
+    const v = Number(localStorage.getItem('orqon.dockHeight'))
+    return v >= 120 && v <= 800 ? v : 256
+  })
+  const [draggingDock, setDraggingDock] = useState(false)
+  const startDockResize = (e: React.MouseEvent) => {
+    e.preventDefault()
+    e.stopPropagation()
+    setDraggingDock(true)
+    const startY = e.clientY
+    const startH = dockHeight
+    let latest = startH
+    const maxH = Math.round(window.innerHeight * 0.7)
+    const onMove = (ev: MouseEvent) => {
+      latest = Math.min(maxH, Math.max(120, startH + (startY - ev.clientY)))
+      setDockHeight(latest)
+    }
+    const onUp = () => {
+      setDraggingDock(false)
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', onUp)
+      localStorage.setItem('orqon.dockHeight', String(latest))
+    }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
+  }
 
   // Multiple user shells (tabs in the dock). All stay mounted (hidden when
   // inactive) so their buffers survive switching.
@@ -1567,12 +1594,22 @@ export function IDEView() {
           )}
         </div>
 
-        {/* 4. Collapsible Integrated Agent Dock (Terminal & Logs) */}
+        {/* 4. Collapsible Integrated Agent Dock (Terminal & Logs) — height is
+            drag-resizable from its top edge and persisted. */}
         <div
-          className={`flex flex-col border-t border-zinc-800 bg-zinc-950/80 backdrop-blur-md transition-all duration-300 flex-shrink-0 ${
-            isBottomOpen ? 'h-64' : 'h-8'
+          className={`relative flex flex-col border-t border-zinc-800 bg-zinc-950/80 backdrop-blur-md flex-shrink-0 ${
+            draggingDock ? '' : 'transition-all duration-300'
           }`}
+          style={{ height: isBottomOpen ? dockHeight : 32 }}
         >
+          {/* Drag handle: resize the dock from its top edge. */}
+          {isBottomOpen && (
+            <div
+              onMouseDown={startDockResize}
+              className="absolute -top-0.5 left-0 right-0 h-1.5 z-20 cursor-row-resize hover:bg-blue-500/50 transition-colors"
+              title="Drag to resize"
+            />
+          )}
           {/* Header Panel Control */}
           <div
             onClick={() => setIsBottomOpen(!isBottomOpen)}
