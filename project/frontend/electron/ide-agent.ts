@@ -336,6 +336,8 @@ function buildSystemPrompt(params: IdeAgentParams, workspaceRoot: string): strin
     'Open the relevant file with OpenFile so the user can follow along. ' +
     'Work autonomously: inspect the code with Read/Grep/Glob before changing it, make ' +
     'the smallest correct edit, and prefer Edit over Write for existing files. ' +
+    'Stay on-task: only explore the workspace when the task actually requires it — if the ' +
+    'user asks about one specific file (even outside the workspace), focus on that file. ' +
     'Paths are relative to the workspace root. When done, give a brief summary of what ' +
     'you changed. Do not ask for confirmation in text — the user reviews changes in the editor.\n\n' +
     `Workspace root: ${workspaceRoot}`
@@ -507,7 +509,12 @@ export async function runIdeAgent(
       if (toolCalls.length === 0) {
         // Output cap cut the reply mid-sentence: push the partial answer back
         // and ask the model to continue seamlessly (up to 2 continuations).
-        const capped = res.finishReason === 'length' || res.finishReason === 'max_tokens'
+        // Some gateways silently cap output and report finish=stop anyway —
+        // treat a "stop" that ends mid-sentence as capped too (heuristic).
+        const t = text.trimEnd()
+        const looksTruncated =
+          res.finishReason === 'stop' && t.length > 150 && /[\p{L}\p{N},(–—-]$/u.test(t) && !t.endsWith('```')
+        const capped = res.finishReason === 'length' || res.finishReason === 'max_tokens' || looksTruncated
         if (capped && lengthContinues < 2 && !signal.aborted) {
           lengthContinues++
           continuing = true
