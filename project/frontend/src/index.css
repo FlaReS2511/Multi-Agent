@@ -75,6 +75,12 @@ html, body, #root {
   initial-value: 0deg;
   inherits: false;
 }
+/* Lit span of the review activation wrap (see .review-wave::before). */
+@property --review-wrap {
+  syntax: '<angle>';
+  initial-value: 0deg;
+  inherits: false;
+}
 .plan-glow {
   position: absolute;
   inset: 0;
@@ -212,18 +218,23 @@ html, body, #root {
   inset: 0;
   border-radius: inherit;
   padding: 3px;
-  /* Transparent ring with one bright multicolor arc — the comet. The arc sits
-     at the end of the turn so its head leads as --plan-angle grows. */
-  background: conic-gradient(from var(--plan-angle),
-    transparent 0deg, transparent 270deg,
-    rgba(14, 165, 233, 0.0) 278deg, rgba(56, 189, 248, 0.45) 305deg,
-    #38bdf8 326deg, #bae6fd 342deg, #ffffff 352deg, transparent 360deg);
+  /* Light wraps up from the BOTTOM edge along both sides at once and meets at
+     the top — the real Apple Intelligence power-on, not a comet lap. The lit
+     span is ±--review-wrap around the bottom (conic from 180deg = bottom),
+     with a soft 30deg leading edge on each side. */
+  background: conic-gradient(from 180deg,
+    #ffffff 0deg,
+    #7dd3fc var(--review-wrap),
+    transparent calc(var(--review-wrap) + 30deg),
+    transparent calc(330deg - var(--review-wrap)),
+    #7dd3fc calc(360deg - var(--review-wrap)),
+    #ffffff 360deg);
   -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
           mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
   -webkit-mask-composite: xor;
           mask-composite: exclude;
   filter: blur(5px);
-  animation: review-wave-sweep 1.5s cubic-bezier(0.3, 0.1, 0.25, 1) forwards;
+  animation: review-wave-wrap 1.4s cubic-bezier(0.3, 0.1, 0.25, 1) forwards;
 }
 /* Edge bloom that swells as the comet travels, then dies down with it. */
 .review-wave::after {
@@ -244,11 +255,14 @@ html, body, #root {
   filter: blur(10px);
   animation: review-wave-center 1.5s ease-out forwards;
 }
-@keyframes review-wave-sweep {
-  0% { --plan-angle: 0deg; opacity: 0; }
+@keyframes review-wave-wrap {
+  /* Wrap stops at 150deg: each side carries a 30deg soft edge, so the two
+     edges meet exactly at the top (150+30 = 180) without crossing — crossed
+     stops clamp and draw a hard seam. */
+  0% { --review-wrap: 0deg; opacity: 0; }
   10% { opacity: 1; }
-  78% { opacity: 1; }
-  100% { --plan-angle: 360deg; opacity: 0; }
+  62% { --review-wrap: 150deg; opacity: 1; }
+  100% { --review-wrap: 150deg; opacity: 0; } /* hold, then melt into .review-glow */
 }
 @keyframes review-wave-bloom {
   0% { opacity: 0; }
