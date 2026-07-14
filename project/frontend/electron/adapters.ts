@@ -16,6 +16,8 @@ export interface ChatResult {
   // True when a stream closed WITHOUT a proper finish marker ([DONE] /
   // finish_reason / message_stop) — the reply is likely truncated upstream.
   dropped?: boolean
+  // Provider finish reason ('length' / 'max_tokens' = output cap hit).
+  finishReason?: string
 }
 // Callbacks fired during a streaming turn, so the UI can render text and
 // reasoning tokens as they arrive.
@@ -146,6 +148,7 @@ export class OpenAIAdapter implements Adapter {
     let usageOut = 0
     // Did the stream end properly ([DONE] / finish_reason) or just drop?
     let finished = false
+    let finishReason = ''
     // Accumulate tool calls by index (OpenAI streams argument fragments).
     const tcAcc = new Map<number, { id: string; name: string; args: string }>()
 
@@ -157,7 +160,7 @@ export class OpenAIAdapter implements Adapter {
         usageIn = json.usage.prompt_tokens ?? usageIn
         usageOut = json.usage.completion_tokens ?? usageOut
       }
-      if (json.choices?.[0]?.finish_reason) finished = true
+      if (json.choices?.[0]?.finish_reason) { finished = true; finishReason = json.choices[0].finish_reason }
       const delta = json.choices?.[0]?.delta
       if (!delta) return
       const rc: string | undefined = delta.reasoning_content ?? delta.reasoning
@@ -191,7 +194,7 @@ export class OpenAIAdapter implements Adapter {
         function: { name: tc.name, arguments: JSON.stringify(tc.args) },
       }))
     }
-    return { text, toolCalls, assistantMsg, usage: { input: usageIn, output: usageOut }, dropped: !finished }
+    return { text, toolCalls, assistantMsg, usage: { input: usageIn, output: usageOut }, dropped: !finished, finishReason }
   }
 
   toolResultsMessages(toolCalls: ToolCall[], results: string[]): unknown[] {
@@ -287,6 +290,7 @@ export class AnthropicAdapter implements Adapter {
     let usageOut = 0
     // Did the stream end properly (message_stop) or just drop?
     let finished = false
+    let stopReason = ''
 
     await readSse(resp.body, (data) => {
       let ev: any
@@ -313,6 +317,7 @@ export class AnthropicAdapter implements Adapter {
         }
         case 'message_delta':
           usageOut = ev.usage?.output_tokens ?? usageOut
+          if (ev.delta?.stop_reason) stopReason = ev.delta.stop_reason
           break
         case 'message_stop':
           finished = true
@@ -341,6 +346,7 @@ export class AnthropicAdapter implements Adapter {
       assistantMsg: { role: 'assistant', content: cleanBlocks },
       usage: { input: usageIn, output: usageOut },
       dropped: !finished,
+      finishReason: stopReason,
     }
   }
 

@@ -82,7 +82,31 @@ function toolTarget(t: ToolEntry): string {
 // is folded (compactly) into the assistant side so knowledge gathered by
 // Read/Grep/Glob/etc. survives across turns instead of being discarded. Without
 // this the agent "forgets" a folder it just scanned and re-scans on every turn.
+// Approximate chars an item contributes to the history sent to the model.
+function historyCost(it: AgentItem): number {
+  if (it.kind === 'text') return itemText(it).length
+  if (it.kind === 'tool') return 64 + Math.min(it.result?.length ?? 0, TOOL_RESULT_BUDGET)
+  return 0 // reasoning is never sent
+}
+
+// Total history budget (~12k tokens). Long-lived sessions used to send their
+// ENTIRE transcript every turn until the prompt overflowed the context window
+// and the provider started truncating/dropping replies.
+const HISTORY_CHAR_BUDGET = 48_000
+
 function buildHistory(items: AgentItem[]): Msg[] {
+  // Keep the NEWEST items that fit the budget; drop the oldest beyond it.
+  let kept = items
+  let trimmed = false
+  let total = 0
+  for (let i = items.length - 1; i >= 0; i--) {
+    total += historyCost(items[i])
+    if (total > HISTORY_CHAR_BUDGET) {
+      kept = items.slice(i + 1)
+      trimmed = true
+      break
+    }
+  }
   const out: Msg[] = []
   // Append a line, coalescing into the previous message if it shares the role.
   // Keeps roles strictly alternating (required by Anthropic and friends).
@@ -92,7 +116,7 @@ function buildHistory(items: AgentItem[]): Msg[] {
     else out.push({ role, content: line })
   }
   const pushAssistant = (line: string) => push('assistant', line)
-  for (const it of items) {
+  for (const it of kept) {
     if (it.kind === 'text') {
       const content = itemText(it)
       if (it.role === 'user') push('user', content)
@@ -109,6 +133,12 @@ function buildHistory(items: AgentItem[]): Msg[] {
       }
       pushAssistant(head + body)
     }
+  }
+  if (trimmed) {
+    // Tell the model (and keep roles starting with 'user' for Anthropic).
+    const note = '[Earlier conversation was trimmed to fit the context window — use /compact for a full summary.]'
+    if (out[0]?.role === 'user') out[0].content = `${note}\n${out[0].content}`
+    else out.unshift({ role: 'user', content: note })
   }
   return out
 }

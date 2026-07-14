@@ -476,6 +476,11 @@ export async function runIdeAgent(
       if (res.dropped && streamedThisTurn && toolCalls.length === 0) {
         emit({ type: 'token', delta: '\n\n⚠ [stream dropped — reply may be truncated]', turn })
       }
+      // Hit the output token cap: the reply is cut mid-sentence but the stream
+      // "finished" legally — tell the user they can ask it to continue.
+      if ((res.finishReason === 'length' || res.finishReason === 'max_tokens') && toolCalls.length === 0) {
+        emit({ type: 'token', delta: '\n\n⚠ [reply hit the output limit — say "continue" to resume]', turn })
+      }
       turns++
 
       // Record cost under a virtual role so it shows in the dashboard.
