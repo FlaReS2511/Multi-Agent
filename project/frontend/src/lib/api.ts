@@ -461,6 +461,12 @@ declare global {
       ideAgentConfigSet(patch: { reviewMode?: boolean; allowBash?: boolean }): Promise<{ ok: boolean; reviewMode: boolean; allowBash: boolean }>
       onAiAgentEditorReq(runId: string, cb: (req: EditorRequest) => void): () => void
       aiAgentEditorRes(resp: EditorResponse): Promise<{ ok: boolean }>
+      browserSetBounds(rect: { x: number; y: number; width: number; height: number }): void
+      browserSetVisible(visible: boolean): void
+      browserUserNavigate(url: string): void
+      browserTabClosed(): void
+      onAgentBrowserShow(cb: () => void): () => void
+      onBrowserUrlChanged(cb: (info: { url: string; title: string }) => void): () => void
       groupCreate(input: { task_id: string; worker_role: string }): Promise<{ ok: boolean; group?: string; error?: string }>
       groupList(): Promise<{ ok: boolean; groups: GroupRow[] }>
       groupKill(groupId: string): Promise<{ ok: boolean }>

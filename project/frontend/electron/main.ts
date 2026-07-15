@@ -11,6 +11,9 @@ import { GroupCoordinator, DEFAULT_ORCHESTRATION, OrchestrationConfig } from './
 import { normalizeDiscordConfig, type DiscordConfig } from './group-params'
 import { runIdeAgent, IdeAgentParams, IdeAgentEvent, PendingChange, ReviewDecision, EditorRequest, EditorResponse } from './ide-agent'
 import { PendingAction, killAllBackgroundJobs } from './extra-tools'
+import {
+  initBrowserTools, browserSetBounds, browserSetVisible, browserUserNavigate, closeBrowserView,
+} from './browser-tools'
 const require = createRequire(import.meta.url)
 // node-pty is a native module that must be rebuilt for Electron. If it failed
 // to build (e.g. missing VS Build Tools on Windows), load it lazily so the app
@@ -23,6 +26,11 @@ try {
 }
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
+
+// Local CDP endpoint for the agent's embedded browser (browser-tools.ts):
+// playwright-core attaches to the app itself over this port. Port 0 = random;
+// Chromium writes the real one to <userData>/DevToolsActivePort. Loopback only.
+app.commandLine.appendSwitch('remote-debugging-port', '0')
 
 // Project root: 3 levels up from dist-electron/main.js
 // dist-electron is at project/frontend/dist-electron, root is /Users/tom/Downloads/multi-agent
@@ -113,6 +121,13 @@ function createWindow() {
 
   mainWindow.on('maximize', () => mainWindow?.webContents.send('window-maximized-changed', true))
   mainWindow.on('unmaximize', () => mainWindow?.webContents.send('window-maximized-changed', false))
+
+  // Agent-driven embedded browser (WebContentsView over the editor area).
+  initBrowserTools({
+    getWindow: () => mainWindow,
+    showTab: () => mainWindow?.webContents.send('agent-browser-show'),
+    urlChanged: (url, title) => mainWindow?.webContents.send('browser-url-changed', { url, title }),
+  })
 
   // Toggle DevTools on demand (F12 / Ctrl+Shift+I) since it no longer auto-opens.
   mainWindow.webContents.on('before-input-event', (_e, input) => {
@@ -1821,6 +1836,15 @@ function createBoardTask(input: { title: string; owner: string; description?: st
   })
 }
 
+// Embedded agent browser: the renderer owns the tab layout and streams the
+// placeholder rect; main owns the WebContentsView and follows it.
+ipcMain.on('browser-set-bounds', (_e, rect: { x: number; y: number; width: number; height: number }) => {
+  if (rect && Number.isFinite(rect.x)) browserSetBounds(rect)
+})
+ipcMain.on('browser-set-visible', (_e, visible: boolean) => browserSetVisible(Boolean(visible)))
+ipcMain.on('browser-user-navigate', (_e, url: string) => { if (typeof url === 'string' && url.trim()) browserUserNavigate(url) })
+ipcMain.on('browser-tab-closed', () => closeBrowserView())
+
 ipcMain.handle('ai-agent-run', async (_evt, runId: string, params: IdeAgentParams) => {
   const ac = new AbortController()
   agentAborts.set(runId, ac)
@@ -2050,6 +2074,7 @@ app.on('window-all-closed', () => {
 app.on('will-quit', () => {
   // Stop any background jobs the IDE agent started so they don't outlive the app.
   try { killAllBackgroundJobs() } catch { /* ignore */ }
+  try { closeBrowserView() } catch { /* ignore */ }
   // Kill the Discord bot child so it doesn't linger after the app closes.
   try { killDiscordBot() } catch { /* ignore */ }
 })

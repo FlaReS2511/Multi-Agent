@@ -20,6 +20,7 @@ import {
 import {
   EXTRA_TOOL_SPECS, EXTRA_TOOL_NAMES, runExtraTool, PendingAction,
 } from './extra-tools'
+import { BROWSER_TOOL_SPECS, BROWSER_TOOL_NAMES, runBrowserTool, browserGateInfo } from './browser-tools'
 import { buildAdapter, ProviderCfgLike } from './adapters'
 import { contextWindowFor } from './context-window'
 import * as db from './db'
@@ -62,6 +63,8 @@ const PLAN_READONLY_TOOLS = new Set([
   'GitStatus', 'GitDiff', 'GitLog', 'GitBranch', 'GitConfigGet', 'GitRemoteGet',
   'GitHubAuthStatus', 'ListGitProfiles', 'ListPRs', 'ViewPR', 'ListIssues',
   'WebFetch', 'WebSearch', 'RecallNotes', 'TodoWrite', 'BashOutput',
+  'BrowserOpen', 'BrowserNavigate', 'BrowserSnapshot', 'BrowserRead',
+  'BrowserScroll', 'BrowserConsole', 'BrowserScreenshot',
   'ReportBlocked',
 ])
 
@@ -72,6 +75,9 @@ const RESEARCH_READONLY_TOOLS = new Set([
   'OpenFile', 'GetOpenEditor', 'ShowDiff',
   'GitStatus', 'GitDiff', 'GitLog', 'GitBranch',
   'WebFetch', 'WebSearch', 'Research', 'RecallNotes', 'TodoWrite', 'ReportBlocked',
+  // Browser read set + Click (cookie banners / doc navigation) — no typing.
+  'BrowserOpen', 'BrowserNavigate', 'BrowserSnapshot', 'BrowserRead',
+  'BrowserScroll', 'BrowserConsole', 'BrowserScreenshot', 'BrowserClick',
 ])
 
 // Editor round-trip tools (GĐ2). These don't touch fs — main asks the renderer
@@ -169,6 +175,7 @@ function toolSpecsFor(opts: { allowBash: boolean; orchestrationEnabled: boolean 
     ...FILE_TOOL_SPECS.filter((s) => opts.allowBash || s.name !== 'Bash'),
     ...EDITOR_TOOL_SPECS,
     ...EXTRA_TOOL_SPECS,
+    ...BROWSER_TOOL_SPECS,
     REPORT_BLOCKED_SPEC,
   ]
   if (opts.orchestrationEnabled) specs.push(...ORCH_TOOL_SPECS)
@@ -191,6 +198,7 @@ const TOOL_GROUPS: Record<string, ToolSpec[]> = {
   memory: pickExtra(['RememberNote', 'RecallNotes']),
   background: pickExtra(['BashBackground', 'BashOutput', 'BashInput', 'KillBash']),
   excel: EXCEL_TOOL_SPECS,
+  browser: BROWSER_TOOL_SPECS,
 }
 const GROUP_BLURBS: Record<string, string> = {
   git: 'git (status/diff/log/branch/add/commit/push/pull/checkout/config/remote/account)',
@@ -199,6 +207,7 @@ const GROUP_BLURBS: Record<string, string> = {
   memory: 'memory (remember/recall notes across sessions)',
   background: 'background (run/monitor/kill long-running commands)',
   excel: 'excel (create/read/edit .xlsx: sheets, ranges, formulas, formatting)',
+  browser: 'browser (drive a real page inside the IDE: open/click/type/read console+text — ideal for testing localhost apps and reading JS-rendered sites)',
 }
 const LOAD_GROUP_SPEC: ToolSpec = {
   name: 'LoadToolGroup',
@@ -333,8 +342,18 @@ function buildSystemPrompt(params: IdeAgentParams, workspaceRoot: string): strin
     'TodoWrite to track a plan. ' +
     'Extra tool groups are NOT loaded by default (to save context): git (status/diff/commit/' +
     'push/branch/checkout/config/account), github (PRs & issues), web (WebFetch, WebSearch), ' +
-    'memory (remember/recall notes), and background (long-running commands). When the task ' +
+    'memory (remember/recall notes), background (long-running commands), and browser (drive a ' +
+    'real page inside the IDE — open/click/type/read console; ideal for testing the localhost ' +
+    'app you are building and reading JS-rendered sites). When the task ' +
     'needs one, call LoadToolGroup(group) FIRST to enable it, then call its tools. ' +
+    'If a browser page shows a CAPTCHA or login wall, do NOT retry or try to bypass it — tell ' +
+    'the user to complete it by hand in the browser tab, then continue. ' +
+    'Every browser action (open/navigate/click/type) returns a fresh "CURRENT PAGE" snapshot ' +
+    'with numbered element refs — ALWAYS pick your next BrowserClick/BrowserType target from the ' +
+    'most recent snapshot; never guess a ref or an element that is not listed. ' +
+    'When the user describes concrete UI steps (click this, type that, press enter), reproduce ' +
+    'those steps with BrowserClick/BrowserType so they can watch — do not shortcut to a ' +
+    'constructed URL unless they just ask for a destination. ' +
     'Sensitive actions (git mutations, changing the identity, switching accounts, logging ' +
     'in, background commands) ask the user for confirmation automatically — just call the ' +
     'tool and the user will approve or decline. ' +
@@ -344,7 +363,10 @@ function buildSystemPrompt(params: IdeAgentParams, workspaceRoot: string): strin
     'Stay on-task: only explore the workspace when the task actually requires it — if the ' +
     'user asks about one specific file (even outside the workspace), focus on that file. ' +
     'Paths are relative to the workspace root. When done, give a brief summary of what ' +
-    'you changed. Do not ask for confirmation in text — the user reviews changes in the editor.\n\n' +
+    'you changed. Do not ask for confirmation in text — the user reviews changes in the editor. ' +
+    'Make tool calls through the normal tool interface — NEVER write tool-log markers such as ' +
+    '"[used ToolName] →", element refs like "[e30]", or paste raw tool output into your reply; ' +
+    'just speak to the user in plain prose about what you found or did.\n\n' +
     `Workspace root: ${workspaceRoot}`
   if (params.planMode) {
     s =
@@ -455,6 +477,7 @@ export async function runIdeAgent(
     let anyActivity = false // any tool call ran this run
     let lengthContinues = 0 // auto-continuations after hitting the output cap
     let continuing = false  // this turn continues a capped reply
+    let browserApproved = false // approve-once: driving the browser beyond localhost
 
     for (let i = 0; i < MAX_TURNS; i++) {
       if (signal.aborted) { emit({ type: 'error', error: 'cancelled' }); return }
@@ -641,6 +664,28 @@ export async function runIdeAgent(
           }
         }
 
+        // Browser gate: the FIRST browser action aimed beyond localhost asks
+        // once per run (Approve/Decline); localhost (the app being built)
+        // never asks. After approval the run drives the browser freely — the
+        // user watches everything in the embedded browser tab.
+        if (BROWSER_TOOL_NAMES.has(call.name) && !browserApproved) {
+          const gi = browserGateInfo(call.name, call.args as Record<string, unknown>)
+          if (!gi.local) {
+            const ok = await confirm({
+              tool: call.name,
+              title: 'Drive the browser beyond localhost',
+              detail: gi.detail,
+            })
+            if (!ok) {
+              const denied = 'denied by user: browsing beyond localhost was not approved for this run'
+              results.push(denied)
+              emit({ type: 'tool_result', callId, name: call.name, result: denied, isError: true })
+              continue
+            }
+            browserApproved = true
+          }
+        }
+
         // Review mode: mutators without a diff card ask via Approve/Decline.
         if (reviewOn && (REVIEW_CONFIRM_TOOLS.has(call.name) || EXCEL_MUTATORS.has(call.name))) {
           const detail = call.name === 'Bash'
@@ -662,8 +707,17 @@ export async function runIdeAgent(
         const isOrchTool = ORCH_TOOL_NAMES.has(call.name)
         const isExtraTool = EXTRA_TOOL_NAMES.has(call.name)
         const isExcelTool = EXCEL_TOOL_NAMES.has(call.name)
+        const isBrowserTool = BROWSER_TOOL_NAMES.has(call.name)
 
-        if (isExcelTool) {
+        if (isBrowserTool) {
+          try {
+            result = await runBrowserTool(call.name, call.args as Record<string, unknown>, { workspaceRoot })
+            isError = result.startsWith('error:')
+          } catch (e: any) {
+            result = `error: ${e?.message || e}`
+            isError = true
+          }
+        } else if (isExcelTool) {
           // Excel tools are async (exceljs) → dispatched separately from runFileTool.
           try {
             const r = await runExcelTool(workspaceRoot, call.name, call.args)

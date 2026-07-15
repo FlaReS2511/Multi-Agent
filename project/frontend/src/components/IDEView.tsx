@@ -4,6 +4,7 @@ import Editor, { DiffEditor } from '@monaco-editor/react'
 import {
   FolderTree,
   GitBranch,
+  Globe,
   MessagesSquare,
   Terminal as TerminalIcon,
   Save,
@@ -43,6 +44,9 @@ import { toast } from '../lib/toast'
 import { computeLineDiff } from '../lib/lineDiff'
 import { useInlineAIEdit } from './useInlineAIEdit'
 import { activeAgents, AgentsConfig, colorFor, ModelOption, isResidentRole, PendingChange } from '../lib/api'
+
+// Sentinel tab id for the embedded agent browser (not a file on disk).
+const BROWSER_TAB = 'orqon://browser'
 
 interface FileNode {
   name: string
@@ -814,14 +818,57 @@ export function IDEView() {
   const [paletteOpen, setPaletteOpen] = useState(false)
   const [paletteMode, setPaletteMode] = useState<'commands' | 'files'>('files')
 
+  // ── Embedded agent browser tab ──────────────────────────────────
+  // The page itself is a WebContentsView owned by MAIN (a webview guest is
+  // invisible to playwright over CDP); this component reserves a placeholder
+  // rect for it and streams the bounds. `orqon://browser` is a sentinel entry
+  // in the normal tab list.
+  const [browserUrl, setBrowserUrl] = useState('')
+  const [browserAddr, setBrowserAddr] = useState('') // editable address bar text
+  const browserHostRef = useRef<HTMLDivElement>(null)
+  useEffect(() => window.api.onAgentBrowserShow(() => {
+    setOpenTabs((tabs) => (tabs.includes(BROWSER_TAB) ? tabs : [...tabs, BROWSER_TAB]))
+    setActiveTab(BROWSER_TAB)
+  }), [])
+  useEffect(() => window.api.onBrowserUrlChanged(({ url }) => {
+    setBrowserUrl(url)
+    setBrowserAddr(url.startsWith('about:blank') ? '' : url)
+  }), [])
+  // Stream the placeholder rect to main. Sidebar/chat slides shift layout
+  // without resize events, so poll while the tab is active.
+  useEffect(() => {
+    if (activeTab !== BROWSER_TAB) { window.api.browserSetVisible(false); return }
+    let last = ''
+    const sync = () => {
+      const el = browserHostRef.current
+      if (!el) return
+      const r = el.getBoundingClientRect()
+      const key = `${Math.round(r.x)},${Math.round(r.y)},${Math.round(r.width)},${Math.round(r.height)}`
+      if (key !== last && r.width > 0) {
+        last = key
+        window.api.browserSetBounds({ x: r.x, y: r.y, width: r.width, height: r.height })
+      }
+    }
+    sync()
+    window.api.browserSetVisible(true)
+    const iv = window.setInterval(sync, 250)
+    window.addEventListener('resize', sync)
+    return () => {
+      window.clearInterval(iv)
+      window.removeEventListener('resize', sync)
+      window.api.browserSetVisible(false)
+    }
+  }, [activeTab])
+
   // Close a tab unconditionally (dirty state already resolved by the caller).
   const doCloseTab = (relPath: string) => {
+    if (relPath === BROWSER_TAB) window.api.browserTabClosed()
     const nextTabs = openTabs.filter((t) => t !== relPath)
     setOpenTabs(nextTabs)
     if (activeTab === relPath) {
       setActiveTab(nextTabs.length > 0 ? nextTabs[nextTabs.length - 1] : null)
     }
-    closedTabsRef.current = [...closedTabsRef.current.filter((t) => t !== relPath), relPath].slice(-10)
+    if (relPath !== BROWSER_TAB) closedTabsRef.current = [...closedTabsRef.current.filter((t) => t !== relPath), relPath].slice(-10)
     // Drop the dirty flag so a later reopen re-reads from disk cleanly.
     setDirtyFiles((prev) => {
       const next = { ...prev }
@@ -1389,14 +1436,21 @@ export function IDEView() {
                       return next
                     })
                   }}
-                  onClick={() => openFile(tab)}
+                  onClick={() => (tab === BROWSER_TAB ? setActiveTab(tab) : openFile(tab))}
                   onAuxClick={(e) => {
                     // Middle-click closes (through the dirty guard).
                     if (e.button === 1) { e.preventDefault(); requestCloseTab(tab) }
                   }}
                   className={`group/tab h-8 px-3 border-b-2 flex items-center gap-2 cursor-pointer transition-all text-xs font-mono select-none rounded-t ${tabColor}`}
                 >
-                  <span className="truncate max-w-[140px]">{tab.split('/').pop()}</span>
+                  {tab === BROWSER_TAB ? (
+                    <span className="flex items-center gap-1.5 truncate max-w-[160px]">
+                      <Globe size={11} className="text-sky-400 flex-shrink-0" />
+                      {(() => { try { return new URL(browserUrl).host || 'Browser' } catch { return 'Browser' } })()}
+                    </span>
+                  ) : (
+                    <span className="truncate max-w-[140px]">{tab.split('/').pop()}</span>
+                  )}
 
                   {/* Dirty dot swaps to an X on hover so dirty tabs stay closable. */}
                   {isDirty && (
@@ -1421,7 +1475,7 @@ export function IDEView() {
           </div>
 
           {/* Action Bar (Top Right Toolbar) */}
-          {activeTab && (
+          {activeTab && activeTab !== BROWSER_TAB && (
             <div className="flex items-center gap-1.5 flex-shrink-0 pl-4 border-l border-zinc-800/80">
               {/* Save Button */}
               <button
@@ -1482,7 +1536,27 @@ export function IDEView() {
 
         {/* Editor Main Content Area */}
         <div className="flex-1 min-h-0 relative overflow-hidden flex flex-col bg-zinc-950">
-          {activeTab ? (
+          {/* Embedded agent browser: address bar + placeholder rect that the
+              main-process WebContentsView is positioned over. */}
+          {activeTab === BROWSER_TAB && (
+            <div className="absolute inset-0 flex flex-col">
+              <div className="h-9 border-b border-zinc-800 bg-zinc-950/80 flex items-center gap-2 px-3 flex-shrink-0">
+                <Globe size={12} className="text-zinc-500 flex-shrink-0" />
+                <input
+                  value={browserAddr}
+                  onChange={(e) => setBrowserAddr(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' && browserAddr.trim()) window.api.browserUserNavigate(browserAddr.trim())
+                  }}
+                  placeholder="Enter a URL and press Enter…"
+                  spellCheck={false}
+                  className="flex-1 bg-zinc-900 border border-zinc-800 rounded px-2 py-1 text-[11px] font-mono text-zinc-300 outline-none focus:border-blue-500/50"
+                />
+              </div>
+              <div ref={browserHostRef} className="flex-1 bg-zinc-950" />
+            </div>
+          )}
+          {activeTab && activeTab !== BROWSER_TAB ? (
             <div className="absolute inset-0 flex flex-col">
               {diffMode ? (
                 <div className="flex-1 w-full overflow-hidden relative">
@@ -1563,7 +1637,7 @@ export function IDEView() {
                 </div>
               )}
             </div>
-          ) : (
+          ) : !activeTab ? (
             <div className="relative flex-1 flex flex-col items-center justify-center text-zinc-500 select-none bg-zinc-950 overflow-hidden">
               {/* Debossed logo watermark */}
               <OrqonLogo
@@ -1591,7 +1665,7 @@ export function IDEView() {
                 </div>
               </div>
             </div>
-          )}
+          ) : null}
         </div>
 
         {/* 4. Collapsible Integrated Agent Dock (Terminal & Logs) — height is
