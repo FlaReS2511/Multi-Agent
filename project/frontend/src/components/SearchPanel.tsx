@@ -64,17 +64,40 @@ function highlightParts(
   }
 }
 
+const HISTORY_KEY = 'orqon.searchHistory'
+
+function readHistory(): string[] {
+  try {
+    const raw = localStorage.getItem(HISTORY_KEY)
+    const arr = raw ? JSON.parse(raw) : []
+    return Array.isArray(arr) ? arr.filter((x) => typeof x === 'string') : []
+  } catch { return [] }
+}
+
 export function SearchPanel({ onOpenResult }: Props) {
   const [query, setQuery] = useState('')
   const [replaceText, setReplaceText] = useState('')
   const [showReplace, setShowReplace] = useState(false)
   const [caseSensitive, setCaseSensitive] = useState(false)
   const [regex, setRegex] = useState(false)
+  const [includeGlob, setIncludeGlob] = useState('')
+  const [excludeGlob, setExcludeGlob] = useState('')
+  const [history, setHistory] = useState<string[]>(readHistory)
   const [matches, setMatches] = useState<Match[]>([])
   const [error, setError] = useState<string | null>(null)
   const [searching, setSearching] = useState(false)
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set())
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  // Remember recent queries (deduped, last 10) for the datalist dropdown.
+  const recordHistory = useCallback((q: string) => {
+    if (q.length < 3) return
+    setHistory((prev) => {
+      const next = [q, ...prev.filter((x) => x !== q)].slice(0, 10)
+      try { localStorage.setItem(HISTORY_KEY, JSON.stringify(next)) } catch { /* ignore */ }
+      return next
+    })
+  }, [])
 
   const runSearch = useCallback(
     async (q: string) => {
@@ -90,6 +113,8 @@ export function SearchPanel({ onOpenResult }: Props) {
           caseSensitive,
           regex,
           maxResults: 2000,
+          include: includeGlob || undefined,
+          exclude: excludeGlob || undefined,
         })
         if (!res.ok) {
           setError(res.error || 'Search failed')
@@ -97,6 +122,7 @@ export function SearchPanel({ onOpenResult }: Props) {
         } else {
           setError(null)
           setMatches(res.matches)
+          if (res.matches.length > 0) recordHistory(q)
         }
       } catch (err: unknown) {
         setError(err instanceof Error ? err.message : 'Search failed')
@@ -105,7 +131,7 @@ export function SearchPanel({ onOpenResult }: Props) {
         setSearching(false)
       }
     },
-    [caseSensitive, regex],
+    [caseSensitive, regex, includeGlob, excludeGlob, recordHistory],
   )
 
   // Debounced search on query / option changes.
@@ -160,7 +186,9 @@ export function SearchPanel({ onOpenResult }: Props) {
               <ChevronRight className="w-3.5 h-3.5" />
             )}
           </button>
-          <div className="flex-1 space-y-1.5">
+          {/* min-w-0 lets the inputs shrink below their intrinsic width so the
+              column never overflows the 256px sidebar. */}
+          <div className="flex-1 min-w-0 space-y-1.5">
             <div className="flex items-center gap-1 px-2 bg-zinc-900 border border-zinc-700 rounded focus-within:border-blue-500">
               <Search className="w-3.5 h-3.5 text-zinc-500 shrink-0" />
               <input
@@ -168,8 +196,12 @@ export function SearchPanel({ onOpenResult }: Props) {
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
                 placeholder="Search"
+                list="orqon-search-history"
                 className="flex-1 py-1 bg-transparent text-zinc-100 placeholder-zinc-600 focus:outline-none"
               />
+              <datalist id="orqon-search-history">
+                {history.map((h) => <option key={h} value={h} />)}
+              </datalist>
               <button
                 onClick={() => setCaseSensitive((v) => !v)}
                 title="Match Case"
@@ -214,6 +246,23 @@ export function SearchPanel({ onOpenResult }: Props) {
                 </button>
               </div>
             )}
+
+            {/* Include / exclude glob filters (comma-separated, rg -g syntax).
+                Stacked vertically — the sidebar is only 256px wide. */}
+            <input
+              type="text"
+              value={includeGlob}
+              onChange={(e) => setIncludeGlob(e.target.value)}
+              placeholder="include: src/**/*.ts"
+              className="w-full min-w-0 px-2 py-0.5 bg-zinc-900 border border-zinc-800 rounded text-[10px] text-zinc-200 placeholder-zinc-600 focus:outline-none focus:border-blue-500"
+            />
+            <input
+              type="text"
+              value={excludeGlob}
+              onChange={(e) => setExcludeGlob(e.target.value)}
+              placeholder="exclude: *.test.ts"
+              className="w-full min-w-0 px-2 py-0.5 bg-zinc-900 border border-zinc-800 rounded text-[10px] text-zinc-200 placeholder-zinc-600 focus:outline-none focus:border-blue-500"
+            />
           </div>
         </div>
 

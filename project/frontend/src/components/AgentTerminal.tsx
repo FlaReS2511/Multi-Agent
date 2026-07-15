@@ -96,12 +96,15 @@ export function AgentTerminal({ agent, active }: Props) {
       window.api.ptyResize(agent, cols, rows)
     })
 
+    // Debounced refit: panel width animations fire ResizeObserver dozens of
+    // times; resizing the PTY on each tick makes the CLI redraw its prompt at
+    // every intermediate width. Fit once, after the size has settled.
+    let fitTimer: ReturnType<typeof setTimeout> | null = null
     const ro = new ResizeObserver(() => {
-      try {
-        fit.fit()
-      } catch {
-        /* ignore */
-      }
+      if (fitTimer) clearTimeout(fitTimer)
+      fitTimer = setTimeout(() => {
+        try { fit.fit() } catch { /* ignore */ }
+      }, 150)
     })
     ro.observe(containerRef.current)
 
@@ -110,6 +113,7 @@ export function AgentTerminal({ agent, active }: Props) {
       offExit()
       dataDisposable.dispose()
       resizeDisposable.dispose()
+      if (fitTimer) clearTimeout(fitTimer)
       ro.disconnect()
       term.dispose()
       termRef.current = null

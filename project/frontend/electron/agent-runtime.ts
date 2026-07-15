@@ -23,6 +23,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { execSync } from 'node:child_process'
 import * as db from './db'
+import { contextWindowFor } from './context-window'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 // dist-electron/agent-runtime.js → ROOT is three levels up
@@ -332,13 +333,33 @@ function toolDispatchTask(a: { title: string; note?: string }): string {
   return 'sub-task dispatched to the coordinator. Ending your session now.'
 }
 
+// Escape hatch: the worker declares the task impossible/blocked. The coordinator
+// fails the group immediately — no reviewer, no retry — so an unachievable task
+// stops burning retries instead of looping to the cap. Reason is REQUIRED.
+function toolReportBlocked(a: { reason: string }): string {
+  if (!CTX_GROUP) return 'error: ReportBlocked is only available inside a group session'
+  if (CTX_GROUP_KIND !== 'worker') return 'error: only the worker may report a task blocked'
+  if (!(a.reason && a.reason.trim())) {
+    return 'error: reason is required — explain concretely why the task cannot be completed'
+  }
+  db.addGroupMemory({
+    group_id: CTX_GROUP,
+    task_id: CTX_GROUP_TASK || null,
+    role: 'worker',
+    kind: 'blocked',
+    content: a.reason.trim(),
+  })
+  GROUP_SIGNAL = `blocked:${a.reason.trim().slice(0, 200)}`
+  return 'task reported as blocked; the coordinator will stop this group without retrying. Ending your session now.'
+}
+
 const TOOLS: Record<string, (args: any) => string> = {
   Read: toolRead, Write: toolWrite, Edit: toolEdit,
   Bash: toolBash, Grep: toolGrep, Glob: toolGlob,
   SendMessage: toolSendMessage, ListTasks: toolListTasks,
   CreateTask: toolCreateTask, UpdateTask: toolUpdateTask,
   RequestReview: toolRequestReview, SubmitReview: toolSubmitReview,
-  DispatchTask: toolDispatchTask,
+  DispatchTask: toolDispatchTask, ReportBlocked: toolReportBlocked,
 }
 
 interface ToolSpec {
@@ -486,6 +507,19 @@ const TOOL_SPECS: ToolSpec[] = [
         note: { type: 'string', description: 'context for the sub-group worker' },
       },
       required: ['title'],
+    },
+  },
+  {
+    name: 'ReportBlocked',
+    description:
+      'Worker only, group mode. Use ONLY when the task genuinely cannot be completed (missing prerequisites, ' +
+      'contradictory/impossible requirements, needed access or file absent). This fails the group immediately ' +
+      'with no reviewer and no retry — do NOT use it to avoid hard work. reason is REQUIRED: state concretely ' +
+      'what blocks the task. This ends your session.',
+    input_schema: {
+      type: 'object',
+      properties: { reason: { type: 'string', description: 'concrete reason the task is impossible' } },
+      required: ['reason'],
     },
   },
 ]
@@ -647,7 +681,7 @@ class AnthropicAdapter implements Adapter {
 
 // ── config / provider resolution ─────────────────────────────────
 
-interface ProviderCfg { kind?: string; base_url?: string; models?: string[]; price_in?: number; price_out?: number }
+interface ProviderCfg { kind?: string; base_url?: string; models?: string[]; price_in?: number; price_out?: number; context_window?: number; context_windows?: Record<string, number> }
 interface AgentCfg { provider?: string; model?: string }
 interface Config { providers?: Record<string, ProviderCfg>; agents?: Record<string, AgentCfg> }
 
@@ -768,6 +802,7 @@ function setupRole(role: string): {
   rates: [number, number] | null
   model: string
   providerId: string
+  providerCfg: ProviderCfg
 } {
   const agentDir = path.join(AGENTS, role)
   if (!fs.existsSync(agentDir)) { console.error(`agent dir not found: ${agentDir}`); process.exit(1) }
@@ -786,7 +821,7 @@ function setupRole(role: string): {
   if (!fs.existsSync(agentMd)) { console.error(`AGENT.md missing in ${agentDir}`); process.exit(1) }
   const systemPrompt = fs.readFileSync(agentMd, 'utf-8') + PROTOCOL_APPENDIX.replace('{role}', role)
 
-  return { adapter, systemPrompt, rates, model, providerId }
+  return { adapter, systemPrompt, rates, model, providerId, providerCfg }
 }
 
 function chdirWorkspace(): void {
@@ -815,8 +850,11 @@ the code-level coordinator, not by messaging other agents.
 
 - If you are the **worker**: do the coding work. When your part is done (or you
   need it checked), call **RequestReview(summary)**. If the task is too big and a
-  chunk deserves its own group, call **DispatchTask(title, note)**. Do NOT call
-  SendMessage/CreateTask/UpdateTask — those are for the resident orchestrator.
+  chunk deserves its own group, call **DispatchTask(title, note)**. If the task
+  genuinely CANNOT be done (missing prerequisites, impossible/contradictory
+  requirements, needed file or access absent), call **ReportBlocked(reason)** —
+  this stops the group without retrying. Do NOT use it to dodge hard work. Do NOT
+  call SendMessage/CreateTask/UpdateTask — those are for the resident orchestrator.
 - If you are the **reviewer**: inspect the worker's output against the task, then
   call **SubmitReview(verdict, report)**. On fail, the report is the handoff the
   next worker reads, so be concrete (file/line, why, how to fix).
@@ -876,7 +914,9 @@ async function runGroupSession(args: Args): Promise<void> {
   CTX_GROUP = groupId
   CTX_GROUP_KIND = groupKind
 
-  const { adapter, systemPrompt, rates, model } = setupRole(role)
+  const { adapter, systemPrompt, rates, model, providerCfg } = setupRole(role)
+  const contextWindow = contextWindowFor(model, providerCfg)
+  let peakContext = 0
   db.initDb(SHARED)
   chdirWorkspace()
 
@@ -904,6 +944,7 @@ async function runGroupSession(args: Args): Promise<void> {
     turns++
     totalIn += usage.input
     totalOut += usage.output
+    if (usage.input > peakContext) peakContext = usage.input
     db.addUsage({
       ts: nowStamp(),
       role,
@@ -914,7 +955,11 @@ async function runGroupSession(args: Args): Promise<void> {
       task_id: g.task_id || null,
       group_id: groupId,
     })
-    db.updateGroupFields(groupId, { heartbeat_at: nowStamp() })
+    db.updateGroupFields(groupId, {
+      heartbeat_at: nowStamp(),
+      peak_context: peakContext,
+      context_window: contextWindow,
+    })
 
     if (toolCalls.length === 0) {
       if (text) console.log(`[${role}#${groupId}] said: ${text.slice(0, 200)}`)

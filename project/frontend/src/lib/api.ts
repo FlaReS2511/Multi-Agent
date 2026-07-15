@@ -212,6 +212,8 @@ export interface GroupRow {
   worker_pid: number | null
   reviewer_pid: number | null
   heartbeat_at: string | null
+  peak_context?: number
+  context_window?: number
   created_at: string
   updated_at: string
 }
@@ -240,6 +242,20 @@ export interface OrchestrationConfig {
   heartbeat_timeout_sec: number
 }
 
+// Discord bot config (stored under `discord` in agents-config.json; the bot
+// token itself lives in encrypted secrets, provider id 'discord').
+export interface DiscordConfig {
+  enabled: boolean
+  allowed_user_ids: string[]
+  allowed_channel_ids: string[]
+  default_worker_role: string
+  guild_id: string
+  max_code_bytes: number
+  agent_provider: string
+  agent_model: string
+  allow_agent_bash: boolean
+}
+
 export const GROUP_STATUS_STYLES: Record<GroupStatus, { label: string; classes: string }> = {
   pending:   { label: 'PENDING',   classes: 'bg-zinc-700/40 text-zinc-300 ring-zinc-600/40' },
   active:    { label: 'ACTIVE',    classes: 'bg-blue-500/15 text-blue-300 ring-blue-500/30' },
@@ -248,6 +264,81 @@ export const GROUP_STATUS_STYLES: Record<GroupStatus, { label: string; classes: 
   failed:    { label: 'FAILED',    classes: 'bg-rose-500/15 text-rose-300 ring-rose-500/30' },
   killed:    { label: 'KILLED',    classes: 'bg-rose-900/30 text-rose-400 ring-rose-800/40' },
 }
+
+export interface PendingChange {
+  changeId: string
+  path: string
+  kind: 'write' | 'edit'
+  before: string
+  after: string
+  isNew: boolean
+  note: string
+}
+
+export interface EditorRequest {
+  requestId: string
+  op: 'OpenFile' | 'GetOpenEditor' | 'ShowDiff'
+  args: Record<string, unknown>
+}
+export interface EditorResponse {
+  requestId: string
+  ok: boolean
+  result: string
+}
+
+// A sensitive action (git mutation, account switch, login, background command)
+// the agent wants to run, awaiting the user's approve/decline.
+export interface PendingAction {
+  actionId: string
+  tool: string
+  title: string
+  detail: string
+}
+
+export interface AgentTodo {
+  content: string
+  status: string
+}
+
+export interface GitProfile {
+  id: number
+  label: string
+  user_name: string
+  user_email: string
+  remote_url: string | null
+  gh_account: string | null
+  created_at: string
+}
+
+// A saved agent conversation (persistent memory), scoped to a workspace.
+export interface AgentSessionMeta {
+  id: number
+  workspace: string
+  title: string
+  updated_at: string
+}
+
+export interface AgentSessionRow extends AgentSessionMeta {
+  items: string       // JSON transcript
+  created_at: string
+}
+
+export type IdeAgentEvent =
+  | { type: 'reasoning'; delta: string; turn: number }
+  | { type: 'token'; delta: string; turn: number }
+  | { type: 'tool_call'; callId: string; name: string; args: Record<string, unknown> }
+  | { type: 'tool_result'; callId: string; name: string; result: string; isError: boolean }
+  | { type: 'pending_change'; change: PendingChange }
+  | { type: 'change_resolved'; changeId: string; decision: 'accept' | 'reject' }
+  | { type: 'pending_action'; action: PendingAction }
+  | { type: 'action_resolved'; actionId: string; approved: boolean }
+  | { type: 'todos'; todos: AgentTodo[] }
+  | { type: 'file_changed'; path: string }
+  | { type: 'context'; used: number; window: number; turn: number }
+  | { type: 'blocked'; reason: string; turns: number }
+  | { type: 'plan'; plan: string; turns: number }
+  | { type: 'done'; text: string; turns: number }
+  | { type: 'error'; error: string }
 
 declare global {
   interface Window {
@@ -309,7 +400,7 @@ declare global {
       workspaceCreateFolder(relPath: string): Promise<{ ok: boolean; error?: string }>
       workspaceRename(fromRel: string, toRel: string): Promise<{ ok: boolean; error?: string }>
       workspaceDelete(relPath: string): Promise<{ ok: boolean; error?: string }>
-      workspaceSearch(query: string, opts?: { caseSensitive?: boolean; regex?: boolean; maxResults?: number }): Promise<{ ok: boolean; error?: string; matches: { file: string; line: number; column: number; text: string }[] }>
+      workspaceSearch(query: string, opts?: { caseSensitive?: boolean; regex?: boolean; maxResults?: number; include?: string; exclude?: string }): Promise<{ ok: boolean; error?: string; matches: { file: string; line: number; column: number; text: string }[] }>
       workspaceReplaceInFile(relPath: string, find: string, replace: string, opts?: { regex?: boolean; caseSensitive?: boolean }): Promise<{ ok: boolean; error?: string }>
       workspaceGitBranch(): Promise<{ current: string; branches: string[] }>
       workspaceGitStage(file: string): Promise<{ ok: boolean; error?: string }>
@@ -319,6 +410,8 @@ declare global {
       workspaceGitCheckout(branch: string, create?: boolean): Promise<{ ok: boolean; error?: string }>
       workspaceGitPush(): Promise<{ ok: boolean; output?: string }>
       workspaceGitPull(): Promise<{ ok: boolean; output?: string }>
+      workspaceGitDirtyCount(): Promise<{ ok: boolean; count: number }>
+      workspaceGitRestoreFiles(files: string[]): Promise<{ ok: boolean; restored?: string[]; removed?: string[]; failed?: string[]; error?: string }>
       shellStart(id: string): Promise<{ ok: boolean; history?: string; error?: string }>
       shellWrite(id: string, data: string): Promise<{ ok: boolean }>
       shellResize(id: string, cols: number, rows: number): Promise<{ ok: boolean }>
@@ -341,6 +434,39 @@ declare global {
       aiChatCancel(requestId: string): Promise<{ ok: boolean }>
       onAiChatChunk(requestId: string, cb: (delta: string) => void): () => void
       onAiChatDone(requestId: string, cb: (info: { ok: boolean; text?: string; error?: string }) => void): () => void
+      aiAgentRun(runId: string, params: {
+        provider: string; model?: string
+        messages: { role: 'user' | 'assistant'; content: string }[]
+        openFile?: { path: string; language?: string; content: string }
+        selection?: string
+        reviewMode?: boolean
+        planMode?: boolean
+        researchMode?: boolean
+      }): Promise<{ ok: boolean; error?: string }>
+      aiAgentCancel(runId: string): Promise<{ ok: boolean }>
+      aiAgentReview(changeId: string, decision: 'accept' | 'reject'): Promise<{ ok: boolean }>
+      aiAgentAction(actionId: string, approved: boolean): Promise<{ ok: boolean }>
+      gitProfilesList(): Promise<GitProfile[]>
+      gitProfileSave(input: { label: string; user_name: string; user_email: string; remote_url?: string; gh_account?: string }): Promise<{ ok: boolean; error?: string }>
+      gitProfileDelete(label: string): Promise<{ ok: boolean }>
+      agentSessionList(): Promise<AgentSessionMeta[]>
+      agentSessionLatest(): Promise<AgentSessionRow | null>
+      agentSessionGet(id: number): Promise<AgentSessionRow | null>
+      agentSessionCreate(title: string, items?: string): Promise<{ ok: boolean; id?: number; error?: string }>
+      agentSessionUpdate(id: number, items: string, title?: string): Promise<{ ok: boolean }>
+      agentSessionRename(id: number, title: string): Promise<{ ok: boolean }>
+      agentSessionDelete(id: number): Promise<{ ok: boolean }>
+      onAiAgentEvent(runId: string, cb: (e: IdeAgentEvent) => void): () => void
+      ideAgentConfigGet(): Promise<{ reviewMode: boolean; allowBash: boolean }>
+      ideAgentConfigSet(patch: { reviewMode?: boolean; allowBash?: boolean }): Promise<{ ok: boolean; reviewMode: boolean; allowBash: boolean }>
+      onAiAgentEditorReq(runId: string, cb: (req: EditorRequest) => void): () => void
+      aiAgentEditorRes(resp: EditorResponse): Promise<{ ok: boolean }>
+      browserSetBounds(rect: { x: number; y: number; width: number; height: number }): void
+      browserSetVisible(visible: boolean): void
+      browserUserNavigate(url: string): void
+      browserTabClosed(): void
+      onAgentBrowserShow(cb: () => void): () => void
+      onBrowserUrlChanged(cb: (info: { url: string; title: string }) => void): () => void
       groupCreate(input: { task_id: string; worker_role: string }): Promise<{ ok: boolean; group?: string; error?: string }>
       groupList(): Promise<{ ok: boolean; groups: GroupRow[] }>
       groupKill(groupId: string): Promise<{ ok: boolean }>
@@ -348,6 +474,10 @@ declare global {
       orchestrationGet(): Promise<OrchestrationConfig>
       orchestrationSet(patch: Partial<OrchestrationConfig>): Promise<{ ok: boolean; orchestration: OrchestrationConfig }>
       onCoordinatorEvent(cb: (info: { event: string; payload: unknown }) => void): () => void
+      setZoomFactor(factor: number): void
+      discordConfigGet(): Promise<DiscordConfig>
+      discordConfigSet(patch: Partial<DiscordConfig>): Promise<{ ok: boolean; discord: DiscordConfig }>
+      discordTokenStatus(): Promise<{ hasToken: boolean }>
     }
   }
 }

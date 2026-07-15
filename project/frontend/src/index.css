@@ -1,7 +1,8 @@
 @import "tailwindcss";
+@import "@fontsource-variable/geist/index.css";
 
 @theme {
-  --font-sans: ui-sans-serif, -apple-system, system-ui, "Segoe UI", sans-serif;
+  --font-sans: "Geist Variable", ui-sans-serif, -apple-system, system-ui, "Segoe UI", sans-serif;
   --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Consolas, monospace;
 }
 
@@ -10,6 +11,7 @@ html, body, #root {
   margin: 0;
   background: #09090b;
   color: #e4e4e7;
+  font-family: "Geist Variable", ui-sans-serif, -apple-system, system-ui, "Segoe UI", sans-serif;
 }
 
 ::-webkit-scrollbar {
@@ -35,4 +37,286 @@ html, body, #root {
 @keyframes inline-ai-fade {
   0% { background: rgba(16, 185, 129, 0.32); }
   100% { background: rgba(16, 185, 129, 0); }
+}
+
+/* Markdown rendering for chat messages (react-markdown + remark-gfm). Wide
+   tables and code scroll inside the bubble so nothing overflows. */
+.md-body { font-size: var(--chat-font-size, 12px); line-height: 1.55; word-break: break-word; overflow-wrap: anywhere; }
+.md-body > :first-child { margin-top: 0; }
+.md-body > :last-child { margin-bottom: 0; }
+.md-body p { margin: 0.4em 0; }
+.md-body h1 { font-size: 1.18em; font-weight: 600; margin: 0.7em 0 0.35em; }
+.md-body h2 { font-size: 1.1em; font-weight: 600; margin: 0.65em 0 0.3em; }
+.md-body h3 { font-size: 1.02em; font-weight: 600; margin: 0.55em 0 0.25em; }
+.md-body h4, .md-body h5, .md-body h6 { font-weight: 600; margin: 0.5em 0 0.2em; }
+.md-body ul { list-style: disc; padding-left: 1.25em; margin: 0.4em 0; }
+.md-body ol { list-style: decimal; padding-left: 1.4em; margin: 0.4em 0; }
+.md-body li { margin: 0.15em 0; }
+.md-body li > ul, .md-body li > ol { margin: 0.15em 0; }
+.md-body a { color: #60a5fa; text-decoration: underline; word-break: break-all; }
+.md-body strong { font-weight: 600; color: #fafafa; }
+.md-body em { font-style: italic; }
+.md-body hr { border: 0; border-top: 1px solid #27272a; margin: 0.8em 0; }
+.md-body blockquote { border-left: 2px solid #3f3f46; padding-left: 0.6em; color: #a1a1aa; margin: 0.4em 0; }
+.md-body code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.92em; }
+.md-body :not(pre) > code { background: rgba(63, 63, 70, 0.55); padding: 0.05em 0.35em; border-radius: 3px; }
+.md-body pre { background: #09090b; border: 1px solid #27272a; border-radius: 6px; padding: 0.6em; overflow-x: auto; margin: 0.5em 0; }
+.md-body pre code { background: none; padding: 0; font-size: 11px; line-height: 1.5; white-space: pre; }
+.md-body table { display: block; width: max-content; max-width: 100%; overflow-x: auto; border-collapse: collapse; margin: 0.5em 0; font-size: 0.95em; }
+.md-body th, .md-body td { border: 1px solid #3f3f46; padding: 0.25em 0.6em; text-align: left; white-space: nowrap; }
+.md-body th { background: rgba(63, 63, 70, 0.4); font-weight: 600; }
+
+/* Plan-mode glow — Apple-Intelligence-style rim of light around the chat edge.
+   A multicolor (blue/white) gradient rotates around the border, masked to the
+   rim only so the center stays clear, softly blurred, and it breathes. Stays on
+   the whole time plan mode is active. */
+@property --plan-angle {
+  syntax: '<angle>';
+  initial-value: 0deg;
+  inherits: false;
+}
+/* Lit span of the plan activation wrap (see .plan-wave::before). */
+@property --plan-wrap {
+  syntax: '<angle>';
+  initial-value: 0deg;
+  inherits: false;
+}
+.plan-glow {
+  position: absolute;
+  inset: 0;
+  z-index: 30;
+  pointer-events: none;
+  border-radius: inherit;
+  /* Thin inward edge bleed on ALL sides — hugs the border, keeps the CENTER
+     clear (Apple lights the edges, not the middle). */
+  box-shadow: inset 0 0 20px rgba(96, 165, 250, 0.28);
+  animation: plan-glow-breathe 3s ease-in-out infinite;
+}
+/* Rotating multicolor rim on the border only (xor/exclude mask), softly blurred
+   — the flowing colored border of the Apple Intelligence look. */
+.plan-glow::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  padding: 2px;
+  background: conic-gradient(from var(--plan-angle),
+    #1d4ed8, #60a5fa, #ffffff, #3b82f6, #dbeafe, #2563eb, #93c5fd, #1d4ed8);
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+          mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+          mask-composite: exclude;
+  filter: blur(4px);
+  animation: plan-glow-spin 6s linear infinite;
+}
+/* Bottom-edge emphasis: a low glow hugging the very bottom edge (below the
+   composer), NOT rising up into the chat. Rises in once. */
+.plan-glow::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 12%;
+  background: linear-gradient(to top, rgba(96, 165, 250, 0.5), rgba(59, 130, 246, 0.12) 55%, transparent);
+  filter: blur(6px);
+  animation: plan-bottom-in 0.9s ease-out;
+}
+@keyframes plan-glow-spin { to { --plan-angle: 360deg; } }
+@keyframes plan-glow-breathe { 0%, 100% { opacity: 0.78; } 50% { opacity: 1; } }
+@keyframes plan-bottom-in { from { opacity: 0; transform: translateY(40%); } to { opacity: 1; transform: none; } }
+
+/* Research-mode glow — same shape as plan, VIOLET palette to distinguish it.
+   Reuses the plan keyframes (they only animate angle/opacity/transform). */
+.research-glow {
+  position: absolute;
+  inset: 0;
+  z-index: 30;
+  pointer-events: none;
+  border-radius: inherit;
+  box-shadow: inset 0 0 20px rgba(167, 139, 250, 0.28);
+  animation: plan-glow-breathe 3s ease-in-out infinite;
+}
+.research-glow::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  padding: 2px;
+  background: conic-gradient(from var(--plan-angle),
+    #6d28d9, #a78bfa, #ffffff, #7c3aed, #ddd6fe, #8b5cf6, #c4b5fd, #6d28d9);
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+          mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+          mask-composite: exclude;
+  filter: blur(4px);
+  animation: plan-glow-spin 6s linear infinite;
+}
+.research-glow::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 12%;
+  background: linear-gradient(to top, rgba(167, 139, 250, 0.55), rgba(124, 58, 237, 0.18) 45%, transparent);
+  filter: blur(7px);
+  animation: plan-bottom-in 0.9s ease-out;
+}
+
+/* Plan-mode activation wave — the Apple Intelligence "power-on" that plays
+   ONCE when plan mode turns on, then melts into the persistent .plan-glow.
+   Light wraps up from the BOTTOM edge along both sides at once and meets at
+   the top, while the edges bloom. The element is removed on animationend. */
+.plan-wave {
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+}
+.plan-wave::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  padding: 3px;
+  /* Lit span is ±--plan-wrap around the bottom (conic from 180deg = bottom),
+     with a soft 30deg leading edge on each side. */
+  background: conic-gradient(from 180deg,
+    #ffffff 0deg,
+    #60a5fa var(--plan-wrap),
+    transparent calc(var(--plan-wrap) + 30deg),
+    transparent calc(330deg - var(--plan-wrap)),
+    #60a5fa calc(360deg - var(--plan-wrap)),
+    #ffffff 360deg);
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+          mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+          mask-composite: exclude;
+  filter: blur(5px);
+  animation: plan-wave-wrap 1.5s cubic-bezier(0.3, 0.1, 0.25, 1) forwards;
+}
+/* Edge bloom that swells as the light wraps, then dies down with it. */
+.plan-wave::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  box-shadow: inset 0 0 36px rgba(96, 165, 250, 0.45);
+  animation: plan-wave-bloom 1.5s ease-out forwards;
+}
+/* Center wash — the light wave that rolls across the MIDDLE of the panel on
+   activation (Apple lights the display's center too, not just the rim). */
+.plan-wave-center {
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(58% 46% at 50% 55%,
+    rgba(219, 234, 254, 0.30), rgba(96, 165, 250, 0.16) 45%, transparent 72%);
+  filter: blur(10px);
+  animation: plan-wave-center 1.5s ease-out forwards;
+}
+@keyframes plan-wave-wrap {
+  /* Wrap stops at 150deg: each side carries a 30deg soft edge, so the two
+     edges meet exactly at the top (150+30 = 180) without crossing — crossed
+     stops clamp and draw a hard seam. */
+  0% { --plan-wrap: 0deg; opacity: 0; }
+  10% { opacity: 1; }
+  62% { --plan-wrap: 150deg; opacity: 1; }
+  100% { --plan-wrap: 150deg; opacity: 0; } /* hold, then melt into .plan-glow */
+}
+@keyframes plan-wave-bloom {
+  0% { opacity: 0; }
+  30% { opacity: 1; }
+  100% { opacity: 0; }
+}
+@keyframes plan-wave-center {
+  0% { opacity: 0; transform: scale(0.72); }
+  35% { opacity: 1; }
+  100% { opacity: 0; transform: scale(1.16); }
+}
+
+/* Git gutter — thin bars in Monaco's linesDecorations lane marking lines
+   changed vs HEAD: emerald = added, blue = modified, red triangle = deletion. */
+.git-gutter-add {
+  background: #10b981;
+  width: 3px !important;
+  margin-left: 4px;
+  border-radius: 2px;
+}
+.git-gutter-mod {
+  background: #3b82f6;
+  width: 3px !important;
+  margin-left: 4px;
+  border-radius: 2px;
+}
+.git-gutter-del {
+  width: 0 !important;
+  margin-left: 1px;
+  position: relative;
+}
+.git-gutter-del::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: -4px;
+  border: 5px solid transparent;
+  border-left: 7px solid #f43f5e;
+}
+
+/* Agent navigation (OpenFile with a line): pulse the target line bright↔dim
+   like a warning so it's easy to spot. Keeps pulsing until the user clicks or
+   types (JS removes the decoration then). Blue = distinct from the green
+   "applied edit" flash. */
+.agent-reveal-line {
+  animation: agent-reveal-pulse 1.15s ease-in-out infinite;
+}
+.agent-reveal-gutter {
+  background: #3b82f6;
+  width: 3px !important;
+  margin-left: 2px;
+  animation: agent-reveal-gutter-pulse 1.15s ease-in-out infinite;
+}
+@keyframes agent-reveal-pulse {
+  0%, 100% { background: rgba(59, 130, 246, 0.10); }
+  50%      { background: rgba(37, 99, 235, 0.55); }
+}
+@keyframes agent-reveal-gutter-pulse {
+  0%, 100% { opacity: 0.35; }
+  50%      { opacity: 1; }
+}
+
+/* Streaming text: each freshly revealed chunk fades from dark → bright,
+   giving the typewriter a smooth "glow-in" feel instead of a hard pop. */
+.stream-chunk {
+  display: inline;
+  animation: stream-glow 0.5s ease forwards;
+}
+@keyframes stream-glow {
+  0%   { opacity: 0; filter: brightness(0.3); }
+  100% { opacity: 1; filter: brightness(1); }
+}
+
+/* Thinking dock: once the text has streamed in but the model is still thinking,
+   a faint darker band sweeps left→right across the words, like a loading pulse. */
+/* Codex-style thinking shimmer: dim text with a brighter band gliding across.
+   The gradient is clipped to the glyphs and its position animates, so the
+   highlight flows smoothly at the pixel level rather than per word. */
+.thinking-shimmer {
+  background: linear-gradient(
+    100deg,
+    #a1a1aa 0%,
+    #a1a1aa 42%,
+    #f4f4f5 50%,
+    #a1a1aa 58%,
+    #a1a1aa 100%
+  );
+  background-size: 300% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  color: transparent;
+  animation: thinking-shimmer 3s linear infinite;
+}
+@keyframes thinking-shimmer {
+  0%   { background-position: 150% 0; }
+  100% { background-position: -150% 0; }
 }

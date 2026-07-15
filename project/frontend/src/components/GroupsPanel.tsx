@@ -1,6 +1,6 @@
 import React, { useEffect, useState, useCallback } from 'react'
 import { motion } from 'framer-motion'
-import { RefreshCw, Skull, ChevronRight, ChevronDown, DollarSign, Layers } from 'lucide-react'
+import { RefreshCw, Skull, ChevronRight, ChevronDown, DollarSign, Layers, Gauge } from 'lucide-react'
 import {
   GroupRow,
   GroupMemoryRow,
@@ -127,6 +127,16 @@ export function GroupsPanel({ windup }: GroupsPanelProps) {
                 {g.depth}
               </span>
             )}
+            {g.peak_context != null && g.peak_context > 0 && g.context_window ? (() => {
+              const pct = Math.min(100, (g.peak_context / g.context_window) * 100)
+              const col = pct >= 90 ? 'text-rose-400' : pct >= 75 ? 'text-amber-400' : 'text-zinc-500'
+              return (
+                <span className={`flex items-center gap-0.5 font-mono ${col}`} title={`Peak context: ${g.peak_context.toLocaleString()} / ${g.context_window.toLocaleString()} tokens`}>
+                  <Gauge size={9} />
+                  {pct.toFixed(0)}%
+                </span>
+              )
+            })() : null}
           </div>
           {isOpen && (
             <div className="px-2.5 pb-2.5 border-t border-zinc-800/60 pt-2 flex flex-col gap-2">

@@ -1,4 +1,4 @@
-import { contextBridge, ipcRenderer } from 'electron'
+import { contextBridge, ipcRenderer, webFrame } from 'electron'
 
 const api = {
   getTasks: () => ipcRenderer.invoke('get-tasks'),
@@ -122,7 +122,7 @@ const api = {
   workspaceDelete: (relPath: string) => ipcRenderer.invoke('workspace-delete', relPath),
 
   // Search
-  workspaceSearch: (query: string, opts?: { caseSensitive?: boolean; regex?: boolean; maxResults?: number }) =>
+  workspaceSearch: (query: string, opts?: { caseSensitive?: boolean; regex?: boolean; maxResults?: number; include?: string; exclude?: string }) =>
     ipcRenderer.invoke('workspace-search', query, opts),
   workspaceReplaceInFile: (relPath: string, find: string, replace: string, opts?: { regex?: boolean; caseSensitive?: boolean }) =>
     ipcRenderer.invoke('workspace-replace-in-file', relPath, find, replace, opts),
@@ -136,6 +136,8 @@ const api = {
   workspaceGitCheckout: (branch: string, create?: boolean) => ipcRenderer.invoke('workspace-git-checkout', branch, create),
   workspaceGitPush: () => ipcRenderer.invoke('workspace-git-push'),
   workspaceGitPull: () => ipcRenderer.invoke('workspace-git-pull'),
+  workspaceGitDirtyCount: () => ipcRenderer.invoke('workspace-git-dirty-count'),
+  workspaceGitRestoreFiles: (files: string[]) => ipcRenderer.invoke('workspace-git-restore-files', files),
 
   // Inline AI edit (streaming)
   aiInlineEdit: (requestId: string, params: {
@@ -176,6 +178,73 @@ const api = {
     ipcRenderer.on(channel, listener)
     return () => ipcRenderer.removeListener(channel, listener)
   },
+
+  // IDE agent (tool-calling loop)
+  aiAgentRun: (runId: string, params: {
+    provider: string; model?: string
+    messages: { role: 'user' | 'assistant'; content: string }[]
+    openFile?: { path: string; language?: string; content: string }
+    selection?: string
+    reviewMode?: boolean
+    planMode?: boolean
+    researchMode?: boolean
+  }) => ipcRenderer.invoke('ai-agent-run', runId, params),
+  aiAgentCancel: (runId: string) => ipcRenderer.invoke('ai-agent-cancel', runId),
+  aiAgentReview: (changeId: string, decision: 'accept' | 'reject') =>
+    ipcRenderer.invoke('ai-agent-review', changeId, decision),
+  aiAgentAction: (actionId: string, approved: boolean) =>
+    ipcRenderer.invoke('ai-agent-action', actionId, approved),
+
+  // Git account profiles (for the agent's SwitchGitAccount)
+  gitProfilesList: () => ipcRenderer.invoke('git-profiles-list'),
+  gitProfileSave: (input: {
+    label: string; user_name: string; user_email: string; remote_url?: string; gh_account?: string
+  }) => ipcRenderer.invoke('git-profile-save', input),
+  gitProfileDelete: (label: string) => ipcRenderer.invoke('git-profile-delete', label),
+
+  // Agent chat sessions (persistent memory)
+  agentSessionList: () => ipcRenderer.invoke('agent-session-list'),
+  agentSessionLatest: () => ipcRenderer.invoke('agent-session-latest'),
+  agentSessionGet: (id: number) => ipcRenderer.invoke('agent-session-get', id),
+  agentSessionCreate: (title: string, items?: string) => ipcRenderer.invoke('agent-session-create', title, items),
+  agentSessionUpdate: (id: number, items: string, title?: string) => ipcRenderer.invoke('agent-session-update', id, items, title),
+  agentSessionRename: (id: number, title: string) => ipcRenderer.invoke('agent-session-rename', id, title),
+  agentSessionDelete: (id: number) => ipcRenderer.invoke('agent-session-delete', id),
+  onAiAgentEvent: (runId: string, cb: (e: unknown) => void) => {
+    const channel = `ai-agent-event:${runId}`
+    const listener = (_e: unknown, ev: unknown) => cb(ev)
+    ipcRenderer.on(channel, listener)
+    return () => ipcRenderer.removeListener(channel, listener)
+  },
+  ideAgentConfigGet: () => ipcRenderer.invoke('ide-agent-config-get'),
+  ideAgentConfigSet: (patch: { reviewMode?: boolean; allowBash?: boolean }) =>
+    ipcRenderer.invoke('ide-agent-config-set', patch),
+  // Editor round-trip tools: main asks the renderer to drive Monaco.
+  onAiAgentEditorReq: (runId: string, cb: (req: unknown) => void) => {
+    const channel = `ai-agent-editor-req:${runId}`
+    const listener = (_e: unknown, req: unknown) => cb(req)
+    ipcRenderer.on(channel, listener)
+    return () => ipcRenderer.removeListener(channel, listener)
+  },
+  aiAgentEditorRes: (resp: { requestId: string; ok: boolean; result: string }) =>
+    ipcRenderer.invoke('ai-agent-editor-res', resp),
+  // Embedded agent browser: renderer streams the placeholder rect, main
+  // positions the WebContentsView; url changes flow back for the address bar.
+  browserSetBounds: (rect: { x: number; y: number; width: number; height: number }) =>
+    ipcRenderer.send('browser-set-bounds', rect),
+  browserSetVisible: (visible: boolean) => ipcRenderer.send('browser-set-visible', visible),
+  browserUserNavigate: (url: string) => ipcRenderer.send('browser-user-navigate', url),
+  browserTabClosed: () => ipcRenderer.send('browser-tab-closed'),
+  onAgentBrowserShow: (cb: () => void) => {
+    const listener = () => cb()
+    ipcRenderer.on('agent-browser-show', listener)
+    return () => ipcRenderer.removeListener('agent-browser-show', listener)
+  },
+  onBrowserUrlChanged: (cb: (info: { url: string; title: string }) => void) => {
+    const listener = (_e: unknown, info: { url: string; title: string }) => cb(info)
+    ipcRenderer.on('browser-url-changed', listener)
+    return () => ipcRenderer.removeListener('browser-url-changed', listener)
+  },
   setAutoTrigger: (enabled: boolean) => ipcRenderer.invoke('set-auto-trigger', enabled),
   getAutoTrigger: () => ipcRenderer.invoke('get-auto-trigger'),
   onAutoTrigger: (cb: (info: { agent: string }) => void) => {
@@ -192,11 +261,19 @@ const api = {
   groupMemory: (groupId: string) => ipcRenderer.invoke('group-memory', groupId),
   orchestrationGet: () => ipcRenderer.invoke('orchestration-get'),
   orchestrationSet: (patch: Record<string, unknown>) => ipcRenderer.invoke('orchestration-set', patch),
+
+  // Discord bot config (token stored via setProviderKey with provider 'discord')
+  discordConfigGet: () => ipcRenderer.invoke('discord-config-get'),
+  discordConfigSet: (patch: Record<string, unknown>) => ipcRenderer.invoke('discord-config-set', patch),
+  discordTokenStatus: () => ipcRenderer.invoke('discord-token-status'),
   onCoordinatorEvent: (cb: (info: { event: string; payload: unknown }) => void) => {
     const listener = (_e: unknown, info: { event: string; payload: unknown }) => cb(info)
     ipcRenderer.on('coordinator-event', listener)
     return () => ipcRenderer.removeListener('coordinator-event', listener)
   },
+
+  // Whole-app zoom (persisted UI setting; applied directly via webFrame).
+  setZoomFactor: (factor: number) => { try { webFrame.setZoomFactor(factor) } catch { /* ignore */ } },
 
   // Window controls (custom title bar)
   windowMinimize: () => ipcRenderer.invoke('window-minimize'),
