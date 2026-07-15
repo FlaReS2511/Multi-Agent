@@ -153,8 +153,12 @@ function ensureView(): WebContentsView {
     const lv = ['debug', 'log', 'warn', 'error'][level] ?? String(level)
     pushConsole(`[${lv}] ${message}${sourceId ? ` (${sourceId.split('/').pop()}:${line})` : ''}`)
   })
-  view.webContents.on('did-fail-load', (_e, code, desc, url) => {
-    if (code !== -3) pushConsole(`[pageerror] failed to load ${url}: ${desc} (${code})`)
+  view.webContents.on('did-fail-load', (_e, code, desc, url, isMainFrame) => {
+    if (code === -3) return // aborted (normal during redirects)
+    pushConsole(`[pageerror] failed to load ${url}: ${desc} (${code})`)
+    if (isMainFrame && view && !view.webContents.isDestroyed()) {
+      void view.webContents.loadURL(errorPage(url, `${desc} (${code})`))
+    }
   })
   const report = () => {
     if (view && !view.webContents.isDestroyed()) {
@@ -313,7 +317,23 @@ function normalizeUrl(u: string): string {
   const s = u.trim()
   if (/^(https?|file|about|data):/i.test(s)) return s
   if (/^(localhost|127\.0\.0\.1|\[::1\])(:\d+)?([/?#]|$)/i.test(s)) return `http://${s}`
+  // Bare words ("github") or phrases aren't hostnames — search instead of
+  // producing a dead https://github/ that fails to a blank white page.
+  if (/\s/.test(s) || !s.includes('.')) return `https://www.google.com/search?q=${encodeURIComponent(s)}`
   return `https://${s}`
+}
+
+// A dead navigation (bad DNS, refused connection) leaves Chromium on a bare
+// white page — swap in a small dark error page that says what happened.
+function errorPage(url: string, desc: string): string {
+  const esc = (t: string) => t.replace(/&/g, '&amp;').replace(/</g, '&lt;')
+  return 'data:text/html;charset=utf-8,' + encodeURIComponent(
+    `<body style="margin:0;display:grid;place-items:center;height:100vh;background:#09090b;color:#a1a1aa;` +
+    `font:13px ui-monospace,monospace"><div style="text-align:center;max-width:520px;padding:24px">` +
+    `<div style="font-size:28px;margin-bottom:12px">⚠︎</div>` +
+    `<div style="color:#e4e4e7;margin-bottom:6px">Couldn't load ${esc(url)}</div>` +
+    `<div>${esc(desc)}</div></div></body>`,
+  )
 }
 
 const CHALLENGE_RE = /captcha|cloudflare|turnstile|verify you are (a )?human|just a moment|access denied/i
