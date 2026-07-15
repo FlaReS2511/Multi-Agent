@@ -226,6 +226,7 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
   // Plan text stashed while a git-dirty warning is shown before running it.
   const pendingPlanRef = useRef<string | null>(null)
   const [reviewMode, setReviewMode] = useState(false)
+  const [planWave, setPlanWave] = useState(false) // one-shot activation sweep
   // Files the current agent run has written (for the "Undo run" affordance).
   const runFilesRef = useRef<Set<string>>(new Set())
   const [lastRunFiles, setLastRunFiles] = useState<string[]>([])
@@ -470,6 +471,17 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
     setReviewMode(next)
     window.api.ideAgentConfigSet({ reviewMode: next }).catch(() => {})
   }
+
+  // Entering plan mode plays the activation wave once (Apple-Intelligence
+  // power-on), then the persistent plan-glow carries on. Timeout is a
+  // fallback in case the CSS animation never runs (e.g. animations disabled)
+  // so the overlay can't get stuck.
+  useEffect(() => {
+    if (!planMode) return
+    setPlanWave(true)
+    const t = window.setTimeout(() => setPlanWave(false), 1600)
+    return () => window.clearTimeout(t)
+  }, [planMode])
 
   // Revert every file the last run wrote (git checkout tracked, delete new).
   const undoLastRun = async () => {
@@ -1444,6 +1456,21 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
           </motion.div>
         )}
       </AnimatePresence>
+
+      {/* Plan-mode activation wave: light wraps up from the bottom edge along
+          both sides while a soft wash blooms across the CENTER (the Apple
+          Intelligence power-on), then both fade into the persistent
+          .plan-glow above. */}
+      {planWave && (
+        <div
+          className="absolute inset-0 z-30 pointer-events-none"
+          aria-hidden="true"
+          onAnimationEnd={() => setPlanWave(false)}
+        >
+          <div className="plan-wave" />
+          <div className="plan-wave-center" />
+        </div>
+      )}
     </motion.div>
   )
 }

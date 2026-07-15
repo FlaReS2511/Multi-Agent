@@ -29,6 +29,11 @@ const MAX_TURNS = parseInt(process.env.IDE_AGENT_MAX_TURNS || '30', 10)
 // File-mutating tools whose success should reload the editor/file-tree.
 const FILE_CHANGED_TOOLS = new Set(['Write', 'Edit', 'MultiEdit', 'Move', 'Delete', 'NotebookEdit', 'DownloadFile'])
 
+// Review mode: Write/Edit render a diff card, but these mutators have no diff
+// to show — they gate on the Approve/Decline action card instead, so nothing
+// can change the workspace silently while review is on.
+const REVIEW_CONFIRM_TOOLS = new Set(['Bash', 'MultiEdit', 'Move', 'Delete', 'NotebookEdit', 'DownloadFile'])
+
 // Tools whose path args are guarded against escaping the workspace. When a
 // call targets an outside path we ASK the user (Approve/Decline) instead of
 // hard-failing; approval whitelists that directory for the rest of the session.
@@ -365,6 +370,18 @@ function buildSystemPrompt(params: IdeAgentParams, workspaceRoot: string): strin
       '(URLs / file paths).\n\n' +
       `Workspace root: ${workspaceRoot}`
   }
+  // Project rules: a checked-in ORQON.md (or AGENTS.md) at the workspace root
+  // rides along on every run — conventions, build/test commands, do-nots.
+  for (const name of ['ORQON.md', 'AGENTS.md']) {
+    try {
+      const raw = fs.readFileSync(path.join(workspaceRoot, name), 'utf8').trim()
+      if (raw) {
+        const body = raw.length > 10000 ? raw.slice(0, 10000) + '\n… (truncated)' : raw
+        s += `\n\nProject rules from ${name} — follow them:\n${body}`
+        break
+      }
+    } catch { /* absent or unreadable rules never block a run */ }
+  }
   if (params.openFile) {
     const body = params.openFile.content.length > 12000
       ? params.openFile.content.slice(0, 12000) + '\n… (truncated)'
@@ -621,6 +638,20 @@ export async function runIdeAgent(
               allowOutsidePath(abs)
               allowOutsidePath(path.dirname(abs))
             }
+          }
+        }
+
+        // Review mode: mutators without a diff card ask via Approve/Decline.
+        if (reviewOn && (REVIEW_CONFIRM_TOOLS.has(call.name) || EXCEL_MUTATORS.has(call.name))) {
+          const detail = call.name === 'Bash'
+            ? String((call.args as { command?: string }).command || '')
+            : JSON.stringify(call.args, null, 2).slice(0, 1500)
+          const ok = await confirm({ tool: call.name, title: `Review mode: approve ${call.name}`, detail })
+          if (!ok) {
+            const denied = `denied by user: ${call.name} was not approved in review mode`
+            results.push(denied)
+            emit({ type: 'tool_result', callId, name: call.name, result: denied, isError: true })
+            continue
           }
         }
 
