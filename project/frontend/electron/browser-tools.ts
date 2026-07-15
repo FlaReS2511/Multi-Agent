@@ -408,7 +408,10 @@ async function snapshot(pg: Page, opts?: { waitMs?: number; settleFirst?: boolea
 }
 
 function refLocator(pg: Page, ref: string) {
-  const clean = String(ref).replace(/[^e0-9]/g, '')
+  // Snapshot tags elements as data-orqon-ref="eN" and shows them as [eN].
+  // Models often pass just the number ("1") or "e1" — normalize both to "eN".
+  const digits = String(ref).replace(/\D/g, '')
+  const clean = digits ? `e${digits}` : String(ref).trim()
   return pg.locator(`[data-orqon-ref="${clean}"]`).first()
 }
 
