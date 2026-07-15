@@ -86,6 +86,18 @@ export const BROWSER_TOOL_SPECS: ToolSpec[] = [
     input_schema: { type: 'object', properties: {} },
   },
   {
+    name: 'BrowserLaunchExternal',
+    description: 'Launch the user\'s real Chrome or Edge with a debugging port and a dedicated persistent profile (~/.orqon/browser-profile), so the user can browse/log in normally in that window while you assist. After it starts, call BrowserOpen with target "external" to attach. Requires user approval.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        browser: { type: 'string', enum: ['chrome', 'edge'] },
+        port: { type: 'integer', description: 'debug port (default 9222)' },
+      },
+      required: ['browser'],
+    },
+  },
+  {
     name: 'BrowserClose',
     description: 'Close the embedded browser tab (or detach from the external browser). Sessions/cookies persist for next time.',
     input_schema: { type: 'object', properties: {} },
@@ -279,6 +291,9 @@ function isLocalUrl(u: string): boolean {
 // Is this call confined to localhost? Open/Navigate are judged by their url
 // argument; everything else by the page the agent is currently on.
 export function browserGateInfo(name: string, args: Record<string, unknown>): { local: boolean; detail: string } {
+  if (name === 'BrowserLaunchExternal') {
+    return { local: false, detail: `launch ${args?.browser === 'edge' ? 'Microsoft Edge' : 'Google Chrome'} with a debugging port (dedicated profile)` }
+  }
   if (name === 'BrowserOpen' || name === 'BrowserNavigate') {
     const url = String(args?.url ?? '')
     if (url === 'back') return { local: true, detail: 'go back' }
@@ -355,6 +370,45 @@ function refLocator(pg: Page, ref: string) {
   return pg.locator(`[data-orqon-ref="${clean}"]`).first()
 }
 
+// ── external browser launch (phase 2) ───────────────────────────
+
+async function cdpAlive(port: number): Promise<boolean> {
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/json/version`, { signal: AbortSignal.timeout(1000) })
+    return res.ok
+  } catch { return false }
+}
+
+// Chrome/Edge 136+ refuse a debug port on the DEFAULT profile, so external
+// browsers run on a dedicated persistent profile the user logs into once.
+function launchExternalBrowser(brand: 'chrome' | 'edge', port: number): void {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { spawn } = cjsRequire('node:child_process') as typeof import('node:child_process')
+  const profile = path.join(app.getPath('home'), '.orqon', 'browser-profile', brand)
+  fs.mkdirSync(profile, { recursive: true })
+  const flags = [`--remote-debugging-port=${port}`, `--user-data-dir=${profile}`, '--no-first-run', '--no-default-browser-check']
+  if (process.platform === 'darwin') {
+    const appName = brand === 'edge' ? 'Microsoft Edge' : 'Google Chrome'
+    const installed = fs.existsSync(`/Applications/${appName}.app`) ||
+      fs.existsSync(path.join(app.getPath('home'), 'Applications', `${appName}.app`))
+    if (!installed) throw new Error(`${appName} is not installed in /Applications`)
+    spawn('open', ['-na', appName, '--args', ...flags], { detached: true, stdio: 'ignore' }).unref()
+    return
+  }
+  if (process.platform === 'win32') {
+    const rel = brand === 'edge' ? 'Microsoft\\Edge\\Application\\msedge.exe' : 'Google\\Chrome\\Application\\chrome.exe'
+    const candidates = [process.env.PROGRAMFILES, process.env['PROGRAMFILES(X86)'], process.env.LOCALAPPDATA]
+      .filter(Boolean).map((base) => path.join(base as string, rel))
+    const exe = candidates.find((p) => fs.existsSync(p))
+    if (!exe) throw new Error(`${brand} executable not found (looked in Program Files / LocalAppData)`)
+    spawn(exe, flags, { detached: true, stdio: 'ignore' }).unref()
+    return
+  }
+  // linux: rely on PATH
+  const bin = brand === 'edge' ? 'microsoft-edge' : 'google-chrome'
+  spawn(bin, flags, { detached: true, stdio: 'ignore' }).unref()
+}
+
 // ── dispatcher ───────────────────────────────────────────────────
 
 export async function runBrowserTool(
@@ -424,6 +478,22 @@ export async function runBrowserTool(
       const file = path.join(dir, `shot-${++shotCounter}-${Date.now() % 100000}.png`)
       await pg.screenshot({ path: file, timeout: 10_000 })
       return `saved screenshot to ${path.relative(ctx.workspaceRoot, file)} (tell the user to open it — you cannot view images)`
+    }
+    case 'BrowserLaunchExternal': {
+      const brand = args.browser === 'edge' ? 'edge' : 'chrome'
+      const port = Number(args.port) || 9222
+      if (await cdpAlive(port)) {
+        return `a browser is already listening on port ${port} — call BrowserOpen with target "external" (port ${port}) to attach`
+      }
+      launchExternalBrowser(brand, port)
+      for (let i = 0; i < 30; i++) {
+        await new Promise((r) => setTimeout(r, 500))
+        if (await cdpAlive(port)) {
+          return `${brand} launched with debugging port ${port} (dedicated profile ~/.orqon/browser-profile/${brand} — ` +
+            'the user can browse and log in normally in that window). Call BrowserOpen with target "external" to attach.'
+        }
+      }
+      return `error: launched ${brand} but port ${port} never came up — it may already be running WITHOUT a debug port; ask the user to quit it fully and retry`
     }
     case 'BrowserClose': {
       if (extPage && !extPage.isClosed()) { await extPage.close().catch(() => {}) }
