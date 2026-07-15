@@ -11,7 +11,7 @@
 // declines. No tokens/credentials are persisted by this module.
 
 import { execFile } from 'node:child_process'
-import { spawn, ChildProcess } from 'node:child_process'
+import { spawn } from 'node:child_process'
 import * as db from './db'
 import { ToolSpec } from './agent-tools'
 
@@ -305,7 +305,7 @@ export const EXTRA_TOOL_SPECS: ToolSpec[] = [
   },
   {
     name: 'BashBackground',
-    description: 'Start a long-running shell command in the background (e.g. a dev server, watcher, or build over 120s). Returns a job id. Use BashOutput to read its output and KillBash to stop it. Requires user confirmation.',
+    description: 'Start a long-running command in a background terminal (real PTY) — dev servers, watchers, builds over 120s, even interactive programs. Returns a job id. Use BashOutput to read output, BashInput to answer prompts, KillBash to stop it (kills the whole process tree). Requires user confirmation.',
     input_schema: {
       type: 'object',
       properties: { command: { type: 'string' } },
@@ -314,11 +314,20 @@ export const EXTRA_TOOL_SPECS: ToolSpec[] = [
   },
   {
     name: 'BashOutput',
-    description: 'Read the accumulated stdout/stderr of a background job started with BashBackground. Read-only.',
+    description: 'Read the accumulated output of a background job started with BashBackground (ANSI codes stripped). Read-only.',
     input_schema: {
       type: 'object',
       properties: { job_id: { type: 'string' } },
       required: ['job_id'],
+    },
+  },
+  {
+    name: 'BashInput',
+    description: 'Send a line to the stdin of a running background job — answer an interactive prompt (y/n, a menu choice…). A trailing newline is added automatically.',
+    input_schema: {
+      type: 'object',
+      properties: { job_id: { type: 'string' }, input: { type: 'string' } },
+      required: ['job_id', 'input'],
     },
   },
   {
@@ -407,33 +416,87 @@ export const SENSITIVE_EXTRA_TOOLS = new Set([
 // Jobs live for the lifetime of the main process. Output is buffered (capped)
 // so BashOutput can read it. Keyed by a short job id.
 
+// Jobs run inside a real PTY (node-pty, same native module the terminal dock
+// uses): programs see a TTY, interactive prompts can be answered via
+// BashInput, and killing the pty tears down the WHOLE process session — not
+// just the wrapper shell (plain kill left `npm run dev`'s node children
+// alive, still holding the port). Falls back to child_process when the
+// native module is unavailable.
+let bgPty: typeof import('node-pty') | null = null
+try {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  bgPty = require('node-pty') as typeof import('node-pty')
+} catch { /* fallback to child_process below */ }
+
 interface BgJob {
   id: string
   command: string
-  proc: ChildProcess
   output: string
   done: boolean
   exitCode: number | null
+  write: (text: string) => void
+  kill: () => void
 }
 
 const bgJobs = new Map<string, BgJob>()
 let bgCounter = 0
 const BG_OUTPUT_CAP = 200_000 // chars retained per job
 
+// PTY output carries ANSI escapes and carriage-return redraws (progress
+// bars, spinners). Reduce to plain text so the model reads clean logs:
+// strip escape sequences, then keep only the final redraw of each line.
+function cleanTerminalOutput(raw: string): string {
+  const noEsc = raw
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '') // OSC (window title…)
+    .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '')          // CSI (colors, cursor)
+    .replace(/\x1b[@-_]/g, '')                          // bare ESC sequences
+  return noEsc
+    .split('\n')
+    .map((line) => line.split('\r').filter(Boolean).pop() ?? '')
+    .join('\n')
+}
+
 function startBackground(cwd: string, command: string): string {
   const id = `job-${++bgCounter}`
-  const shell = process.platform === 'win32' ? 'powershell.exe' : '/bin/sh'
-  const shellArgs = process.platform === 'win32' ? ['-Command', command] : ['-c', command]
-  const proc = spawn(shell, shellArgs, { cwd, stdio: ['ignore', 'pipe', 'pipe'] })
-  const job: BgJob = { id, command, proc, output: '', done: false, exitCode: null }
-  const append = (chunk: Buffer) => {
-    job.output += chunk.toString('utf-8')
+  const isWin = process.platform === 'win32'
+  const shell = isWin ? 'powershell.exe' : '/bin/sh'
+  const shellArgs = isWin ? ['-Command', command] : ['-c', command]
+  let job: BgJob
+  const append = (text: string) => {
+    job.output += text
     if (job.output.length > BG_OUTPUT_CAP) job.output = job.output.slice(-BG_OUTPUT_CAP)
   }
-  proc.stdout?.on('data', append)
-  proc.stderr?.on('data', append)
-  proc.on('exit', (code) => { job.done = true; job.exitCode = code })
-  proc.on('error', (err) => { job.output += `\n[spawn error] ${err.message}`; job.done = true; job.exitCode = 1 })
+  if (bgPty) {
+    const p = bgPty.spawn(shell, shellArgs, {
+      name: 'xterm-256color', cols: 120, rows: 30, cwd,
+      env: process.env as Record<string, string>,
+    })
+    job = {
+      id, command, output: '', done: false, exitCode: null,
+      write: (t) => p.write(t),
+      kill: () => { try { p.kill() } catch { /* already dead */ } },
+    }
+    p.onData(append)
+    p.onExit(({ exitCode }) => { job.done = true; job.exitCode = exitCode })
+  } else {
+    // detached → the job leads its own process group, so kill(-pid) reaches
+    // every descendant, not just the shell.
+    const p = spawn(shell, shellArgs, { cwd, stdio: ['pipe', 'pipe', 'pipe'], detached: !isWin })
+    job = {
+      id, command, output: '', done: false, exitCode: null,
+      write: (t) => { p.stdin?.write(t) },
+      kill: () => {
+        if (!isWin && p.pid) {
+          try { process.kill(-p.pid, 'SIGTERM'); return } catch { /* group gone */ }
+        }
+        try { p.kill() } catch { /* already dead */ }
+      },
+    }
+    p.stdout?.on('data', (c: Buffer) => append(c.toString('utf-8')))
+    p.stderr?.on('data', (c: Buffer) => append(c.toString('utf-8')))
+    p.on('exit', (code) => { job.done = true; job.exitCode = code })
+    p.on('error', (err) => { append(`\n[spawn error] ${err.message}`); job.done = true; job.exitCode = 1 })
+  }
   bgJobs.set(id, job)
   return id
 }
@@ -441,7 +504,7 @@ function startBackground(cwd: string, command: string): string {
 // Kill any surviving background jobs (called on app quit from main).
 export function killAllBackgroundJobs(): void {
   for (const job of bgJobs.values()) {
-    if (!job.done) { try { job.proc.kill() } catch { /* ignore */ } }
+    if (!job.done) { try { job.kill() } catch { /* ignore */ } }
   }
   bgJobs.clear()
 }
@@ -790,16 +853,26 @@ export async function runExtraTool(
       const job = bgJobs.get(a.job_id)
       if (!job) return `error: no job ${a.job_id}`
       const status = job.done ? `exited (code ${job.exitCode})` : 'running'
-      const out = job.output.length > 6000 ? job.output.slice(-6000) : job.output
+      const clean = cleanTerminalOutput(job.output)
+      const out = clean.length > 6000 ? clean.slice(-6000) : clean
       return `[${job.id}] ${status}\n${out || '(no output yet)'}`
+    }
+    case 'BashInput': {
+      const a = args as { job_id: string; input?: string }
+      const job = bgJobs.get(a.job_id)
+      if (!job) return `error: no job ${a.job_id}`
+      if (job.done) return `error: job ${a.job_id} already exited (code ${job.exitCode})`
+      if (a.input == null) return 'error: input is required'
+      job.write(a.input.endsWith('\n') ? a.input : a.input + '\n')
+      return `sent to ${a.job_id} — read the response with BashOutput("${a.job_id}")`
     }
     case 'KillBash': {
       const a = args as { job_id: string }
       const job = bgJobs.get(a.job_id)
       if (!job) return `error: no job ${a.job_id}`
       if (job.done) return `job ${a.job_id} already exited (code ${job.exitCode})`
-      try { job.proc.kill() } catch { /* ignore */ }
-      return `killed job ${a.job_id}`
+      job.kill()
+      return `killed job ${a.job_id} (whole process tree)`
     }
   }
   return `error: unhandled extra tool ${name}`

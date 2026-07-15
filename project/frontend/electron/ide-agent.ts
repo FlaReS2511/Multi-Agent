@@ -189,7 +189,7 @@ const TOOL_GROUPS: Record<string, ToolSpec[]> = {
   github: pickExtra(['GitHubAuthStatus', 'GitHubAuthSwitch', 'GitHubLogin', 'ListPRs', 'ViewPR', 'ListIssues', 'CreatePR', 'CommentIssue']),
   web: pickExtra(['WebFetch', 'WebSearch', 'Research']),
   memory: pickExtra(['RememberNote', 'RecallNotes']),
-  background: pickExtra(['BashBackground', 'BashOutput', 'KillBash']),
+  background: pickExtra(['BashBackground', 'BashOutput', 'BashInput', 'KillBash']),
   excel: EXCEL_TOOL_SPECS,
 }
 const GROUP_BLURBS: Record<string, string> = {
