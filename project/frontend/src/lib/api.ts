@@ -351,6 +351,7 @@ export type IdeAgentEvent =
   | { type: 'plan'; plan: string; turns: number }
   | { type: 'done'; text: string; turns: number }
   | { type: 'error'; error: string }
+  | { type: 'subagent_started'; childRunId: string; label: string; task: string }
 
 declare global {
   interface Window {

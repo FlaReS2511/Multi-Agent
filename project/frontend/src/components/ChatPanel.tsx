@@ -15,6 +15,7 @@ import {
   TerminalSquare, ListPlus, Boxes, Undo2, AlertTriangle,
   GitBranch, GitCommitHorizontal, GitPullRequestArrow, UserCog, Globe, ListChecks, FolderTree, Trash, FileInput,
   History, Plus, Archive, Telescope, Copy, Check, ArrowDown, Pencil, AtSign,
+  ChevronRight, Loader2,
 } from 'lucide-react'
 import { ModelOption, IdeAgentEvent, PendingChange, PendingAction, AgentTodo, AgentSessionMeta } from '../lib/api'
 import { useUiSettings } from '../lib/uiSettings'
@@ -52,10 +53,19 @@ interface ToolEntry {
   running: boolean
 }
 
+// A delegated child agent, rendered as a nested live card in the transcript.
+interface SubAgentEntry {
+  kind: 'subagent'
+  childRunId: string
+  label: string
+  task: string
+}
+
 type AgentItem =
   | { kind: 'text'; id?: string; role: 'user' | 'assistant'; content?: string; chunks?: string[] }
   | { kind: 'reasoning'; id: string; chunks?: string[]; content?: string }
   | ToolEntry
+  | SubAgentEntry
 
 // Revealed text of an item, whether it stores whole content or streamed chunks.
 function itemText(it: AgentItem): string {
@@ -175,11 +185,15 @@ function buildHistory(items: AgentItem[]): Msg[] {
 // restores identically without the typewriter machinery. Drops the `running`
 // flag from tool entries (a restored tool is always finished).
 function serializeItems(items: AgentItem[]): AgentItem[] {
-  return items.map((it) => {
-    if (it.kind === 'text') return { kind: 'text', role: it.role, content: itemText(it) }
-    if (it.kind === 'reasoning') return { kind: 'reasoning', id: it.id, content: itemText(it) }
-    return { ...it, running: false }
-  })
+  return items
+    // Sub-agent cards are live views of a finished child run; drop them on
+    // persist (the SpawnAgent tool entry keeps the summary for history).
+    .filter((it) => it.kind !== 'subagent')
+    .map((it) => {
+      if (it.kind === 'text') return { kind: 'text', role: it.role, content: itemText(it) }
+      if (it.kind === 'reasoning') return { kind: 'reasoning', id: it.id, content: itemText(it) }
+      return { ...it, running: false }
+    })
 }
 
 // Shorten a long file path for a one-line chip, keeping the tail (filename +
@@ -231,6 +245,9 @@ interface Props {
   // Current workspace root — the panel reloads its session when this changes
   // (it stays mounted across workspace switches).
   workspaceRoot?: string
+  // Fired when the agent spawns a child agent (so the host can surface the
+  // live sub-agents sidebar panel).
+  onSubAgentStarted?: () => void
 }
 
 // Wind-up choreography: the frame slides open first (handled by the parent),
@@ -246,7 +263,7 @@ const itemVariants = {
   show: { opacity: 1, y: 0, transition: { duration: 0.28, ease: 'easeOut' } },
 }
 
-export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, onChangeResolved, onEditorRequest, windup = true, visible = true, onRunStateChange, onContextUsage, onRunFinished, files = [], workspaceRoot = '' }: Props) {
+export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, onChangeResolved, onEditorRequest, windup = true, visible = true, onRunStateChange, onContextUsage, onRunFinished, files = [], workspaceRoot = '', onSubAgentStarted }: Props) {
   const { chatFontSize } = useUiSettings()
   const [mode, setMode] = useState<'ask' | 'agent'>('ask')
   // Plan mode is a toggle WITHIN agent mode (via /plan): runs read-only and
@@ -728,6 +745,13 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
       if (e.type === 'action_resolved') { setPendingAction(null); return }
       if (e.type === 'todos') { setTodos(e.todos); return }
       if (e.type === 'context') { setCtxUsage({ used: e.used, window: e.window }); return }
+      if (e.type === 'subagent_started') {
+        // A child agent was delegated: render a nested live card. The plain
+        // SpawnAgent tool entry is kept for history but hidden from view.
+        onSubAgentStarted?.()
+        setAgentItems((prev) => [...prev, { kind: 'subagent', childRunId: e.childRunId, label: e.label, task: e.task }])
+        return
+      }
       setAgentItems((prev) => {
         const copy = [...prev]
         if (e.type === 'tool_call') {
@@ -1161,8 +1185,12 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
                     ? <GlowMessage role={it.role} chunks={it.chunks} />
                     : <MessageBubble role={it.role} content={it.content ?? ''} streaming={false} />}
                 </RiseIn>
+              ) : it.kind === 'subagent' ? (
+                <RiseIn key={i}><SubAgentCard entry={it} /></RiseIn>
               ) : it.kind === 'tool' ? (
-                <RiseIn key={i}><ToolActivity entry={it} /></RiseIn>
+                // The SpawnAgent tool entry is kept in state for cross-turn
+                // history but shown as the richer nested SubAgentCard instead.
+                it.name === 'SpawnAgent' ? null : <RiseIn key={i}><ToolActivity entry={it} /></RiseIn>
               ) : null,
             )}
             {streaming && (
@@ -1749,6 +1777,64 @@ function ThinkingDock({ chunks, active }: { chunks: string[]; active: boolean })
 
 // Inline card for one tool call. Collapsed by default: a single summary line
 // (icon + name + target). Expand to see the tool's output.
+// A delegated child agent, rendered as a nested collapsible card that
+// subscribes to the child's own run channel and streams its live activity.
+function SubAgentCard({ entry }: { entry: SubAgentEntry }) {
+  const [open, setOpen] = useState(false)
+  const [tools, setTools] = useState<ToolEntry[]>([])
+  const [text, setText] = useState('')
+  const [status, setStatus] = useState<'running' | 'done' | 'error' | 'blocked'>('running')
+
+  useEffect(() => {
+    const off = window.api.onAiAgentEvent(entry.childRunId, (e: IdeAgentEvent) => {
+      if (e.type === 'token') setText((t) => t + e.delta)
+      else if (e.type === 'tool_call') setTools((ts) => [...ts, { kind: 'tool', callId: e.callId, name: e.name, args: e.args, running: true }])
+      else if (e.type === 'tool_result') setTools((ts) => ts.map((t) => t.callId === e.callId ? { ...t, result: e.result, isError: e.isError, running: false } : t))
+      else if (e.type === 'done') { setStatus('done'); if (e.text) setText(e.text) }
+      else if (e.type === 'error') { setStatus('error'); setText((t) => t + `\n⚠ ${e.error}`) }
+      else if (e.type === 'blocked') { setStatus('blocked'); setText((t) => t + `\n⛔ ${e.reason}`) }
+    })
+    return off
+  }, [entry.childRunId])
+
+  const dot = status === 'running'
+    ? <Loader2 size={12} className="animate-spin text-blue-400" />
+    : status === 'done' ? <Check size={12} className="text-emerald-400" />
+    : <XCircle size={12} className="text-rose-400" />
+  const runningTools = tools.filter((t) => !t.running).length
+
+  return (
+    <div className="rounded-lg border border-violet-500/30 bg-violet-500/5 text-[11px] overflow-hidden">
+      <button
+        onClick={() => setOpen((v) => !v)}
+        className="w-full flex items-center gap-1.5 px-2 py-1.5 text-left hover:bg-violet-500/10 transition-colors"
+      >
+        <ChevronRight size={12} className={`text-zinc-500 transition-transform flex-shrink-0 ${open ? 'rotate-90' : ''}`} />
+        <Boxes size={12} className="text-violet-400 flex-shrink-0" />
+        <span className="font-semibold text-violet-200 truncate">{entry.label}</span>
+        <span className="ml-auto flex items-center gap-1.5 flex-shrink-0 text-zinc-500">
+          {runningTools > 0 && <span className="font-mono text-[10px]">{runningTools} tool{runningTools > 1 ? 's' : ''}</span>}
+          {dot}
+        </span>
+      </button>
+      {open && (
+        <div className="px-2 pb-2 pt-0.5 space-y-1.5 border-t border-violet-500/20">
+          <div className="text-[10px] text-zinc-500 italic pt-1.5 whitespace-pre-wrap">{entry.task}</div>
+          {tools.map((t, i) => <ToolActivity key={i} entry={t} />)}
+          {text.trim() && (
+            <div className="rounded bg-zinc-900/60 border border-zinc-800 px-2 py-1.5">
+              <MessageContent text={text} />
+            </div>
+          )}
+        </div>
+      )}
+      {!open && status !== 'running' && text.trim() && (
+        <div className="px-2.5 pb-2 -mt-0.5 text-[10px] text-zinc-400 line-clamp-2">{text.trim().slice(0, 160)}</div>
+      )}
+    </div>
+  )
+}
+
 function ToolActivity({ entry }: { entry: ToolEntry }) {
   const [open, setOpen] = useState(false)
   const icon = {
