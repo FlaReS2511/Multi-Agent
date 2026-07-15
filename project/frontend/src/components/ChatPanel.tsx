@@ -182,6 +182,14 @@ function serializeItems(items: AgentItem[]): AgentItem[] {
   })
 }
 
+// Shorten a long file path for a one-line chip, keeping the tail (filename +
+// nearest folders — the part that identifies the file). CSS truncate is the
+// backstop for very narrow widths; this keeps the useful end visible.
+function shortenPath(p: string, max = 44): string {
+  if (p.length <= max) return p
+  return '…' + p.slice(p.length - (max - 1))
+}
+
 // A short title derived from the first user message of a conversation.
 function deriveTitle(items: AgentItem[]): string {
   const firstUser = items.find((it) => it.kind === 'text' && it.role === 'user') as
@@ -1335,17 +1343,19 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
         {/* Context chip */}
         <button
           onClick={() => setUseFileContext((v) => !v)}
-          className={`w-full flex items-center gap-1.5 px-2 py-1 rounded text-[10px] font-mono transition-colors ${
+          className={`w-full min-w-0 flex items-center gap-1.5 px-2 py-1 rounded text-[10px] font-mono transition-colors ${
             useFileContext && ctxPreview
               ? 'bg-blue-500/10 border border-blue-500/30 text-blue-300'
               : 'bg-zinc-900 border border-zinc-800 text-zinc-600'
           }`}
-          title="Toggle sending the open file as context"
+          title={ctxPreview ? ctxPreview.path : 'Toggle sending the open file as context'}
         >
-          <FileCode size={11} />
-          {ctxPreview
-            ? `${useFileContext ? '' : '(off) '}${ctxPreview.path}${ctxPreview.selection ? ' · selection' : ''}`
-            : 'No file open'}
+          <FileCode size={11} className="flex-shrink-0" />
+          <span className="truncate min-w-0">
+            {ctxPreview
+              ? `${useFileContext ? '' : '(off) '}${shortenPath(ctxPreview.path)}${ctxPreview.selection ? ' · selection' : ''}`
+              : 'No file open'}
+          </span>
         </button>
 
         {mode !== 'ask' && ctxUsage && <ContextMeter used={ctxUsage.used} window={ctxUsage.window} />}
