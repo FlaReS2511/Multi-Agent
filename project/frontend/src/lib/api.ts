@@ -336,6 +336,7 @@ export type IdeAgentEvent =
   | { type: 'file_changed'; path: string }
   | { type: 'context'; used: number; window: number; turn: number }
   | { type: 'blocked'; reason: string; turns: number }
+  | { type: 'plan'; plan: string; turns: number }
   | { type: 'done'; text: string; turns: number }
   | { type: 'error'; error: string }
 
@@ -440,6 +441,7 @@ declare global {
         selection?: string
         reviewMode?: boolean
         planMode?: boolean
+        researchMode?: boolean
       }): Promise<{ ok: boolean; error?: string }>
       aiAgentCancel(runId: string): Promise<{ ok: boolean }>
       aiAgentReview(changeId: string, decision: 'accept' | 'reject'): Promise<{ ok: boolean }>

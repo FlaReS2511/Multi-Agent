@@ -14,6 +14,7 @@ import path from 'node:path'
 import {
   FILE_TOOL_SPECS, runFileTool, ToolSpec,
   ChangePreview, previewWrite, previewEdit, applyChange,
+  EXCEL_TOOL_SPECS, EXCEL_TOOL_NAMES, EXCEL_MUTATORS, runExcelTool,
 } from './agent-tools'
 import {
   EXTRA_TOOL_SPECS, EXTRA_TOOL_NAMES, runExtraTool, PendingAction,
@@ -36,6 +37,15 @@ const PLAN_READONLY_TOOLS = new Set([
   'GitHubAuthStatus', 'ListGitProfiles', 'ListPRs', 'ViewPR', 'ListIssues',
   'WebFetch', 'WebSearch', 'RecallNotes', 'TodoWrite', 'BashOutput',
   'ReportBlocked',
+])
+
+// Research mode: read-only deep investigation with the web tools available
+// (WebSearch/WebFetch/Research), producing a thorough cited answer.
+const RESEARCH_READONLY_TOOLS = new Set([
+  'Read', 'Grep', 'Glob', 'ListDir', 'GetDiagnostics',
+  'OpenFile', 'GetOpenEditor', 'ShowDiff',
+  'GitStatus', 'GitDiff', 'GitLog', 'GitBranch',
+  'WebFetch', 'WebSearch', 'Research', 'RecallNotes', 'TodoWrite', 'ReportBlocked',
 ])
 
 // Editor round-trip tools (GĐ2). These don't touch fs — main asks the renderer
@@ -111,7 +121,23 @@ const REPORT_BLOCKED_SPEC: ToolSpec = {
   },
 }
 
-// Build the tool set for a run. Bash and orchestration tools are opt-in.
+// Plan-mode control tool: the agent calls this ONCE, when the plan is complete,
+// to present it for approval. Until then no approve UI appears.
+const PRESENT_PLAN_SPEC: ToolSpec = {
+  name: 'PresentPlan',
+  description:
+    'Call this EXACTLY ONCE, only when your plan is complete and final, to present it to the user for approval. ' +
+    'Pass the full step-by-step plan as `plan` (markdown). This ends plan mode and shows the user an Approve button. ' +
+    'Do NOT call it while you are still investigating or if you need to ask the user something first — just keep ' +
+    'using read-only tools until the plan is genuinely ready.',
+  input_schema: {
+    type: 'object',
+    properties: { plan: { type: 'string', description: 'the complete step-by-step plan (markdown)' } },
+    required: ['plan'],
+  },
+}
+
+// The FULL tool set for a run (used for plan-mode read-only filtering).
 function toolSpecsFor(opts: { allowBash: boolean; orchestrationEnabled: boolean }): ToolSpec[] {
   const specs: ToolSpec[] = [
     ...FILE_TOOL_SPECS.filter((s) => opts.allowBash || s.name !== 'Bash'),
@@ -119,6 +145,57 @@ function toolSpecsFor(opts: { allowBash: boolean; orchestrationEnabled: boolean 
     ...EXTRA_TOOL_SPECS,
     REPORT_BLOCKED_SPEC,
   ]
+  if (opts.orchestrationEnabled) specs.push(...ORCH_TOOL_SPECS)
+  return specs
+}
+
+// ── Lazy tool loading ────────────────────────────────────────────
+// Only the CORE toolset is sent every turn. Heavier tool families (git, github,
+// web, memory, background) live in groups the model loads on demand via
+// LoadToolGroup, so their ~28 definitions don't cost input tokens each turn
+// unless the task actually needs them.
+const EXTRA_BY_NAME = new Map(EXTRA_TOOL_SPECS.map((s) => [s.name, s]))
+function pickExtra(names: string[]): ToolSpec[] {
+  return names.map((n) => EXTRA_BY_NAME.get(n)).filter((s): s is ToolSpec => !!s)
+}
+const TOOL_GROUPS: Record<string, ToolSpec[]> = {
+  git: pickExtra(['GitStatus', 'GitDiff', 'GitLog', 'GitBranch', 'GitConfigGet', 'GitConfigSet', 'GitRemoteGet', 'GitRemoteSet', 'GitAdd', 'GitCommit', 'GitPush', 'GitPull', 'GitCheckout', 'SwitchGitAccount', 'SaveGitProfile', 'ListGitProfiles']),
+  github: pickExtra(['GitHubAuthStatus', 'GitHubAuthSwitch', 'GitHubLogin', 'ListPRs', 'ViewPR', 'ListIssues', 'CreatePR', 'CommentIssue']),
+  web: pickExtra(['WebFetch', 'WebSearch', 'Research']),
+  memory: pickExtra(['RememberNote', 'RecallNotes']),
+  background: pickExtra(['BashBackground', 'BashOutput', 'KillBash']),
+  excel: EXCEL_TOOL_SPECS,
+}
+const GROUP_BLURBS: Record<string, string> = {
+  git: 'git (status/diff/log/branch/add/commit/push/pull/checkout/config/remote/account)',
+  github: 'github (pull requests & issues via gh)',
+  web: 'web (WebFetch, WebSearch)',
+  memory: 'memory (remember/recall notes across sessions)',
+  background: 'background (run/monitor/kill long-running commands)',
+  excel: 'excel (create/read/edit .xlsx: sheets, ranges, formulas, formatting)',
+}
+const LOAD_GROUP_SPEC: ToolSpec = {
+  name: 'LoadToolGroup',
+  description:
+    'Enable an extra group of tools when the task needs them (they are hidden until loaded, to save context). ' +
+    'Groups: ' + Object.entries(GROUP_BLURBS).map(([k, v]) => `"${k}" = ${v}`).join('; ') + '. ' +
+    'Call group=<name> to enable that group for the rest of this session, then call its tools directly. Load only what you need.',
+  input_schema: {
+    type: 'object',
+    properties: { group: { type: 'string', enum: Object.keys(TOOL_GROUPS) } },
+    required: ['group'],
+  },
+}
+const TODO_SPEC = EXTRA_BY_NAME.get('TodoWrite') // common + tiny → keep in core
+
+// Core tools sent every turn: file + editor + todo + control + LoadToolGroup.
+function coreSpecsFor(opts: { allowBash: boolean; orchestrationEnabled: boolean }): ToolSpec[] {
+  const specs: ToolSpec[] = [
+    ...FILE_TOOL_SPECS.filter((s) => opts.allowBash || s.name !== 'Bash'),
+    ...EDITOR_TOOL_SPECS,
+  ]
+  if (TODO_SPEC) specs.push(TODO_SPEC)
+  specs.push(REPORT_BLOCKED_SPEC, LOAD_GROUP_SPEC)
   if (opts.orchestrationEnabled) specs.push(...ORCH_TOOL_SPECS)
   return specs
 }
@@ -137,6 +214,8 @@ export interface IdeAgentParams {
   orchestrationEnabled?: boolean
   // Plan mode: read-only investigation, then present a plan (no file writes).
   planMode?: boolean
+  // Research mode: read-only deep investigation (web + code) → cited answer.
+  researchMode?: boolean
 }
 
 // Orchestration tools run in main (need db + coordinator), so they're routed
@@ -185,6 +264,7 @@ export type IdeAgentEvent =
   | { type: 'file_changed'; path: string }
   | { type: 'context'; used: number; window: number; turn: number }
   | { type: 'blocked'; reason: string; turns: number }
+  | { type: 'plan'; plan: string; turns: number }
   | { type: 'done'; text: string; turns: number }
   | { type: 'error'; error: string }
 
@@ -223,14 +303,12 @@ function buildSystemPrompt(params: IdeAgentParams, workspaceRoot: string): strin
     'Grep, Glob, ListDir, Move, Delete. ' +
     'You also have editor tools to work with what the user sees: OpenFile (show a file ' +
     'in the editor, optionally at a line), GetOpenEditor (get the currently viewed file ' +
-    'and selection), and ShowDiff (preview a proposed change without writing it). ' +
-    'For version control you have git tools: GitStatus, GitDiff, GitLog, GitBranch, ' +
-    'GitAdd, GitCommit, GitPush, GitPull, GitCheckout. For managing the git identity / ' +
-    'account you have GitConfigGet/GitConfigSet, GitRemoteGet/GitRemoteSet, and for GitHub: ' +
-    'GitHubAuthStatus, GitHubAuthSwitch, GitHubLogin. You can save reusable account ' +
-    'profiles (SaveGitProfile, ListGitProfiles) and apply one in a single step with ' +
-    'SwitchGitAccount. You can also research online with WebFetch and WebSearch, track ' +
-    'your plan with TodoWrite, and run long processes with BashBackground/BashOutput/KillBash. ' +
+    'and selection), and ShowDiff (preview a proposed change without writing it), plus ' +
+    'TodoWrite to track a plan. ' +
+    'Extra tool groups are NOT loaded by default (to save context): git (status/diff/commit/' +
+    'push/branch/checkout/config/account), github (PRs & issues), web (WebFetch, WebSearch), ' +
+    'memory (remember/recall notes), and background (long-running commands). When the task ' +
+    'needs one, call LoadToolGroup(group) FIRST to enable it, then call its tools. ' +
     'Sensitive actions (git mutations, changing the identity, switching accounts, logging ' +
     'in, background commands) ask the user for confirmation automatically — just call the ' +
     'tool and the user will approve or decline. ' +
@@ -244,10 +322,24 @@ function buildSystemPrompt(params: IdeAgentParams, workspaceRoot: string): strin
     s =
       'You are Orqon in PLAN MODE. You may ONLY investigate — read files, search, run ' +
       'diagnostics, inspect git, browse the web. You must NOT modify anything (no Write/Edit/' +
-      'commits/commands). Your job is to research the request thoroughly, then present a clear, ' +
-      'step-by-step implementation plan: what files to change and how, key decisions, and how to ' +
-      'verify. End your final message with the plan as a numbered list. The user will review it ' +
-      'and approve before any changes are made — so do not ask questions, just produce the best plan.\n\n' +
+      'commits/commands). Research the request thoroughly FIRST. Only when your plan is complete ' +
+      'and final, call the PresentPlan tool with the full step-by-step plan (files to change and how, ' +
+      'key decisions, how to verify). Do NOT call PresentPlan until you have finished investigating — ' +
+      'keep using read-only tools until you are confident. Calling PresentPlan is what shows the user ' +
+      'the Approve button; until then, no approval is offered. ' +
+      'As you investigate, briefly narrate what you find in one line each (this streams live to the ' +
+      'user so they can follow your thinking) before you call PresentPlan.\n\n' +
+      `Workspace root: ${workspaceRoot}`
+  } else if (params.researchMode) {
+    s =
+      'You are Orqon in RESEARCH mode. Investigate the question DEEPLY and strictly READ-ONLY. You may ' +
+      'read the codebase (Read/Grep/Glob/ListDir/GetDiagnostics), inspect git history (GitStatus/Diff/Log), ' +
+      'and research the web with WebSearch, WebFetch, and Research (a one-call multi-source deep dive). ' +
+      'Do NOT modify anything. Go DEEP: call Research with 2–4 sub-queries covering different angles of the ' +
+      'question, read the returned sources, then run FOLLOW-UP Research/WebFetch calls to fill gaps, verify ' +
+      'claims across sources, and chase specifics — do not stop at the first search. Keep digging until the ' +
+      'answer is well-supported, then write a thorough, well-structured answer that CITES its sources ' +
+      '(URLs / file paths).\n\n' +
       `Workspace root: ${workspaceRoot}`
   }
   if (params.openFile) {
@@ -300,9 +392,20 @@ export async function runIdeAgent(
     const orchestrationEnabled = Boolean(params.orchestrationEnabled && orchestrationBridge)
     const contextWindow = contextWindowFor(model, pc)
     const planMode = Boolean(params.planMode)
-    let specs = toolSpecsFor({ allowBash, orchestrationEnabled })
-    if (planMode) specs = specs.filter((s) => PLAN_READONLY_TOOLS.has(s.name))
-    const adapter = buildAdapter(pc, key, model, specs)
+    const researchMode = Boolean(params.researchMode) && !planMode
+    // Plan/research use a curated read-only set (no lazy loading). Normal mode
+    // sends only the core set + LoadToolGroup; extra groups load on demand.
+    let activeSpecs: ToolSpec[]
+    if (planMode) {
+      activeSpecs = toolSpecsFor({ allowBash, orchestrationEnabled }).filter((s) => PLAN_READONLY_TOOLS.has(s.name))
+      activeSpecs.push(PRESENT_PLAN_SPEC)
+    } else if (researchMode) {
+      activeSpecs = toolSpecsFor({ allowBash, orchestrationEnabled }).filter((s) => RESEARCH_READONLY_TOOLS.has(s.name))
+    } else {
+      activeSpecs = coreSpecsFor({ allowBash, orchestrationEnabled })
+    }
+    let adapter = buildAdapter(pc, key, model, activeSpecs)
+    const loadedGroups = new Set<string>()
     const system = buildSystemPrompt(params, workspaceRoot)
     // Seed the conversation with the prior chat turns (user + assistant text).
     const messages: unknown[] = params.messages.map((m) => ({ role: m.role, content: m.content }))
@@ -363,14 +466,62 @@ export async function runIdeAgent(
           return
         }
 
+        // Plan-mode control tool: the plan is ready → present it for approval.
+        if (call.name === 'PresentPlan') {
+          const plan = String((call.args as { plan?: string }).plan || '').trim()
+          if (!plan) {
+            emit({ type: 'tool_result', callId, name: call.name, result: 'error: plan is required', isError: true })
+            results.push('error: plan is required — pass the full step-by-step plan')
+            continue
+          }
+          emit({ type: 'tool_result', callId, name: call.name, result: 'plan presented', isError: false })
+          emit({ type: 'plan', plan, turns })
+          return
+        }
+
+        // Lazy tool loading: enable a group's tools for the rest of the run.
+        if (call.name === 'LoadToolGroup') {
+          const g = String((call.args as { group?: string }).group || '')
+          const grp = TOOL_GROUPS[g]
+          let r: string
+          if (!grp) {
+            r = `error: unknown group "${g}". Available: ${Object.keys(TOOL_GROUPS).join(', ')}`
+          } else if (loadedGroups.has(g)) {
+            r = `group "${g}" is already loaded`
+          } else {
+            loadedGroups.add(g)
+            activeSpecs = [...activeSpecs, ...grp]
+            adapter = buildAdapter(pc, key, model, activeSpecs) // rebuild with the new tools
+            r = `loaded ${grp.length} ${g} tools: ${grp.map((s) => s.name).join(', ')}. You can call them now.`
+          }
+          emit({ type: 'tool_result', callId, name: call.name, result: r, isError: r.startsWith('error:') })
+          results.push(r)
+          continue
+        }
+
         let result: string
         let isError = false
         const isMutation = call.name === 'Write' || call.name === 'Edit'
         const isEditorTool = EDITOR_TOOL_NAMES.has(call.name)
         const isOrchTool = ORCH_TOOL_NAMES.has(call.name)
         const isExtraTool = EXTRA_TOOL_NAMES.has(call.name)
+        const isExcelTool = EXCEL_TOOL_NAMES.has(call.name)
 
-        if (isExtraTool) {
+        if (isExcelTool) {
+          // Excel tools are async (exceljs) → dispatched separately from runFileTool.
+          try {
+            const r = await runExcelTool(workspaceRoot, call.name, call.args)
+            result = r == null ? `error: unknown tool ${call.name}` : r
+            isError = result.startsWith('error:')
+          } catch (e: any) {
+            result = `error: ${e?.message || e}`
+            isError = true
+          }
+          if (!isError && EXCEL_MUTATORS.has(call.name)) {
+            const rel = (call.args as { path?: string }).path
+            if (rel) emit({ type: 'file_changed', path: rel })
+          }
+        } else if (isExtraTool) {
           // Git / git-account / web / todo / background tools. Sensitive ones
           // (mutations, login, account switch) gate on the confirm bridge.
           const confirm = async (action: Omit<PendingAction, 'actionId'>): Promise<boolean> => {

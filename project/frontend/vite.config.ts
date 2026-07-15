@@ -3,7 +3,7 @@ import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 import electron from 'vite-plugin-electron/simple'
 
-const nativeExternal = ['node-pty', 'better-sqlite3']
+const nativeExternal = ['node-pty', 'better-sqlite3', 'exceljs']
 // discord.js is a large Node library with dynamic requires (ws, zlib bindings).
 // Keep it external for the bot child-process build so Rollup doesn't try to
 // bundle it; it's resolved from node_modules at runtime like the native deps.

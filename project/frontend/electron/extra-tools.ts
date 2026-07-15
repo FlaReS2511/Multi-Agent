@@ -267,6 +267,19 @@ export const EXTRA_TOOL_SPECS: ToolSpec[] = [
       required: ['query'],
     },
   },
+  {
+    name: 'Research',
+    description: 'Deep web research in one call: runs SEVERAL web searches (the main question plus any sub-queries/angles you pass in `queries`), dedupes sources across them, fetches the top pages, and returns their combined content for you to synthesize a thorough, cited answer. Pass 2–4 `queries` covering different angles for real depth, and call this again on follow-up questions to fill gaps. max_sources default 5 (max 8). Read-only.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'the main research question' },
+        queries: { type: 'array', items: { type: 'string' }, description: 'extra search angles / sub-questions to broaden coverage' },
+        max_sources: { type: 'integer' },
+      },
+      required: ['query'],
+    },
+  },
 
   // ── agent utilities ──
   {
@@ -506,6 +519,46 @@ async function webSearch(query: string): Promise<string> {
   }
 }
 
+// Deep research: run several web searches (the main question + any sub-queries /
+// angles), dedupe sources across them, fetch the top pages, and return the
+// combined corpus so the model can synthesize a thorough, cited answer. The
+// agent drives depth by passing multiple `queries` and by calling this again on
+// follow-up questions.
+async function research(query: string, maxSources: number, queries?: string[]): Promise<string> {
+  const qs = [...new Set([query, ...(queries || [])].map((q) => (q || '').trim()).filter(Boolean))].slice(0, 5)
+  const searchBlocks: string[] = []
+  const urls: string[] = []
+  for (const q of qs) {
+    const s = await webSearch(q)
+    searchBlocks.push(`### ${q}\n${s}`)
+    if (!s.startsWith('error')) {
+      for (const m of s.matchAll(/(https?:\/\/\S+)/g)) {
+        const u = m[1]
+        // Skip ad/redirect links so we fetch real content sources.
+        if (/bing\.com\/aclick|duckduckgo\.com\/y\.js|googleadservices|\/aclk\?/i.test(u)) continue
+        urls.push(u)
+      }
+    }
+  }
+  const seen = new Set<string>()
+  const uniqUrls: string[] = []
+  for (const u of urls) { if (!seen.has(u)) { seen.add(u); uniqUrls.push(u) } }
+  const limit = Math.max(1, Math.min(8, maxSources || 5))
+  const parts: string[] = [`# Research: "${query}"\n\n## Searches (${qs.length} queries)\n${searchBlocks.join('\n\n')}`]
+  let fetched = 0
+  for (const url of uniqUrls) {
+    if (fetched >= limit) break
+    const body = await webFetch(url, 'text')
+    if (body.startsWith('error')) continue
+    const capped = body.length > 3800 ? body.slice(0, 3800) + '\n… (truncated)' : body
+    parts.push(`\n## Source: ${url}\n${capped}`)
+    fetched++
+  }
+  if (fetched === 0) parts.push('\n(no sources could be fetched)')
+  const out = parts.join('\n')
+  return out.length > 18000 ? out.slice(0, 18000) + '\n… (truncated)' : out
+}
+
 // ── main dispatcher ──────────────────────────────────────────────
 //
 // Returns the tool-result string, or null if `name` is not an extra tool (so
@@ -712,6 +765,11 @@ export async function runExtraTool(
     }
     case 'WebSearch':
       return await webSearch((args as { query: string }).query || '')
+    case 'Research': {
+      const a = args as { query: string; queries?: string[]; max_sources?: number }
+      if (!a.query?.trim()) return 'error: query required'
+      return await research(a.query, a.max_sources ?? 5, Array.isArray(a.queries) ? a.queries : undefined)
+    }
 
     // ── utilities ──
     case 'TodoWrite': {

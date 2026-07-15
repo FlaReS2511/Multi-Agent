@@ -187,6 +187,7 @@ const api = {
     selection?: string
     reviewMode?: boolean
     planMode?: boolean
+    researchMode?: boolean
   }) => ipcRenderer.invoke('ai-agent-run', runId, params),
   aiAgentCancel: (runId: string) => ipcRenderer.invoke('ai-agent-cancel', runId),
   aiAgentReview: (changeId: string, decision: 'accept' | 'reject') =>
