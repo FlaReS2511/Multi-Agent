@@ -1814,6 +1814,30 @@ const pendingActions = new Map<string, (approved: boolean) => void>()
 const pendingEditorReqs = new Map<string, (r: EditorResponse) => void>()
 let editorReqCounter = 0
 
+// ── sub-agent registry ───────────────────────────────────────────
+// Child IDE-agents spawned by the chat agent via SpawnAgent. The renderer
+// shows them both inline (nested card, subscribing to ai-agent-event:<childId>)
+// and in the sidebar (this list, pushed on `subagent-event`).
+interface SubAgentRec {
+  childRunId: string
+  parentRunId: string
+  label: string
+  task: string
+  status: 'running' | 'done' | 'error'
+  startedAt: number
+  endedAt: number | null
+  summary: string
+}
+const subAgents = new Map<string, SubAgentRec>()
+let subAgentCounter = 0
+const MAX_SUBAGENTS = 4
+function broadcastSubAgents(): void {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('subagent-event', [...subAgents.values()])
+  }
+}
+ipcMain.handle('subagent-list', () => ({ ok: true, subagents: [...subAgents.values()] }))
+
 // Create a task on the board (mirrors the create-task IPC, minus HTN split).
 function createBoardTask(input: { title: string; owner: string; description?: string; priority?: string }): string {
   const ts = nowStamp()
@@ -1904,11 +1928,74 @@ ipcMain.handle('ai-agent-run', async (_evt, runId: string, params: IdeAgentParam
     allowBash: Boolean(ideCfg.allowBash),
     orchestrationEnabled: Boolean(orch.enabled),
   }
+  // Delegate a sub-task to a child IDE-agent (full toolset, minus editor
+  // round-trip and minus its own SpawnAgent). Runs to completion; returns the
+  // child's final summary. Shares this run's abort signal + approval bridges so
+  // cancelling the parent cancels children and sensitive actions still prompt
+  // the user exactly once. Only offered to the TOP-LEVEL agent (depth 0).
+  const spawnSubAgent = async (input: { task: string; label?: string }): Promise<string> => {
+    if ((params.subAgentDepth ?? 0) > 0) return 'error: sub-agents cannot spawn further agents'
+    if (subAgents.size >= MAX_SUBAGENTS && [...subAgents.values()].filter((s) => s.status === 'running').length >= MAX_SUBAGENTS) {
+      return `error: too many sub-agents running (max ${MAX_SUBAGENTS}) — wait for one to finish`
+    }
+    // Keep the registry small: drop the oldest finished entries past a cap.
+    if (subAgents.size > 30) {
+      const finished = [...subAgents.values()].filter((s) => s.status !== 'running').sort((a, b) => (a.endedAt ?? 0) - (b.endedAt ?? 0))
+      for (const s of finished.slice(0, subAgents.size - 30)) subAgents.delete(s.childRunId)
+    }
+    const childRunId = `${runId}.sub-${++subAgentCounter}`
+    const label = (input.label || input.task).slice(0, 60)
+    const rec: SubAgentRec = {
+      childRunId, parentRunId: runId, label, task: input.task,
+      status: 'running', startedAt: Date.now(), endedAt: null, summary: '',
+    }
+    subAgents.set(childRunId, rec)
+    emit({ type: 'subagent_started', childRunId, label, task: input.task })
+    broadcastSubAgents()
+
+    let summary = ''
+    const childEmit = (e: IdeAgentEvent) => {
+      if (e.type === 'done') summary = e.text || ''
+      else if (e.type === 'blocked') summary = `blocked: ${e.reason}`
+      else if (e.type === 'error') summary = `error: ${e.error}`
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send(`ai-agent-event:${childRunId}`, e)
+      }
+    }
+    const childParams: IdeAgentParams = {
+      ...runParams,
+      messages: [{ role: 'user', content: input.task }],
+      openFile: undefined,
+      selection: undefined,
+      planMode: false,
+      researchMode: false,
+      subAgentDepth: (params.subAgentDepth ?? 0) + 1,
+    }
+    // Sub-agents reuse createTask/createGroup but NOT spawnSubAgent (depth cap).
+    const subBridge = {
+      createTask: orchestrationBridge.createTask,
+      createGroup: orchestrationBridge.createGroup,
+    }
+    try {
+      // editorBridge = undefined: a sub-agent must not drive the user's single
+      // editor; it writes to disk and the file_changed events reload the tab.
+      await runIdeAgent(SHARED, childParams, decryptKey, childEmit, ac.signal, requestReview, undefined, subBridge, requestAction)
+      rec.status = summary.startsWith('error:') ? 'error' : 'done'
+    } catch (e) {
+      summary = `error: ${(e as Error).message || e}`
+      rec.status = 'error'
+    }
+    rec.summary = summary
+    rec.endedAt = Date.now()
+    broadcastSubAgents()
+    return summary || '(sub-agent finished without a summary)'
+  }
   const orchestrationBridge = {
     createTask: async (input: { title: string; owner: string; description?: string; priority?: string }) =>
       createBoardTask(input),
     createGroup: async (input: { task_id: string; worker_role: string }) =>
       coordinator.createGroupForTask(input.task_id, input.worker_role),
+    spawnSubAgent,
   }
   try {
     await runIdeAgent(SHARED, runParams, decryptKey, emit, ac.signal, requestReview, editorBridge, orchestrationBridge, requestAction)

@@ -194,6 +194,18 @@ export interface TaskThreadEntry {
 
 export type GroupStatus = 'pending' | 'active' | 'reviewing' | 'passed' | 'failed' | 'killed'
 
+// A child agent spawned by the chat agent via SpawnAgent.
+export interface SubAgentInfo {
+  childRunId: string
+  parentRunId: string
+  label: string
+  task: string
+  status: 'running' | 'done' | 'error'
+  startedAt: number
+  endedAt: number | null
+  summary: string
+}
+
 export interface GroupRow {
   id: string
   task_id: string
@@ -467,6 +479,8 @@ declare global {
       browserTabClosed(): void
       onAgentBrowserShow(cb: () => void): () => void
       onBrowserUrlChanged(cb: (info: { url: string; title: string }) => void): () => void
+      subagentList(): Promise<{ ok: boolean; subagents: SubAgentInfo[] }>
+      onSubagentEvent(cb: (list: SubAgentInfo[]) => void): () => void
       groupCreate(input: { task_id: string; worker_role: string }): Promise<{ ok: boolean; group?: string; error?: string }>
       groupList(): Promise<{ ok: boolean; groups: GroupRow[] }>
       groupKill(groupId: string): Promise<{ ok: boolean }>

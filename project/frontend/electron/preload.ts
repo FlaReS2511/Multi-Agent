@@ -245,6 +245,13 @@ const api = {
     ipcRenderer.on('browser-url-changed', listener)
     return () => ipcRenderer.removeListener('browser-url-changed', listener)
   },
+  // Sub-agents spawned by the chat agent (live list for the sidebar).
+  subagentList: () => ipcRenderer.invoke('subagent-list'),
+  onSubagentEvent: (cb: (list: unknown[]) => void) => {
+    const listener = (_e: unknown, list: unknown[]) => cb(list)
+    ipcRenderer.on('subagent-event', listener)
+    return () => ipcRenderer.removeListener('subagent-event', listener)
+  },
   setAutoTrigger: (enabled: boolean) => ipcRenderer.invoke('set-auto-trigger', enabled),
   getAutoTrigger: () => ipcRenderer.invoke('get-auto-trigger'),
   onAutoTrigger: (cb: (info: { agent: string }) => void) => {
