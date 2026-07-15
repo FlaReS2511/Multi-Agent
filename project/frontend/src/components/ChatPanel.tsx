@@ -69,6 +69,22 @@ function itemText(it: AgentItem): string {
 // Per-tool result budget when folding tool activity into cross-turn history.
 const TOOL_RESULT_BUDGET = 800
 
+// Some models imitate the internal tool-log format (they see prior tool
+// activity in history and start pasting "[used Tool] → result" and element
+// refs like [e30] straight into their visible reply). Strip those machine
+// artifacts — they are never something the model should be speaking, so
+// removing them is safe for real prose while cleaning up the leak and
+// stopping it from compounding back into the next turn's history.
+function stripToolEcho(text: string): string {
+  if (!text.includes('[used ') && !/\[e\d+\]/.test(text)) return text
+  return text
+    .replace(/\[used [^\]\n]*\]\s*(?:→|->)?[ \t]*/g, '') // "[used BrowserClick] → "
+    .replace(/\[e\d+\]\s*/g, '')                          // element refs "[e30] "
+    .replace(/[ \t]{2,}/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+}
+
 // One-line summary of a tool call's target (path/pattern/command/…).
 function toolTarget(t: ToolEntry): string {
   const a = t.args as Record<string, unknown>
@@ -115,25 +131,37 @@ function buildHistory(items: AgentItem[]): Msg[] {
     if (last && last.role === role) last.content += (last.content ? '\n' : '') + line
     else out.push({ role, content: line })
   }
-  const pushAssistant = (line: string) => push('assistant', line)
+  // Tool activity is fed back in the USER voice (framed as reference), NOT the
+  // assistant voice — otherwise the model treats the tool-log format as its own
+  // speaking style and starts pasting tool results into its replies.
+  let toolBuf: string[] = []
+  const flushTools = () => {
+    if (!toolBuf.length) return
+    push('user', 'Results of tools you ran (reference only — do NOT repeat any of this in your reply):\n' + toolBuf.join('\n'))
+    toolBuf = []
+  }
   for (const it of kept) {
     if (it.kind === 'text') {
-      const content = itemText(it)
-      if (it.role === 'user') push('user', content)
-      else if (content.trim()) pushAssistant(content)
+      if (it.role === 'user') { flushTools(); push('user', itemText(it)) }
+      else {
+        const content = stripToolEcho(itemText(it))
+        flushTools()
+        if (content.trim()) push('assistant', content)
+      }
     } else if (it.kind === 'tool') {
       const target = toolTarget(it)
-      const head = `[used ${it.name}${target ? ` ${target}` : ''}]`
+      const head = `• ${it.name}${target ? ` (${target})` : ''}`
       let body = ''
       if (it.result) {
         const r = it.result.length > TOOL_RESULT_BUDGET
           ? it.result.slice(0, TOOL_RESULT_BUDGET) + ' …(truncated)'
           : it.result
-        body = it.isError ? `\n→ error: ${r}` : `\n→ ${r}`
+        body = it.isError ? ` → error: ${r}` : ` → ${r}`
       }
-      pushAssistant(head + body)
+      toolBuf.push(head + body)
     }
   }
+  flushTools()
   if (trimmed) {
     // Tell the model (and keep roles starting with 'user' for Anthropic).
     const note = '[Earlier conversation was trimmed to fit the context window — use /compact for a full summary.]'
@@ -1550,6 +1578,8 @@ function PreBlock(props: React.HTMLAttributes<HTMLPreElement>) {
 // Styling lives in `.md-body` in index.css; wide tables/code scroll inside the
 // bubble so nothing overflows.
 function MessageContent({ text }: { text: string }) {
+  // Scrub any tool-log echo the model leaked into its prose (see stripToolEcho).
+  const clean = stripToolEcho(text)
   return (
     <div className="md-body">
       <ReactMarkdown
@@ -1559,7 +1589,7 @@ function MessageContent({ text }: { text: string }) {
           pre: ({ node: _n, ...p }) => <PreBlock {...p} />,
         }}
       >
-        {text}
+        {clean}
       </ReactMarkdown>
     </div>
   )

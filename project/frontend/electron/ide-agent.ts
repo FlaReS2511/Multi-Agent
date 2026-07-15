@@ -360,7 +360,10 @@ function buildSystemPrompt(params: IdeAgentParams, workspaceRoot: string): strin
     'Stay on-task: only explore the workspace when the task actually requires it — if the ' +
     'user asks about one specific file (even outside the workspace), focus on that file. ' +
     'Paths are relative to the workspace root. When done, give a brief summary of what ' +
-    'you changed. Do not ask for confirmation in text — the user reviews changes in the editor.\n\n' +
+    'you changed. Do not ask for confirmation in text — the user reviews changes in the editor. ' +
+    'Make tool calls through the normal tool interface — NEVER write tool-log markers such as ' +
+    '"[used ToolName] →", element refs like "[e30]", or paste raw tool output into your reply; ' +
+    'just speak to the user in plain prose about what you found or did.\n\n' +
     `Workspace root: ${workspaceRoot}`
   if (params.planMode) {
     s =
