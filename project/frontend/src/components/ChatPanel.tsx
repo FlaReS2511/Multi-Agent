@@ -82,7 +82,31 @@ function toolTarget(t: ToolEntry): string {
 // is folded (compactly) into the assistant side so knowledge gathered by
 // Read/Grep/Glob/etc. survives across turns instead of being discarded. Without
 // this the agent "forgets" a folder it just scanned and re-scans on every turn.
+// Approximate chars an item contributes to the history sent to the model.
+function historyCost(it: AgentItem): number {
+  if (it.kind === 'text') return itemText(it).length
+  if (it.kind === 'tool') return 64 + Math.min(it.result?.length ?? 0, TOOL_RESULT_BUDGET)
+  return 0 // reasoning is never sent
+}
+
+// Total history budget (~12k tokens). Long-lived sessions used to send their
+// ENTIRE transcript every turn until the prompt overflowed the context window
+// and the provider started truncating/dropping replies.
+const HISTORY_CHAR_BUDGET = 48_000
+
 function buildHistory(items: AgentItem[]): Msg[] {
+  // Keep the NEWEST items that fit the budget; drop the oldest beyond it.
+  let kept = items
+  let trimmed = false
+  let total = 0
+  for (let i = items.length - 1; i >= 0; i--) {
+    total += historyCost(items[i])
+    if (total > HISTORY_CHAR_BUDGET) {
+      kept = items.slice(i + 1)
+      trimmed = true
+      break
+    }
+  }
   const out: Msg[] = []
   // Append a line, coalescing into the previous message if it shares the role.
   // Keeps roles strictly alternating (required by Anthropic and friends).
@@ -92,7 +116,7 @@ function buildHistory(items: AgentItem[]): Msg[] {
     else out.push({ role, content: line })
   }
   const pushAssistant = (line: string) => push('assistant', line)
-  for (const it of items) {
+  for (const it of kept) {
     if (it.kind === 'text') {
       const content = itemText(it)
       if (it.role === 'user') push('user', content)
@@ -109,6 +133,12 @@ function buildHistory(items: AgentItem[]): Msg[] {
       }
       pushAssistant(head + body)
     }
+  }
+  if (trimmed) {
+    // Tell the model (and keep roles starting with 'user' for Anthropic).
+    const note = '[Earlier conversation was trimmed to fit the context window — use /compact for a full summary.]'
+    if (out[0]?.role === 'user') out[0].content = `${note}\n${out[0].content}`
+    else out.unshift({ role: 'user', content: note })
   }
   return out
 }
@@ -162,6 +192,9 @@ interface Props {
   onRunFinished?: (info: { kind: 'done' | 'error' | 'blocked' | 'plan' }) => void
   // Workspace file list for @file mentions (relPaths).
   files?: string[]
+  // Current workspace root — the panel reloads its session when this changes
+  // (it stays mounted across workspace switches).
+  workspaceRoot?: string
 }
 
 // Wind-up choreography: the frame slides open first (handled by the parent),
@@ -177,7 +210,7 @@ const itemVariants = {
   show: { opacity: 1, y: 0, transition: { duration: 0.28, ease: 'easeOut' } },
 }
 
-export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, onChangeResolved, onEditorRequest, windup = true, visible = true, onRunStateChange, onContextUsage, onRunFinished, files = [] }: Props) {
+export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, onChangeResolved, onEditorRequest, windup = true, visible = true, onRunStateChange, onContextUsage, onRunFinished, files = [], workspaceRoot = '' }: Props) {
   const { chatFontSize } = useUiSettings()
   const [mode, setMode] = useState<'ask' | 'agent'>('ask')
   // Plan mode is a toggle WITHIN agent mode (via /plan): runs read-only and
@@ -276,24 +309,44 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
   useEffect(() => { agentItemsRef.current = agentItems }, [agentItems])
   useEffect(() => { sessionIdRef.current = sessionId }, [sessionId])
 
-  // Restore the most recent session for this workspace on mount, so the agent
-  // remembers earlier conversations across app restarts.
+  // Restore the most recent session for the CURRENT workspace — on first load
+  // and again whenever the workspace changes (the panel stays mounted across
+  // switches; without this the old workspace's conversation bled into the new
+  // one and confused the model).
+  const restoredRootRef = useRef<string | null>(null)
   useEffect(() => {
+    if (!workspaceRoot || restoredRootRef.current === workspaceRoot) return
+    const isSwitch = restoredRootRef.current !== null
+    restoredRootRef.current = workspaceRoot
     let cancelled = false
-    window.api.agentSessionLatest().then((s) => {
-      if (cancelled || !s) return
-      try {
-        const items = JSON.parse(s.items) as AgentItem[]
-        if (Array.isArray(items) && items.length > 0) {
-          setAgentItems(items)
-          agentItemsRef.current = items
-        }
-        setSessionId(s.id)
-        sessionIdRef.current = s.id
-      } catch { /* ignore malformed */ }
-    }).catch(() => {})
+    ;(async () => {
+      if (isSwitch) {
+        // Workspace switched: end any in-flight run and clear the transcript
+        // before loading the new workspace's latest session.
+        if (reqIdRef.current) stop()
+        setMessages([])
+        setTodos([])
+        setPlanApproval(null)
+        setLastRunFiles([])
+        setCtxUsage(null)
+      }
+      const s = await window.api.agentSessionLatest().catch(() => null)
+      if (cancelled) return
+      let items: AgentItem[] = []
+      if (s) {
+        try {
+          const parsed = JSON.parse(s.items) as AgentItem[]
+          if (Array.isArray(parsed)) items = parsed
+        } catch { /* malformed — start clean */ }
+      }
+      setAgentItems(items)
+      agentItemsRef.current = items
+      setSessionId(s?.id ?? null)
+      sessionIdRef.current = s?.id ?? null
+    })()
     return () => { cancelled = true }
-  }, [])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [workspaceRoot])
 
   // Refresh the session list (for the picker dropdown).
   const refreshSessions = () => {
@@ -604,7 +657,11 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
 
     const off = window.api.onAiAgentEvent(runId, (e: IdeAgentEvent) => {
       if (e.type === 'reasoning' || e.type === 'token') {
-        const id = `${e.type}-${e.turn}`
+        // Namespace ids by runId: turns restart at 0 every run, so a bare
+        // `token-0` collided with the PREVIOUS run's bubble — new text got
+        // appended into the old bubble and the real bubble froze mid-word
+        // (its reveal cursor was consumed/cleared by the id collision).
+        const id = `${runId}-${e.type}-${e.turn}`
         targetRef.current.set(id, (targetRef.current.get(id) ?? '') + e.delta)
         setAgentItems((prev) => {
           const idx = prev.findIndex((it) => (it.kind === 'text' || it.kind === 'reasoning') && it.id === id)
@@ -656,15 +713,23 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
         else if (e.type === 'done' && usePlan && e.text?.trim()) setPlanApproval({ text: e.text.trim(), explicit: false })
         // Snap every streaming item to its full received text — append the
         // remaining tail as one final glowing chunk, no lingering typewriter.
+        // Tails MUST be computed before the setState: updaters must stay pure
+        // (StrictMode double-invokes them) — advancing shownRef inside meant
+        // the second invocation saw shown==target and returned the item
+        // WITHOUT its tail, silently eating the end of the reply from the
+        // display, the persisted session and the next turn's history.
+        const tails = new Map<string, string>()
+        for (const [tid, target] of targetRef.current) {
+          const shown = shownRef.current.get(tid) ?? 0
+          if (shown < target.length) {
+            tails.set(tid, target.slice(shown))
+            shownRef.current.set(tid, target.length)
+          }
+        }
         setAgentItems((prev) => {
           const copy = prev.map((it) => {
-            if ((it.kind === 'text' || it.kind === 'reasoning') && it.id) {
-              const target = targetRef.current.get(it.id)
-              const shown = shownRef.current.get(it.id) ?? 0
-              if (target != null && shown < target.length) {
-                shownRef.current.set(it.id, target.length)
-                return { ...it, chunks: [...(it.chunks ?? []), target.slice(shown)] }
-              }
+            if ((it.kind === 'text' || it.kind === 'reasoning') && it.id && tails.has(it.id)) {
+              return { ...it, chunks: [...(it.chunks ?? []), tails.get(it.id) as string] }
             }
             return it
           })
@@ -722,15 +787,20 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
       else window.api.aiChatCancel(reqIdRef.current)
     }
     if (rafRef.current != null) { cancelAnimationFrame(rafRef.current); rafRef.current = null }
-    // Snap streaming items to whatever text has arrived so far.
+    // Snap streaming items to whatever text has arrived so far. Tails are
+    // computed outside the updater — see the identical snap in the run-end
+    // handler for why (StrictMode double-invoke ate the tail).
+    const tails = new Map<string, string>()
+    for (const [tid, target] of targetRef.current) {
+      const shown = shownRef.current.get(tid) ?? 0
+      if (shown < target.length) {
+        tails.set(tid, target.slice(shown))
+        shownRef.current.set(tid, target.length)
+      }
+    }
     setAgentItems((prev) => prev.map((it) => {
-      if ((it.kind === 'text' || it.kind === 'reasoning') && it.id) {
-        const target = targetRef.current.get(it.id)
-        const shown = shownRef.current.get(it.id) ?? 0
-        if (target != null && shown < target.length) {
-          shownRef.current.set(it.id, target.length)
-          return { ...it, chunks: [...(it.chunks ?? []), target.slice(shown)] }
-        }
+      if ((it.kind === 'text' || it.kind === 'reasoning') && it.id && tails.has(it.id)) {
+        return { ...it, chunks: [...(it.chunks ?? []), tails.get(it.id) as string] }
       }
       return it
     }))

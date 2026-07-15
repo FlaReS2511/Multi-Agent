@@ -624,7 +624,7 @@ function messageToText(m: any): string {
 function agentSystemPrompt(ws: string, orchEnabled: boolean, planMode: boolean): string {
   if (planMode) {
     return [
-      'You are Orqon in PLAN MODE over Discord.',
+      'You are a coding agent in PLAN MODE over Discord.',
       `Workspace root: ${ws}`,
       'You may ONLY investigate: Read, Grep, Glob, ListDir, GetDiagnostics, read-only git, WebFetch/WebSearch. Do NOT modify anything.',
       'Research the request thoroughly, then call PresentPlan with the full step-by-step plan (files to change, key decisions, how to verify).',
@@ -632,7 +632,7 @@ function agentSystemPrompt(ws: string, orchEnabled: boolean, planMode: boolean):
     ].join('\n')
   }
   return [
-    'You are Orqon, a coding agent operating on the user\'s workspace over Discord.',
+    'You are a coding agent operating on the user\'s workspace over Discord.',
     `Workspace root: ${ws}`,
     'File tools: Read, Write, Edit, MultiEdit, Grep, Glob, ListDir, Move, Delete, NotebookEdit, DownloadFile' + '. Use them to inspect and modify files directly.',
     'After editing code, run GetDiagnostics to typecheck/lint and fix any errors before finishing.',

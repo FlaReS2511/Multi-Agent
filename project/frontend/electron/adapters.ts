@@ -13,6 +13,11 @@ export interface ChatResult {
   toolCalls: ToolCall[]
   assistantMsg: unknown
   usage: { input: number; output: number }
+  // True when a stream closed WITHOUT a proper finish marker ([DONE] /
+  // finish_reason / message_stop) — the reply is likely truncated upstream.
+  dropped?: boolean
+  // Provider finish reason ('length' / 'max_tokens' = output cap hit).
+  finishReason?: string
 }
 // Callbacks fired during a streaming turn, so the UI can render text and
 // reasoning tokens as they arrive.
@@ -51,6 +56,12 @@ async function readSse(
       if (trimmed.startsWith('data:')) onData(trimmed.slice(5).trim())
     }
   }
+  // Flush the tail: buffering proxies may close the stream right after a final
+  // `data:` line WITHOUT a trailing newline — dropping it here silently lost
+  // the end of long replies. Also flush the decoder (pending multibyte chars).
+  buffer += decoder.decode()
+  const tail = buffer.trim()
+  if (tail.startsWith('data:')) onData(tail.slice(5).trim())
 }
 
 export class OpenAIAdapter implements Adapter {
@@ -141,17 +152,21 @@ export class OpenAIAdapter implements Adapter {
     let reasoning = ''
     let usageIn = 0
     let usageOut = 0
+    // Did the stream end properly ([DONE] / finish_reason) or just drop?
+    let finished = false
+    let finishReason = ''
     // Accumulate tool calls by index (OpenAI streams argument fragments).
     const tcAcc = new Map<number, { id: string; name: string; args: string }>()
 
     await readSse(resp.body, (data) => {
-      if (data === '[DONE]') return
+      if (data === '[DONE]') { finished = true; return }
       let json: any
       try { json = JSON.parse(data) } catch { return }
       if (json.usage) {
         usageIn = json.usage.prompt_tokens ?? usageIn
         usageOut = json.usage.completion_tokens ?? usageOut
       }
+      if (json.choices?.[0]?.finish_reason) { finished = true; finishReason = json.choices[0].finish_reason }
       const delta = json.choices?.[0]?.delta
       if (!delta) return
       const rc: string | undefined = delta.reasoning_content ?? delta.reasoning
@@ -185,7 +200,7 @@ export class OpenAIAdapter implements Adapter {
         function: { name: tc.name, arguments: JSON.stringify(tc.args) },
       }))
     }
-    return { text, toolCalls, assistantMsg, usage: { input: usageIn, output: usageOut } }
+    return { text, toolCalls, assistantMsg, usage: { input: usageIn, output: usageOut }, dropped: !finished, finishReason }
   }
 
   toolResultsMessages(toolCalls: ToolCall[], results: string[]): unknown[] {
@@ -279,6 +294,9 @@ export class AnthropicAdapter implements Adapter {
     const blocks: any[] = []
     let usageIn = 0
     let usageOut = 0
+    // Did the stream end properly (message_stop) or just drop?
+    let finished = false
+    let stopReason = ''
 
     await readSse(resp.body, (data) => {
       let ev: any
@@ -305,6 +323,10 @@ export class AnthropicAdapter implements Adapter {
         }
         case 'message_delta':
           usageOut = ev.usage?.output_tokens ?? usageOut
+          if (ev.delta?.stop_reason) stopReason = ev.delta.stop_reason
+          break
+        case 'message_stop':
+          finished = true
           break
       }
     }, signal)
@@ -329,6 +351,8 @@ export class AnthropicAdapter implements Adapter {
       toolCalls,
       assistantMsg: { role: 'assistant', content: cleanBlocks },
       usage: { input: usageIn, output: usageOut },
+      dropped: !finished,
+      finishReason: stopReason,
     }
   }
 

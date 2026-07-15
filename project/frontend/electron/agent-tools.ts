@@ -18,13 +18,32 @@ const BASH_TIMEOUT_MS = 120_000
 const DIAG_TIMEOUT_MS = 180_000
 const DOWNLOAD_MAX_BYTES = 26_214_400 // 25 MB cap for DownloadFile
 
+// Directories OUTSIDE the workspace the user has explicitly approved (via the
+// agent's Approve/Decline prompt). Grants last until the process exits.
+const ALLOWED_OUTSIDE: string[] = []
+
+export function allowOutsidePath(abs: string): void {
+  const norm = path.resolve(abs)
+  if (!ALLOWED_OUTSIDE.includes(norm)) ALLOWED_OUTSIDE.push(norm)
+}
+
+export function isOutsideRoot(cwd: string, rel: string): string | null {
+  const abs = path.resolve(cwd, rel)
+  const root = path.resolve(cwd)
+  if (abs === root || abs.startsWith(root + path.sep)) return null
+  return abs
+}
+
 // Resolve a user-supplied path against the workspace root and ensure it does
-// not escape. Throws on traversal so a tool call can't touch files outside.
+// not escape — unless the target is inside a user-approved outside directory.
+// Throws on unapproved traversal so a tool call can't silently touch files
+// outside the workspace.
 function resolveInside(cwd: string, rel: string): string {
   const abs = path.resolve(cwd, rel)
   const root = path.resolve(cwd)
   if (abs !== root && !abs.startsWith(root + path.sep)) {
-    throw new Error(`path escapes workspace root: ${rel}`)
+    const approved = ALLOWED_OUTSIDE.some((d) => abs === d || abs.startsWith(d + path.sep))
+    if (!approved) throw new Error(`path escapes workspace root: ${rel}`)
   }
   return abs
 }

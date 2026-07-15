@@ -1807,6 +1807,7 @@ export function IDEView() {
             windup={animationsOn}
             visible={chatOpen}
             files={flatFiles}
+            workspaceRoot={workspaceRootPath}
             onRunStateChange={setAgentBusy}
             onContextUsage={setChatCtxUsage}
             onRunFinished={(info) => {

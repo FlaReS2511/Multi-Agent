@@ -15,6 +15,7 @@ import {
   FILE_TOOL_SPECS, runFileTool, ToolSpec,
   ChangePreview, previewWrite, previewEdit, applyChange,
   EXCEL_TOOL_SPECS, EXCEL_TOOL_NAMES, EXCEL_MUTATORS, runExcelTool,
+  isOutsideRoot, allowOutsidePath,
 } from './agent-tools'
 import {
   EXTRA_TOOL_SPECS, EXTRA_TOOL_NAMES, runExtraTool, PendingAction,
@@ -27,6 +28,26 @@ const MAX_TURNS = parseInt(process.env.IDE_AGENT_MAX_TURNS || '30', 10)
 
 // File-mutating tools whose success should reload the editor/file-tree.
 const FILE_CHANGED_TOOLS = new Set(['Write', 'Edit', 'MultiEdit', 'Move', 'Delete', 'NotebookEdit', 'DownloadFile'])
+
+// Tools whose path args are guarded against escaping the workspace. When a
+// call targets an outside path we ASK the user (Approve/Decline) instead of
+// hard-failing; approval whitelists that directory for the rest of the session.
+const ESCAPE_GUARDED_TOOLS = new Set([
+  ...FILE_TOOL_SPECS.map((s) => s.name).filter((n) => n !== 'Bash'),
+  ...EXCEL_TOOL_SPECS.map((s) => s.name),
+])
+
+function escapingPaths(cwd: string, name: string, args: Record<string, unknown>): string[] {
+  const keys = name === 'Move' ? ['from', 'to'] : ['path']
+  const out: string[] = []
+  for (const k of keys) {
+    const rel = args?.[k]
+    if (typeof rel !== 'string' || !rel) continue
+    const abs = isOutsideRoot(cwd, rel)
+    if (abs) out.push(abs)
+  }
+  return out
+}
 
 // Plan mode: the agent may only investigate (no writes, no side effects) and
 // then present a plan. This is the read-only tool allowlist.
@@ -298,7 +319,7 @@ function estimateCostUsd(tokensIn: number, tokensOut: number, rates: [number, nu
 
 function buildSystemPrompt(params: IdeAgentParams, workspaceRoot: string): string {
   let s =
-    'You are Orqon, an expert AI coding agent embedded in an IDE. You have tools ' +
+    'You are an expert AI coding agent embedded in an IDE. You have tools ' +
     'to read and modify the user\'s workspace directly: Read, Write, Edit, MultiEdit, ' +
     'Grep, Glob, ListDir, Move, Delete. ' +
     'You also have editor tools to work with what the user sees: OpenFile (show a file ' +
@@ -315,12 +336,14 @@ function buildSystemPrompt(params: IdeAgentParams, workspaceRoot: string): strin
     'Open the relevant file with OpenFile so the user can follow along. ' +
     'Work autonomously: inspect the code with Read/Grep/Glob before changing it, make ' +
     'the smallest correct edit, and prefer Edit over Write for existing files. ' +
+    'Stay on-task: only explore the workspace when the task actually requires it — if the ' +
+    'user asks about one specific file (even outside the workspace), focus on that file. ' +
     'Paths are relative to the workspace root. When done, give a brief summary of what ' +
     'you changed. Do not ask for confirmation in text — the user reviews changes in the editor.\n\n' +
     `Workspace root: ${workspaceRoot}`
   if (params.planMode) {
     s =
-      'You are Orqon in PLAN MODE. You may ONLY investigate — read files, search, run ' +
+      'You are in PLAN MODE. You may ONLY investigate — read files, search, run ' +
       'diagnostics, inspect git, browse the web. You must NOT modify anything (no Write/Edit/' +
       'commits/commands). Research the request thoroughly FIRST. Only when your plan is complete ' +
       'and final, call the PresentPlan tool with the full step-by-step plan (files to change and how, ' +
@@ -332,7 +355,7 @@ function buildSystemPrompt(params: IdeAgentParams, workspaceRoot: string): strin
       `Workspace root: ${workspaceRoot}`
   } else if (params.researchMode) {
     s =
-      'You are Orqon in RESEARCH mode. Investigate the question DEEPLY and strictly READ-ONLY. You may ' +
+      'You are in RESEARCH mode. Investigate the question DEEPLY and strictly READ-ONLY. You may ' +
       'read the codebase (Read/Grep/Glob/ListDir/GetDiagnostics), inspect git history (GitStatus/Diff/Log), ' +
       'and research the web with WebSearch, WebFetch, and Research (a one-call multi-source deep dive). ' +
       'Do NOT modify anything. Go DEEP: call Research with 2–4 sub-queries covering different angles of the ' +
@@ -412,19 +435,57 @@ export async function runIdeAgent(
 
     let finalText = ''
     let turns = 0
+    let anyActivity = false // any tool call ran this run
+    let lengthContinues = 0 // auto-continuations after hitting the output cap
+    let continuing = false  // this turn continues a capped reply
 
     for (let i = 0; i < MAX_TURNS; i++) {
       if (signal.aborted) { emit({ type: 'error', error: 'cancelled' }); return }
       const turn = turns
-      const { text, toolCalls, assistantMsg, usage } = await adapter.chatStream(
-        messages,
-        system,
-        {
-          onText: (delta) => emit({ type: 'token', delta, turn }),
-          onReasoning: (delta) => emit({ type: 'reasoning', delta, turn }),
-        },
-        signal,
+
+      // Call the provider with retries. Two failure modes we recover from, as
+      // long as nothing has streamed yet this turn (retrying after partial
+      // output would duplicate it):
+      //  - transient errors (429 / 5xx / network drop)
+      //  - "silent" empty completions (gateway drops the stream and returns
+      //    nothing) — previously these ended the run with no reply at all.
+      let streamedThisTurn = false
+      const handlers = {
+        onText: (delta: string) => { streamedThisTurn = true; emit({ type: 'token', delta, turn }) },
+        onReasoning: (delta: string) => { streamedThisTurn = true; emit({ type: 'reasoning', delta, turn }) },
+      }
+      let res: Awaited<ReturnType<typeof adapter.chatStream>>
+      for (let attempt = 0; ; attempt++) {
+        try {
+          res = await adapter.chatStream(messages, system, handlers, signal)
+        } catch (e: any) {
+          const msg = String(e?.message || e)
+          const transient = /HTTP (429|5\d\d)|fetch failed|network|ECONN|ETIMEDOUT|socket|timed? ?out/i.test(msg)
+          if (transient && !streamedThisTurn && attempt < 2 && !signal.aborted) {
+            await new Promise((r) => setTimeout(r, 1500 * (attempt + 1)))
+            continue
+          }
+          throw e
+        }
+        if (!res.text && res.toolCalls.length === 0 && !streamedThisTurn && attempt < 2 && !signal.aborted) {
+          // Empty completion — retry quietly.
+          await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)))
+          continue
+        }
+        break
+      }
+      const { text, toolCalls, assistantMsg, usage } = res
+      // One-line turn trace (main-process stdout) — how did the stream end?
+      // Lets us tell apart: clean finish vs output cap vs dropped stream.
+      console.log(
+        `[agent] turn=${turns + 1} finish=${res.finishReason || '-'} dropped=${!!res.dropped} ` +
+        `tools=${toolCalls.length} textLen=${text.length} in=${usage.input} out=${usage.output}`,
       )
+      // Upstream closed the stream without a finish marker after partial
+      // output — flag it visibly instead of passing the cut-off reply as done.
+      if (res.dropped && streamedThisTurn && toolCalls.length === 0) {
+        emit({ type: 'token', delta: '\n\n⚠ [stream dropped — reply may be truncated]', turn })
+      }
       turns++
 
       // Record cost under a virtual role so it shows in the dashboard.
@@ -443,11 +504,52 @@ export async function runIdeAgent(
         emit({ type: 'context', used: usage.input, window: contextWindow, turn })
       }
 
-      if (text) finalText = text
-      if (toolCalls.length === 0) break
+      if (text) finalText = continuing ? finalText + text : text
+      continuing = false
+      if (toolCalls.length === 0) {
+        // Output cap cut the reply mid-sentence: push the partial answer back
+        // and ask the model to continue seamlessly (up to 2 continuations).
+        // Some gateways silently cap output and report finish=stop anyway —
+        // treat a "stop" that ends mid-sentence as capped too (heuristic).
+        const t = text.trimEnd()
+        const looksTruncated =
+          res.finishReason === 'stop' && t.length > 150 && /[\p{L}\p{N},(–—-]$/u.test(t) && !t.endsWith('```')
+        const capped = res.finishReason === 'length' || res.finishReason === 'max_tokens' || looksTruncated
+        if (capped && lengthContinues < 2 && !signal.aborted) {
+          lengthContinues++
+          continuing = true
+          messages.push(assistantMsg)
+          messages.push({
+            role: 'user',
+            content: 'Your reply was cut off by the output token limit. Continue EXACTLY where it stopped — do not repeat any earlier text.',
+          })
+          continue
+        }
+        if (capped) emit({ type: 'token', delta: '\n\n⚠ [reply hit the output limit — say "continue" to resume]', turn })
+        // Still empty after retries, nothing streamed, no tools ever ran →
+        // surface it instead of silently ending the run with no reply at all.
+        if (!finalText && !streamedThisTurn && !anyActivity) {
+          emit({ type: 'error', error: 'provider returned an empty response (stream dropped) — please send again' })
+          return
+        }
+        break
+      }
+      anyActivity = true
 
       const reviewOn = Boolean(params.reviewMode && requestReview)
       const results: string[] = []
+
+      // Ask the user to approve a sensitive action (shared by the extra-tools
+      // gate and the outside-workspace gate below).
+      const confirm = async (action: Omit<PendingAction, 'actionId'>): Promise<boolean> => {
+        if (!requestAction) return false
+        const actionId = `act-${++actionCounter}-${Date.now()}`
+        const full: PendingAction = { actionId, ...action }
+        emit({ type: 'pending_action', action: full })
+        const approved = await requestAction(full)
+        emit({ type: 'action_resolved', actionId, approved })
+        return approved
+      }
       for (const call of toolCalls) {
         if (signal.aborted) { emit({ type: 'error', error: 'cancelled' }); return }
         const callId = call.id || `${call.name}-${Date.now()}`
@@ -499,6 +601,29 @@ export async function runIdeAgent(
           continue
         }
 
+        // Outside-workspace path? Ask instead of hard-failing. Approving
+        // whitelists that file's directory for the rest of the app session.
+        if (ESCAPE_GUARDED_TOOLS.has(call.name)) {
+          const outside = escapingPaths(workspaceRoot, call.name, call.args as Record<string, unknown>)
+          if (outside.length > 0) {
+            const ok = await confirm({
+              tool: call.name,
+              title: 'Access OUTSIDE the workspace',
+              detail: `${call.name}:\n${outside.join('\n')}`,
+            })
+            if (!ok) {
+              const denied = `denied by user: ${call.name} on a path outside the workspace root was not allowed`
+              results.push(denied)
+              emit({ type: 'tool_result', callId, name: call.name, result: denied, isError: true })
+              continue
+            }
+            for (const abs of outside) {
+              allowOutsidePath(abs)
+              allowOutsidePath(path.dirname(abs))
+            }
+          }
+        }
+
         let result: string
         let isError = false
         const isMutation = call.name === 'Write' || call.name === 'Edit'
@@ -523,16 +648,7 @@ export async function runIdeAgent(
           }
         } else if (isExtraTool) {
           // Git / git-account / web / todo / background tools. Sensitive ones
-          // (mutations, login, account switch) gate on the confirm bridge.
-          const confirm = async (action: Omit<PendingAction, 'actionId'>): Promise<boolean> => {
-            if (!requestAction) return false
-            const actionId = `act-${++actionCounter}-${Date.now()}`
-            const full: PendingAction = { actionId, ...action }
-            emit({ type: 'pending_action', action: full })
-            const approved = await requestAction(full)
-            emit({ type: 'action_resolved', actionId, approved })
-            return approved
-          }
+          // (mutations, login, account switch) gate on the shared confirm above.
           try {
             const r = await runExtraTool(call.name, call.args, {
               cwd: workspaceRoot,
