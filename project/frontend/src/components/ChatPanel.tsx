@@ -151,6 +151,9 @@ interface Props {
   // When true, inner elements fade/slide in with a staggered "wind-up" after
   // the panel frame has slid open. When false, everything renders instantly.
   windup?: boolean
+  // Whether the (always-mounted) panel is currently shown. Toggling false→true
+  // replays the wind-up, matching the old mount-on-open behavior.
+  visible?: boolean
   // Status-bar signals for the host IDE.
   onRunStateChange?: (busy: boolean) => void
   onContextUsage?: (u: { used: number; window: number } | null) => void
@@ -174,7 +177,7 @@ const itemVariants = {
   show: { opacity: 1, y: 0, transition: { duration: 0.28, ease: 'easeOut' } },
 }
 
-export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, onChangeResolved, onEditorRequest, windup = true, onRunStateChange, onContextUsage, onRunFinished, files = [] }: Props) {
+export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, onChangeResolved, onEditorRequest, windup = true, visible = true, onRunStateChange, onContextUsage, onRunFinished, files = [] }: Props) {
   const { chatFontSize } = useUiSettings()
   const [mode, setMode] = useState<'ask' | 'agent'>('ask')
   // Plan mode is a toggle WITHIN agent mode (via /plan): runs read-only and
@@ -865,7 +868,10 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
       style={{ '--chat-font-size': `${chatFontSize}px` } as React.CSSProperties}
       variants={windup ? containerVariants : undefined}
       initial={windup ? 'hidden' : false}
-      animate={windup ? 'show' : false}
+      // The panel stays mounted while hidden (so agent runs survive close);
+      // dropping back to 'hidden' when invisible makes the wind-up replay on
+      // every open, like the old mount-on-open behavior.
+      animate={windup ? (visible ? 'show' : 'hidden') : false}
     >
       {/* Header */}
       <motion.div

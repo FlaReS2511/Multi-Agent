@@ -5,6 +5,7 @@
 // accept file drops.
 
 import React, { useEffect, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { Folder, FolderOpen, ChevronDown, ChevronRight } from 'lucide-react'
 import { getFileIcon } from './fileIcons'
 
@@ -203,22 +204,37 @@ export function IDEFileTree({
         />
       ))}
 
-      {menu && (
+      {/* Context menu — rendered through a portal to <body>. Inside the tree it
+          would sit under framer-motion transformed ancestors, which turn
+          position:fixed into ancestor-relative (wrong spot) and clip it. The
+          full-screen backdrop also closes it on any outside click. */}
+      {menu && createPortal(
         <div
-          className="fixed z-50 min-w-40 bg-zinc-900 border border-zinc-700 rounded shadow-2xl py-1 text-xs"
-          style={{ top: menu.y, left: menu.x }}
-          onClick={(e) => e.stopPropagation()}
+          className="fixed inset-0 z-[95]"
+          onMouseDown={() => setMenu(null)}
+          onContextMenu={(e) => { e.preventDefault(); setMenu(null) }}
         >
-          {menu.node.isDir && (
-            <>
-              <MenuItem label="New File" onClick={() => { setEditing({ kind: 'create', parentDir: menu.node.relPath, isDir: false }); setExpandedDirs((p) => new Set(p).add(menu.node.relPath)); setMenu(null) }} />
-              <MenuItem label="New Folder" onClick={() => { setEditing({ kind: 'create', parentDir: menu.node.relPath, isDir: true }); setExpandedDirs((p) => new Set(p).add(menu.node.relPath)); setMenu(null) }} />
-              <div className="my-1 border-t border-zinc-800" />
-            </>
-          )}
-          <MenuItem label="Rename" onClick={() => { setEditing({ kind: 'rename', path: menu.node.relPath }); setMenu(null) }} />
-          <MenuItem label="Delete" danger onClick={() => { onDelete(menu.node.relPath); setMenu(null) }} />
-        </div>
+          <div
+            className="absolute min-w-40 bg-zinc-900 border border-zinc-700 rounded shadow-2xl py-1 text-xs font-mono text-zinc-300"
+            style={{
+              top: Math.min(menu.y, window.innerHeight - (menu.node.isDir ? 170 : 90)),
+              left: Math.min(menu.x, window.innerWidth - 180),
+            }}
+            onMouseDown={(e) => e.stopPropagation()}
+            onClick={(e) => e.stopPropagation()}
+          >
+            {menu.node.isDir && (
+              <>
+                <MenuItem label="New File" onClick={() => { setEditing({ kind: 'create', parentDir: menu.node.relPath, isDir: false }); setExpandedDirs((p) => new Set(p).add(menu.node.relPath)); setMenu(null) }} />
+                <MenuItem label="New Folder" onClick={() => { setEditing({ kind: 'create', parentDir: menu.node.relPath, isDir: true }); setExpandedDirs((p) => new Set(p).add(menu.node.relPath)); setMenu(null) }} />
+                <div className="my-1 border-t border-zinc-800" />
+              </>
+            )}
+            <MenuItem label="Rename" onClick={() => { setEditing({ kind: 'rename', path: menu.node.relPath }); setMenu(null) }} />
+            <MenuItem label="Delete" danger onClick={() => { onDelete(menu.node.relPath); setMenu(null) }} />
+          </div>
+        </div>,
+        document.body,
       )}
     </div>
   )
