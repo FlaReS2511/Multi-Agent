@@ -412,7 +412,9 @@ function buildSystemPrompt(params: IdeAgentParams, workspaceRoot: string, opts?:
     (opts?.canSpawn
       ? 'For large or parallelizable work, you can delegate a well-scoped sub-task to a child agent with ' +
         'SpawnAgent(task, label) — it runs autonomously with the full toolset and returns a summary. Do NOT ' +
-        'delegate trivial things you can just do yourself. '
+        'delegate trivial things you can just do yourself. To run several sub-agents AT THE SAME TIME, emit ' +
+        'multiple SpawnAgent tool calls IN ONE turn (they execute in parallel); if the user asks for N agents, ' +
+        'make N SpawnAgent calls in that single turn. Give each a narrow, specific task — never "the whole workspace". '
       : '') +
     'Work autonomously: inspect the code with Read/Grep/Glob before changing it, make ' +
     'the smallest correct edit, and prefer Edit over Write for existing files. ' +
@@ -639,6 +641,10 @@ export async function runIdeAgent(
 
       const reviewOn = Boolean(params.reviewMode && requestReview)
       const results: string[] = []
+      // SpawnAgent runs children CONCURRENTLY: each call reserves its result
+      // slot and kicks off immediately, so two SpawnAgent calls in one turn run
+      // in parallel instead of one-after-another. Filled after the loop.
+      const pendingSpawns: { index: number; callId: string; promise: Promise<string> }[] = []
 
       // Ask the user to approve a sensitive action (shared by the extra-tools
       // gate and the outside-workspace gate below).
@@ -761,6 +767,30 @@ export async function runIdeAgent(
           }
         }
 
+        // SpawnAgent: kick the child off WITHOUT awaiting so sibling spawns in
+        // the same turn run in parallel. Reserve this call's result slot now;
+        // the summary lands after the loop. Errors resolve synchronously.
+        if (call.name === 'SpawnAgent') {
+          const a = call.args as { task?: string; label?: string }
+          if (!canSpawn || !orchestrationBridge?.spawnSubAgent) {
+            const denied = 'error: SpawnAgent is unavailable — enable orchestration in Backend Settings'
+            results.push(denied)
+            emit({ type: 'tool_result', callId, name: call.name, result: denied, isError: true })
+          } else if (!a.task?.trim()) {
+            const denied = 'error: task is required — describe the complete self-contained sub-task'
+            results.push(denied)
+            emit({ type: 'tool_result', callId, name: call.name, result: denied, isError: true })
+          } else {
+            anyActivity = true
+            const index = results.length
+            results.push('') // placeholder; filled once the child finishes
+            const promise = orchestrationBridge.spawnSubAgent({ task: a.task, label: a.label })
+              .catch((e: any) => `error: ${e?.message || e}`)
+            pendingSpawns.push({ index, callId, promise })
+          }
+          continue
+        }
+
         let result: string
         let isError = false
         const isMutation = call.name === 'Write' || call.name === 'Edit'
@@ -770,27 +800,7 @@ export async function runIdeAgent(
         const isExcelTool = EXCEL_TOOL_NAMES.has(call.name)
         const isBrowserTool = BROWSER_TOOL_NAMES.has(call.name)
 
-        if (call.name === 'SpawnAgent') {
-          // Delegate to a child IDE-agent. Blocks until the child finishes;
-          // its summary becomes this tool's result. Withheld from sub-agents.
-          const a = call.args as { task?: string; label?: string }
-          if (!canSpawn || !orchestrationBridge?.spawnSubAgent) {
-            result = 'error: SpawnAgent is unavailable — enable orchestration in Backend Settings'
-            isError = true
-          } else if (!a.task?.trim()) {
-            result = 'error: task is required — describe the complete self-contained sub-task'
-            isError = true
-          } else {
-            try {
-              result = await orchestrationBridge.spawnSubAgent({ task: a.task, label: a.label })
-              isError = result.startsWith('error:')
-              anyActivity = true
-            } catch (e: any) {
-              result = `error: ${e?.message || e}`
-              isError = true
-            }
-          }
-        } else if (isBrowserTool) {
+        if (isBrowserTool) {
           try {
             result = await runBrowserTool(call.name, call.args as Record<string, unknown>, { workspaceRoot })
             isError = result.startsWith('error:')
@@ -888,6 +898,16 @@ export async function runIdeAgent(
 
         results.push(result)
         emit({ type: 'tool_result', callId, name: call.name, result: result.slice(0, 2000), isError })
+      }
+
+      // Wait for any concurrently-spawned children, fill their result slots,
+      // and emit their (suppressed-in-UI) tool_results now that they're done.
+      if (pendingSpawns.length > 0) {
+        await Promise.all(pendingSpawns.map(async ({ index, callId, promise }) => {
+          const r = await promise
+          results[index] = r
+          emit({ type: 'tool_result', callId, name: 'SpawnAgent', result: r.slice(0, 2000), isError: r.startsWith('error:') })
+        }))
       }
 
       messages.push(assistantMsg)

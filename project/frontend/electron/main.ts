@@ -1935,7 +1935,8 @@ ipcMain.handle('ai-agent-run', async (_evt, runId: string, params: IdeAgentParam
   // the user exactly once. Only offered to the TOP-LEVEL agent (depth 0).
   const spawnSubAgent = async (input: { task: string; label?: string }): Promise<string> => {
     if ((params.subAgentDepth ?? 0) > 0) return 'error: sub-agents cannot spawn further agents'
-    if (subAgents.size >= MAX_SUBAGENTS && [...subAgents.values()].filter((s) => s.status === 'running').length >= MAX_SUBAGENTS) {
+    const running = [...subAgents.values()].filter((s) => s.status === 'running').length
+    if (running >= MAX_SUBAGENTS) {
       return `error: too many sub-agents running (max ${MAX_SUBAGENTS}) — wait for one to finish`
     }
     // Keep the registry small: drop the oldest finished entries past a cap.
