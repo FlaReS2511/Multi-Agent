@@ -400,7 +400,7 @@ declare global {
       workspaceCreateFolder(relPath: string): Promise<{ ok: boolean; error?: string }>
       workspaceRename(fromRel: string, toRel: string): Promise<{ ok: boolean; error?: string }>
       workspaceDelete(relPath: string): Promise<{ ok: boolean; error?: string }>
-      workspaceSearch(query: string, opts?: { caseSensitive?: boolean; regex?: boolean; maxResults?: number }): Promise<{ ok: boolean; error?: string; matches: { file: string; line: number; column: number; text: string }[] }>
+      workspaceSearch(query: string, opts?: { caseSensitive?: boolean; regex?: boolean; maxResults?: number; include?: string; exclude?: string }): Promise<{ ok: boolean; error?: string; matches: { file: string; line: number; column: number; text: string }[] }>
       workspaceReplaceInFile(relPath: string, find: string, replace: string, opts?: { regex?: boolean; caseSensitive?: boolean }): Promise<{ ok: boolean; error?: string }>
       workspaceGitBranch(): Promise<{ current: string; branches: string[] }>
       workspaceGitStage(file: string): Promise<{ ok: boolean; error?: string }>
@@ -468,6 +468,7 @@ declare global {
       orchestrationGet(): Promise<OrchestrationConfig>
       orchestrationSet(patch: Partial<OrchestrationConfig>): Promise<{ ok: boolean; orchestration: OrchestrationConfig }>
       onCoordinatorEvent(cb: (info: { event: string; payload: unknown }) => void): () => void
+      setZoomFactor(factor: number): void
       discordConfigGet(): Promise<DiscordConfig>
       discordConfigSet(patch: Partial<DiscordConfig>): Promise<{ ok: boolean; discord: DiscordConfig }>
       discordTokenStatus(): Promise<{ hasToken: boolean }>

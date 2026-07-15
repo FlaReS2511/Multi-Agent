@@ -1,4 +1,4 @@
-import { contextBridge, ipcRenderer } from 'electron'
+import { contextBridge, ipcRenderer, webFrame } from 'electron'
 
 const api = {
   getTasks: () => ipcRenderer.invoke('get-tasks'),
@@ -122,7 +122,7 @@ const api = {
   workspaceDelete: (relPath: string) => ipcRenderer.invoke('workspace-delete', relPath),
 
   // Search
-  workspaceSearch: (query: string, opts?: { caseSensitive?: boolean; regex?: boolean; maxResults?: number }) =>
+  workspaceSearch: (query: string, opts?: { caseSensitive?: boolean; regex?: boolean; maxResults?: number; include?: string; exclude?: string }) =>
     ipcRenderer.invoke('workspace-search', query, opts),
   workspaceReplaceInFile: (relPath: string, find: string, replace: string, opts?: { regex?: boolean; caseSensitive?: boolean }) =>
     ipcRenderer.invoke('workspace-replace-in-file', relPath, find, replace, opts),
@@ -254,6 +254,9 @@ const api = {
     ipcRenderer.on('coordinator-event', listener)
     return () => ipcRenderer.removeListener('coordinator-event', listener)
   },
+
+  // Whole-app zoom (persisted UI setting; applied directly via webFrame).
+  setZoomFactor: (factor: number) => { try { webFrame.setZoomFactor(factor) } catch { /* ignore */ } },
 
   // Window controls (custom title bar)
   windowMinimize: () => ipcRenderer.invoke('window-minimize'),

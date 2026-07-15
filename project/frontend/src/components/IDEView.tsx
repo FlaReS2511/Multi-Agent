@@ -21,6 +21,8 @@ import {
   FilePlus,
   FolderPlus,
   Boxes,
+  Crosshair,
+  ChevronsDownUp,
 } from 'lucide-react'
 import { IDEFileTree } from './IDEFileTree'
 import { AgentTerminal } from './AgentTerminal'
@@ -33,8 +35,12 @@ import { CommandPalette, Command } from './CommandPalette'
 import { ChatPanel } from './ChatPanel'
 import { GroupsPanel } from './GroupsPanel'
 import { DiffReviewCard } from './DiffReviewCard'
+import { ConfirmDialog, ConfirmDialogSpec } from './ConfirmDialog'
+import { StatusBar } from './StatusBar'
 import { OrqonLogo } from './OrqonLogo'
-import { useAnimationsEnabled } from '../lib/uiSettings'
+import { useAnimationsEnabled, useUiSettings, setUiSetting } from '../lib/uiSettings'
+import { toast } from '../lib/toast'
+import { computeLineDiff } from '../lib/lineDiff'
 import { useInlineAIEdit } from './useInlineAIEdit'
 import { activeAgents, AgentsConfig, colorFor, ModelOption, isResidentRole, PendingChange } from '../lib/api'
 
@@ -94,13 +100,45 @@ export function IDEView() {
   const [activeSidebar, setActiveSidebar] = useState<'explorer' | 'search' | 'git' | 'agents' | 'groups'>('explorer')
   const [isSidebarOpen, setIsSidebarOpen] = useState(true)
   const [chatOpen, setChatOpen] = useState(false)
+  // Resizable chat panel width (drag the left edge), persisted.
+  const [chatWidth, setChatWidth] = useState(() => {
+    const v = Number(localStorage.getItem('orqon.chatWidth'))
+    return v >= 280 && v <= 900 ? v : 360
+  })
+  const draggingChatRef = useRef(false)
+  const startChatResize = (e: React.MouseEvent) => {
+    e.preventDefault()
+    draggingChatRef.current = true
+    const startX = e.clientX
+    const startW = chatWidth
+    let latest = startW
+    const onMove = (ev: MouseEvent) => {
+      latest = Math.min(900, Math.max(280, startW + (startX - ev.clientX)))
+      setChatWidth(latest)
+    }
+    const onUp = () => {
+      draggingChatRef.current = false
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', onUp)
+      localStorage.setItem('orqon.chatWidth', String(latest))
+    }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
+  }
   const animationsOn = useAnimationsEnabled()
+  const ui = useUiSettings()
+
+  // Whole-app zoom (persisted). Applied on mount and whenever it changes.
+  useEffect(() => {
+    try { window.api.setZoomFactor?.(ui.zoom) } catch { /* ignore */ }
+  }, [ui.zoom])
   // Minimap is hidden while a side panel animates its width (it flickers on
   // frame-by-frame relayout) and restored once the animation settles.
   const [minimapOn, setMinimapOn] = useState(true)
 
   // Workspace root
   const [workspaceName, setWorkspaceName] = useState<string>('')
+  const [workspaceRootPath, setWorkspaceRootPath] = useState<string>('')
   const [recentWorkspaces, setRecentWorkspaces] = useState<string[]>([])
   const [showWorkspaceMenu, setShowWorkspaceMenu] = useState(false)
 
@@ -108,11 +146,25 @@ export function IDEView() {
   const [files, setFiles] = useState<FileNode[]>([])
   const [gitChanges, setGitChanges] = useState<GitChange[]>([])
   const [loadingWorkspace, setLoadingWorkspace] = useState(false)
+  const [branchName, setBranchName] = useState('')
+
+  // Status-bar signals
+  const [cursorPos, setCursorPos] = useState<{ line: number; col: number } | null>(null)
+  const [agentBusy, setAgentBusy] = useState(false)
+  const [chatCtxUsage, setChatCtxUsage] = useState<{ used: number; window: number } | null>(null)
+  // Chat badge: an agent run finished while the chat panel was closed.
+  const [chatUnread, setChatUnread] = useState(false)
 
   // Editor Tabs State
   const [openTabs, setOpenTabs] = useState<string[]>([])
   const [activeTab, setActiveTab] = useState<string | null>(null)
-  
+  // Recently closed tabs (Cmd+Shift+T reopens), newest last.
+  const closedTabsRef = useRef<string[]>([])
+  // Tab currently being drag-reordered.
+  const dragTabRef = useRef<string | null>(null)
+  // Shared confirm dialog (dirty-close, deletes, discards).
+  const [dialog, setDialog] = useState<ConfirmDialogSpec | null>(null)
+
   // File Contents State
   const [fileContents, setFileContents] = useState<Record<string, string>>({})
   const [originalContents, setOriginalContents] = useState<Record<string, string>>({})
@@ -125,12 +177,45 @@ export function IDEView() {
   // Bottom dock panel state
   const [isBottomOpen, setIsBottomOpen] = useState(true)
   const [bottomTab, setBottomTab] = useState<'terminal' | 'shell' | 'logs'>('terminal')
+
+  // Multiple user shells (tabs in the dock). All stay mounted (hidden when
+  // inactive) so their buffers survive switching.
+  const [shells, setShells] = useState<{ id: string; name: string }[]>([{ id: 'shell-1', name: 'shell 1' }])
+  const [activeShell, setActiveShell] = useState('shell-1')
+  const shellCounterRef = useRef(1)
+  const [renamingShell, setRenamingShell] = useState<string | null>(null)
+  const [shellNameDraft, setShellNameDraft] = useState('')
+
+  const addShell = () => {
+    const n = ++shellCounterRef.current
+    const id = `shell-${n}`
+    setShells((prev) => [...prev, { id, name: `shell ${n}` }])
+    setActiveShell(id)
+    setBottomTab('shell')
+    setIsBottomOpen(true)
+  }
+
+  const closeShell = (id: string) => {
+    window.api.shellKill(id).catch(() => {})
+    setShells((prev) => {
+      const next = prev.filter((s) => s.id !== id)
+      if (activeShell === id && next.length) setActiveShell(next[next.length - 1].id)
+      return next
+    })
+  }
   const [selectedAgent, setSelectedAgent] = useState<string>('orchestrator')
   const [agentsConfig, setAgentsConfig] = useState<AgentsConfig | null>(null)
   const [agentLogs, setAgentLogs] = useState<Record<string, string[]>>({})
 
   const editorRef = useRef<any>(null)
   const monacoRef = useRef<any>(null)
+  // Bumped when the (normal) Monaco editor mounts, so effects that need the
+  // editor instance re-run.
+  const [editorReady, setEditorReady] = useState(0)
+  // The pulsing "agent revealed this line" decoration; cleared on any click/key.
+  const revealDecoRef = useRef<any>(null)
+  // Git gutter decorations (added/modified/deleted vs HEAD) for the active tab.
+  const gitGutterRef = useRef<any>(null)
   const [availableModels, setAvailableModels] = useState<ModelOption[]>([])
 
   // Keep the editor sized in lockstep with the side-panel width animation, and
@@ -241,14 +326,62 @@ export function IDEView() {
     setGitChanges(changes)
   }
 
-  // Load workspace root info
-  const loadWorkspaceInfo = useCallback(async () => {
+  // Load workspace root info. Returns the root path (session-restore key).
+  const loadWorkspaceInfo = useCallback(async (): Promise<string> => {
     const info = await window.api.workspaceGetRoot()
     setWorkspaceName(info.name)
+    setWorkspaceRootPath(info.root)
     setRecentWorkspaces(info.recent ?? [])
+    return info.root
   }, [])
 
-  // Switch to a different workspace folder, then reset editor state.
+  // ── Session restore (per-workspace) ─────────────────────────
+  // Open tabs + layout are persisted per workspace root so a restart (or a
+  // workspace switch) puts the IDE back exactly where it was.
+  interface WorkspaceSession {
+    openTabs: string[]
+    activeTab: string | null
+    activeSidebar: typeof activeSidebar
+    isSidebarOpen: boolean
+    chatOpen: boolean
+    bottomTab: typeof bottomTab
+    isBottomOpen: boolean
+  }
+  // Gate persisting until the initial restore ran, so an early render doesn't
+  // overwrite the saved session with empty state.
+  const sessionReadyRef = useRef(false)
+
+  const restoreSession = useCallback(async (root: string) => {
+    try {
+      const raw = localStorage.getItem('orqon.session.' + root)
+      if (!raw) return
+      const s = JSON.parse(raw) as Partial<WorkspaceSession>
+      if (s.activeSidebar) setActiveSidebar(s.activeSidebar)
+      if (typeof s.isSidebarOpen === 'boolean') setIsSidebarOpen(s.isSidebarOpen)
+      if (typeof s.chatOpen === 'boolean') setChatOpen(s.chatOpen)
+      if (s.bottomTab) setBottomTab(s.bottomTab)
+      if (typeof s.isBottomOpen === 'boolean') setIsBottomOpen(s.isBottomOpen)
+      // Reopen tabs that still exist on disk.
+      const tabs: string[] = []
+      for (const t of s.openTabs ?? []) {
+        try {
+          const disk = await window.api.workspaceReadFile(t)
+          if (!disk.ok) continue
+          tabs.push(t)
+          setFileContents((p) => ({ ...p, [t]: disk.content }))
+          const head = await window.api.workspaceGitShowHead(t)
+          setOriginalContents((p) => ({ ...p, [t]: head.ok ? head.content : '' }))
+        } catch { /* skip */ }
+      }
+      if (tabs.length) {
+        setOpenTabs(tabs)
+        setActiveTab(s.activeTab && tabs.includes(s.activeTab) ? s.activeTab : tabs[tabs.length - 1])
+      }
+    } catch { /* corrupted session — start clean */ }
+  }, [])
+
+  // Switch to a different workspace folder, then reset editor state and
+  // restore that workspace's own session.
   const switchWorkspace = useCallback(async (dir?: string) => {
     const res = dir
       ? await window.api.workspaceSetRoot(dir)
@@ -260,9 +393,11 @@ export function IDEView() {
     setFileContents({})
     setOriginalContents({})
     setDirtyFiles({})
-    await loadWorkspaceInfo()
+    closedTabsRef.current = []
+    const root = await loadWorkspaceInfo()
     await refreshWorkspace()
-  }, [loadWorkspaceInfo])
+    if (root) await restoreSession(root)
+  }, [loadWorkspaceInfo, restoreSession])
 
   // Load agents config to get the list of active agents
   useEffect(() => {
@@ -270,9 +405,29 @@ export function IDEView() {
       setAgentsConfig(cfg)
       setAvailableModels(cfg.available_models ?? [])
     })
-    loadWorkspaceInfo()
+    loadWorkspaceInfo().then(async (root) => {
+      if (root && !sessionReadyRef.current) {
+        await restoreSession(root)
+        sessionReadyRef.current = true
+      }
+    })
     refreshWorkspace()
-  }, [refreshWorkspace, loadWorkspaceInfo])
+  }, [refreshWorkspace, loadWorkspaceInfo, restoreSession])
+
+  // Persist the session (debounced) whenever layout/tabs change.
+  useEffect(() => {
+    if (!workspaceRootPath || !sessionReadyRef.current) return
+    const timer = setTimeout(() => {
+      const s: WorkspaceSession = { openTabs, activeTab, activeSidebar, isSidebarOpen, chatOpen, bottomTab, isBottomOpen }
+      try { localStorage.setItem('orqon.session.' + workspaceRootPath, JSON.stringify(s)) } catch { /* ignore */ }
+    }, 400)
+    return () => clearTimeout(timer)
+  }, [workspaceRootPath, openTabs, activeTab, activeSidebar, isSidebarOpen, chatOpen, bottomTab, isBottomOpen])
+
+  // Window title reflects the workspace.
+  useEffect(() => {
+    document.title = workspaceName ? `${workspaceName} — Orqon` : 'Orqon'
+  }, [workspaceName])
 
   // Get active agents list
   const agentsList = activeAgents(agentsConfig)
@@ -282,12 +437,16 @@ export function IDEView() {
   // full agentsList so a resident agent's terminal stays reachable.
   const residentAgents = agentsList.filter(isResidentRole)
 
-  // Periodically refresh Git status and live logs
+  // Periodically refresh Git status, current branch and live logs
   useEffect(() => {
     const tick = async () => {
-      // Refresh git changes
+      // Refresh git changes + branch (status bar)
       const changes = await window.api.workspaceGitStatus()
       setChangesList(changes)
+      try {
+        const b = await window.api.workspaceGitBranch()
+        setBranchName(b.current || '')
+      } catch { /* not a repo */ }
 
       // Refresh logs
       const allLogs = await window.api.getLogs()
@@ -301,6 +460,16 @@ export function IDEView() {
     tick()
     const i = setInterval(tick, 2000)
     return () => clearInterval(i)
+  }, [])
+
+  // Toast orchestration group outcomes (passed/failed/killed).
+  useEffect(() => {
+    return window.api.onCoordinatorEvent(({ event, payload }) => {
+      const p = payload as { group?: string; task?: string; reason?: string }
+      if (event === 'group-passed') toast(`Group ${p.group} passed — task ${p.task} done`, 'success')
+      else if (event === 'group-failed') toast(`Group ${p.group} failed${p.reason ? `: ${p.reason}` : ''}`, 'error')
+      else if (event === 'group-killed') toast(`Group ${p.group} killed${p.reason ? `: ${p.reason}` : ''}`, 'info')
+    })
   }, [])
 
   // Live-reload logic when AI modifies files on disk
@@ -334,6 +503,93 @@ export function IDEView() {
     const timer = setInterval(checkFileOnDisk, 2000)
     return () => clearInterval(timer)
   }, [activeTab, fileContents, dirtyFiles])
+
+  // ── Git gutter: mark added/modified/deleted lines vs HEAD ──────────
+  // Recomputed (debounced) from the same before/after pair the DiffEditor
+  // uses, via the dependency-free LCS differ. Rendered as thin colored bars
+  // in Monaco's linesDecorations lane; deletions show a small red triangle.
+  useEffect(() => {
+    const ed = editorRef.current
+    const mon = monacoRef.current
+    if (!ed || !mon || !activeTab || diffMode) {
+      try { gitGutterRef.current?.clear() } catch { /* ignore */ }
+      return
+    }
+    const before = originalContents[activeTab]
+    const after = fileContents[activeTab]
+    const timer = setTimeout(() => {
+      try { gitGutterRef.current?.clear() } catch { /* ignore */ }
+      if (before == null || after == null || before === after) return
+      const rows = computeLineDiff(before, after)
+      const decos: { range: unknown; options: Record<string, unknown> }[] = []
+      let i = 0
+      while (i < rows.length) {
+        if (rows[i].kind === 'context') { i++; continue }
+        // Hunk: consecutive non-context rows.
+        const addLines: number[] = []
+        let delCount = 0
+        while (i < rows.length && rows[i].kind !== 'context') {
+          if (rows[i].kind === 'add' && rows[i].newNo) addLines.push(rows[i].newNo!)
+          else if (rows[i].kind === 'del') delCount++
+          i++
+        }
+        if (addLines.length > 0) {
+          const cls = delCount > 0 ? 'git-gutter-mod' : 'git-gutter-add'
+          // Compress consecutive line numbers into ranges.
+          let start = addLines[0]
+          let prev = addLines[0]
+          for (let k = 1; k <= addLines.length; k++) {
+            const cur = addLines[k]
+            if (cur !== prev + 1) {
+              decos.push({ range: new mon.Range(start, 1, prev, 1), options: { linesDecorationsClassName: cls } })
+              start = cur
+            }
+            prev = cur
+          }
+        } else if (delCount > 0) {
+          // Deletion-only hunk: mark the line where content was removed.
+          const line = rows[i]?.newNo ?? Math.max(1, after.split('\n').length)
+          decos.push({ range: new mon.Range(line, 1, line, 1), options: { linesDecorationsClassName: 'git-gutter-del' } })
+        }
+      }
+      if (decos.length) gitGutterRef.current = ed.createDecorationsCollection(decos)
+    }, 400)
+    return () => clearTimeout(timer)
+  }, [activeTab, fileContents, originalContents, diffMode, editorReady])
+
+  // Discard a file's uncommitted changes (Git panel) after confirmation.
+  const handleDiscardFile = useCallback((file: string) => {
+    setDialog({
+      title: `Discard changes in "${file.split('/').pop()}"?`,
+      message: `${file}\n\nThe file will be restored to its last committed state (untracked files are deleted).`,
+      buttons: [
+        {
+          label: 'Discard', kind: 'danger',
+          onClick: async () => {
+            setDialog(null)
+            const res = await window.api.workspaceGitRestoreFiles([file])
+            if (res.ok) {
+              toast(`Discarded changes in ${file.split('/').pop()}`, 'success')
+              // Reload the buffer if it's open.
+              const disk = await window.api.workspaceReadFile(file)
+              if (disk.ok) {
+                setFileContents((p) => ({ ...p, [file]: disk.content }))
+                setDirtyFiles((p) => ({ ...p, [file]: false }))
+              } else {
+                // Untracked file was deleted by the restore.
+                setOpenTabs((tabs) => tabs.filter((t) => t !== file))
+                setActiveTab((t) => (t === file ? null : t))
+              }
+              await refreshWorkspace()
+            } else {
+              toast(res.failed?.length ? `Could not discard: ${res.failed.join(', ')}` : 'Discard failed', 'error')
+            }
+          },
+        },
+        { label: 'Cancel', onClick: () => setDialog(null) },
+      ],
+    })
+  }, [refreshWorkspace])
 
   // Handle open a file
   const openFile = async (relPath: string) => {
@@ -435,6 +691,14 @@ export function IDEView() {
   // A read-only diff the agent asked to display (ShowDiff). Dismiss-only.
   const [previewDiff, setPreviewDiff] = useState<PendingChange | null>(null)
 
+  // Remove the pulsing reveal highlight + its dismiss listeners.
+  const clearReveal = useCallback(() => {
+    if (revealDecoRef.current) { try { revealDecoRef.current.clear() } catch { /* ignore */ } revealDecoRef.current = null }
+    window.removeEventListener('mousedown', clearReveal)
+    window.removeEventListener('keydown', clearReveal)
+  }, [])
+  useEffect(() => () => clearReveal(), [clearReveal])
+
   const onEditorRequest = useCallback(async (
     op: 'OpenFile' | 'GetOpenEditor' | 'ShowDiff',
     args: Record<string, unknown>,
@@ -445,21 +709,35 @@ export function IDEView() {
         if (!rel) return { ok: false, result: 'error: path required' }
         await openFile(rel)
         const line = typeof args.line === 'number' ? args.line : undefined
-        if (line && editorRef.current) {
-          try {
-            editorRef.current.revealLineInCenter(line)
-            editorRef.current.setPosition({ lineNumber: line, column: 1 })
-            editorRef.current.focus()
-            // Flash the target line so the jump is obvious.
+        if (line) {
+          // openFile only sets state — Monaco hasn't swapped to the new file's
+          // model yet, so revealing now scrolls the wrong (old) content. Wait
+          // for the model to actually load `line` lines, THEN center + pulse.
+          const reveal = (tries = 0) => {
+            const ed = editorRef.current
             const mon = monacoRef.current
-            if (mon) {
-              const col = editorRef.current.createDecorationsCollection([{
-                range: new mon.Range(line, 1, line, 1),
-                options: { isWholeLine: true, className: 'agent-reveal-line' },
-              }])
-              setTimeout(() => { try { col.clear() } catch { /* ignore */ } }, 1800)
+            if (!ed || !mon) return
+            const model = ed.getModel?.()
+            if ((!model || model.getLineCount() < line) && tries < 25) {
+              setTimeout(() => reveal(tries + 1), 40)
+              return
             }
-          } catch { /* ignore */ }
+            try {
+              ed.revealLineInCenter(line)
+              ed.setPosition({ lineNumber: line, column: 1 })
+              ed.focus()
+              // Pulse the target line (bright↔dim, like a warning). Keeps pulsing
+              // until the user clicks or types anywhere.
+              clearReveal() // drop any previous reveal first
+              revealDecoRef.current = ed.createDecorationsCollection([{
+                range: new mon.Range(line, 1, line, 1),
+                options: { isWholeLine: true, className: 'agent-reveal-line', linesDecorationsClassName: 'agent-reveal-gutter' },
+              }])
+              window.addEventListener('mousedown', clearReveal)
+              window.addEventListener('keydown', clearReveal)
+            } catch { /* ignore */ }
+          }
+          requestAnimationFrame(() => reveal())
         }
         return { ok: true, result: `opened ${rel}${line ? ` at line ${line}` : ''}` }
       }
@@ -509,19 +787,50 @@ export function IDEView() {
   const [paletteOpen, setPaletteOpen] = useState(false)
   const [paletteMode, setPaletteMode] = useState<'commands' | 'files'>('files')
 
-  // Handle close tab
-  const closeTab = (e: React.MouseEvent, relPath: string) => {
-    e.stopPropagation()
+  // Close a tab unconditionally (dirty state already resolved by the caller).
+  const doCloseTab = (relPath: string) => {
     const nextTabs = openTabs.filter((t) => t !== relPath)
     setOpenTabs(nextTabs)
-
     if (activeTab === relPath) {
-      if (nextTabs.length > 0) {
-        setActiveTab(nextTabs[nextTabs.length - 1])
-      } else {
-        setActiveTab(null)
-      }
+      setActiveTab(nextTabs.length > 0 ? nextTabs[nextTabs.length - 1] : null)
     }
+    closedTabsRef.current = [...closedTabsRef.current.filter((t) => t !== relPath), relPath].slice(-10)
+    // Drop the dirty flag so a later reopen re-reads from disk cleanly.
+    setDirtyFiles((prev) => {
+      const next = { ...prev }
+      delete next[relPath]
+      return next
+    })
+  }
+
+  // Close a tab, guarding unsaved changes with a Save / Discard / Cancel dialog.
+  const requestCloseTab = (relPath: string) => {
+    if (!dirtyFiles[relPath]) { doCloseTab(relPath); return }
+    const name = relPath.split('/').pop()
+    setDialog({
+      title: `Close "${name}"?`,
+      message: 'This file has unsaved changes.',
+      buttons: [
+        {
+          label: 'Save & Close', kind: 'primary',
+          onClick: async () => {
+            setDialog(null)
+            if (await saveFile(relPath)) doCloseTab(relPath)
+          },
+        },
+        {
+          label: 'Discard', kind: 'danger',
+          onClick: () => { setDialog(null); doCloseTab(relPath) },
+        },
+        { label: 'Cancel', onClick: () => setDialog(null) },
+      ],
+    })
+  }
+
+  // Reopen the most recently closed tab (Cmd+Shift+T).
+  const reopenClosedTab = () => {
+    const relPath = closedTabsRef.current.pop()
+    if (relPath) openFile(relPath)
   }
 
   // Handle file edit inside Editor
@@ -531,72 +840,125 @@ export function IDEView() {
     setDirtyFiles((prev) => ({ ...prev, [activeTab]: true }))
   }
 
-  // Handle save file
+  // Save one file (any tab, not just the active one).
+  const saveFile = async (relPath: string): Promise<boolean> => {
+    const content = fileContents[relPath] ?? ''
+    const res = await window.api.workspaceWriteFile(relPath, content)
+    if (res.ok) {
+      setDirtyFiles((prev) => ({ ...prev, [relPath]: false }))
+      refreshWorkspace()
+      return true
+    }
+    toast(`Save failed: ${res.error}`, 'error')
+    return false
+  }
+
   const saveActiveFile = async () => {
     if (!activeTab || !dirtyFiles[activeTab]) return
-    const content = fileContents[activeTab] || ''
-    const res = await window.api.workspaceWriteFile(activeTab, content)
-    if (res.ok) {
-      setDirtyFiles((prev) => ({ ...prev, [activeTab]: false }))
-      // Update original baseline post-save to match git if we commit, or just keep it
-      // Let's refresh workspace to update Git changes state
-      refreshWorkspace()
-    } else {
-      alert(`Error saving file: ${res.error}`)
+    await saveFile(activeTab)
+  }
+
+  // Save every dirty tab (Save All button / Cmd+Alt+S).
+  const dirtyCount = openTabs.filter((t) => dirtyFiles[t]).length
+  const saveAllFiles = async () => {
+    for (const t of openTabs) {
+      if (dirtyFiles[t]) await saveFile(t)
     }
   }
 
-  // ── File operations (create / rename / delete) ──────────────
-  const createFilePrompt = useCallback(async (parentDir: string) => {
-    const name = window.prompt(`New file name${parentDir ? ' in ' + parentDir : ''}:`)
-    if (!name) return
+  // ── File operations (inline create / rename / move / delete) ──────────────
+  // Inline-create request forwarded to the tree (input row appears in place).
+  const [createReq, setCreateReq] = useState<{ parentDir: string; isDir: boolean; nonce: number } | null>(null)
+  const [revealNonce, setRevealNonce] = useState(0)
+  const [collapseNonce, setCollapseNonce] = useState(0)
+
+  // Header buttons / palette: open the inline-create input in the explorer.
+  const createFilePrompt = useCallback((parentDir: string) => {
+    setActiveSidebar('explorer'); setIsSidebarOpen(true)
+    setCreateReq({ parentDir, isDir: false, nonce: Date.now() })
+  }, [])
+
+  const createFolderPrompt = useCallback((parentDir: string) => {
+    setActiveSidebar('explorer'); setIsSidebarOpen(true)
+    setCreateReq({ parentDir, isDir: true, nonce: Date.now() })
+  }, [])
+
+  const handleCreateCommit = useCallback(async (parentDir: string, name: string, isDir: boolean) => {
     const rel = parentDir ? `${parentDir}/${name}` : name
-    const res = await window.api.workspaceCreateFile(rel)
-    if (!res.ok) { alert(res.error); return }
+    const res = isDir
+      ? await window.api.workspaceCreateFolder(rel)
+      : await window.api.workspaceCreateFile(rel)
+    if (!res.ok) { toast(res.error || 'Create failed', 'error'); return }
     await refreshWorkspace()
-    openFile(rel)
+    if (!isDir) openFile(rel)
   }, [refreshWorkspace])
 
-  const createFolderPrompt = useCallback(async (parentDir: string) => {
-    const name = window.prompt(`New folder name${parentDir ? ' in ' + parentDir : ''}:`)
-    if (!name) return
-    const rel = parentDir ? `${parentDir}/${name}` : name
-    const res = await window.api.workspaceCreateFolder(rel)
-    if (!res.ok) { alert(res.error); return }
-    await refreshWorkspace()
-  }, [refreshWorkspace])
-
-  const renamePrompt = useCallback(async (relPath: string) => {
-    const parts = relPath.split('/')
-    const cur = parts[parts.length - 1]
-    const next = window.prompt('Rename to:', cur)
-    if (!next || next === cur) return
-    parts[parts.length - 1] = next
-    const toRel = parts.join('/')
+  // Rename a file/folder (or move it via toRel override) and fix open tabs.
+  const applyRename = useCallback(async (relPath: string, toRel: string) => {
     const res = await window.api.workspaceRename(relPath, toRel)
-    if (!res.ok) { alert(res.error); return }
-    // Update any open tab pointing at the renamed file.
-    setOpenTabs((tabs) => tabs.map((t) => (t === relPath ? toRel : t)))
-    setActiveTab((t) => (t === relPath ? toRel : t))
+    if (!res.ok) { toast(res.error || 'Rename failed', 'error'); return }
+    // Update any open tab pointing at the renamed file or inside the folder.
+    const remap = (t: string) =>
+      t === relPath ? toRel : t.startsWith(relPath + '/') ? toRel + t.slice(relPath.length) : t
+    setOpenTabs((tabs) => tabs.map(remap))
+    setActiveTab((t) => (t ? remap(t) : t))
+    setFileContents((prev) => Object.fromEntries(Object.entries(prev).map(([k, v]) => [remap(k), v])))
+    setOriginalContents((prev) => Object.fromEntries(Object.entries(prev).map(([k, v]) => [remap(k), v])))
+    setDirtyFiles((prev) => Object.fromEntries(Object.entries(prev).map(([k, v]) => [remap(k), v])))
     await refreshWorkspace()
   }, [refreshWorkspace])
 
-  const deletePrompt = useCallback(async (relPath: string) => {
-    if (!window.confirm(`Delete "${relPath}"? This cannot be undone.`)) return
-    const res = await window.api.workspaceDelete(relPath)
-    if (!res.ok) { alert(res.error); return }
-    setOpenTabs((tabs) => tabs.filter((t) => t !== relPath))
-    setActiveTab((t) => (t === relPath ? null : t))
-    await refreshWorkspace()
+  const handleRenameCommit = useCallback(async (relPath: string, newName: string) => {
+    const parts = relPath.split('/')
+    parts[parts.length - 1] = newName
+    await applyRename(relPath, parts.join('/'))
+  }, [applyRename])
+
+  // Drag-drop move into a directory ('' = workspace root).
+  const handleMove = useCallback(async (fromRel: string, toDir: string) => {
+    const base = fromRel.split('/').pop()!
+    await applyRename(fromRel, toDir ? `${toDir}/${base}` : base)
+  }, [applyRename])
+
+  const deletePrompt = useCallback((relPath: string) => {
+    setDialog({
+      title: `Delete "${relPath.split('/').pop()}"?`,
+      message: `${relPath}\n\nThis cannot be undone.`,
+      buttons: [
+        {
+          label: 'Delete', kind: 'danger',
+          onClick: async () => {
+            setDialog(null)
+            const res = await window.api.workspaceDelete(relPath)
+            if (!res.ok) { toast(res.error || 'Delete failed', 'error'); return }
+            setOpenTabs((tabs) => tabs.filter((t) => t !== relPath && !t.startsWith(relPath + '/')))
+            setActiveTab((t) => (t === relPath || t?.startsWith(relPath + '/') ? null : t))
+            await refreshWorkspace()
+          },
+        },
+        { label: 'Cancel', onClick: () => setDialog(null) },
+      ],
+    })
   }, [refreshWorkspace])
 
-  // Handle keyboard shortcut for Save (Cmd+S / Ctrl+S) + palette shortcuts.
+  // Keyboard shortcuts: save / save-all, close / reopen tab, palette, search.
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       const mod = e.metaKey || e.ctrlKey
-      if (mod && e.key === 's') {
+      if (mod && e.altKey && e.code === 'KeyS') {
+        // Cmd+Alt+S — Save All (e.code: macOS Alt+S types 'ß' in e.key)
+        e.preventDefault()
+        saveAllFiles()
+      } else if (mod && e.key === 's') {
         e.preventDefault()
         saveActiveFile()
+      } else if (mod && !e.shiftKey && (e.key === 'w' || e.key === 'W')) {
+        // Cmd+W — close active tab (app menu is null, so this is ours)
+        e.preventDefault()
+        if (activeTab) requestCloseTab(activeTab)
+      } else if (mod && e.shiftKey && (e.key === 'T' || e.key === 't')) {
+        e.preventDefault()
+        reopenClosedTab()
       } else if (mod && e.shiftKey && (e.key === 'P' || e.key === 'p')) {
         e.preventDefault()
         setPaletteMode('commands'); setPaletteOpen(true)
@@ -606,15 +968,30 @@ export function IDEView() {
       } else if (mod && e.shiftKey && (e.key === 'F' || e.key === 'f')) {
         e.preventDefault()
         setActiveSidebar('search'); setIsSidebarOpen(true)
+      } else if (mod && (e.key === '=' || e.key === '+')) {
+        // Cmd+= — zoom in
+        e.preventDefault()
+        setUiSetting('zoom', Math.min(1.5, Math.round((ui.zoom + 0.1) * 10) / 10))
+      } else if (mod && e.key === '-') {
+        e.preventDefault()
+        setUiSetting('zoom', Math.max(0.5, Math.round((ui.zoom - 0.1) * 10) / 10))
+      } else if (mod && e.key === '0') {
+        e.preventDefault()
+        setUiSetting('zoom', 1)
       }
     }
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [activeTab, fileContents, dirtyFiles])
+  }, [activeTab, fileContents, dirtyFiles, openTabs, ui.zoom])
 
-  // Commands for the palette.
-  const paletteCommands: Command[] = useMemo(() => [
+  // Commands for the palette. Intentionally NOT memoized: the actions close
+  // over live editor state (activeTab, dirtyFiles, …) and a memo made "File:
+  // Save" run against stale state.
+  const paletteCommands: Command[] = [
     { id: 'save', label: 'File: Save', hint: 'Ctrl+S', run: () => saveActiveFile() },
+    { id: 'saveall', label: 'File: Save All', hint: 'Ctrl+Alt+S', run: () => saveAllFiles() },
+    { id: 'closetab', label: 'File: Close Tab', hint: 'Ctrl+W', run: () => { if (activeTab) requestCloseTab(activeTab) } },
+    { id: 'reopentab', label: 'File: Reopen Closed Tab', hint: 'Ctrl+Shift+T', run: () => reopenClosedTab() },
     { id: 'newfile', label: 'File: New File', run: () => createFilePrompt('') },
     { id: 'newfolder', label: 'File: New Folder', run: () => createFolderPrompt('') },
     { id: 'openfolder', label: 'Workspace: Open Folder…', run: () => switchWorkspace() },
@@ -623,13 +1000,18 @@ export function IDEView() {
     { id: 'explorer', label: 'View: Explorer', run: () => { setActiveSidebar('explorer'); setIsSidebarOpen(true) } },
     { id: 'refresh', label: 'Workspace: Refresh', run: () => refreshWorkspace() },
     { id: 'quickopen', label: 'Go to File…', hint: 'Ctrl+P', run: () => { setPaletteMode('files'); setPaletteOpen(true) } },
-  ], [createFilePrompt, createFolderPrompt, switchWorkspace, refreshWorkspace])
+  ]
 
 
   // Custom theme initialization for Monaco
   const handleEditorDidMount = (editor: any, monaco: any) => {
     editorRef.current = editor
     monacoRef.current = monaco
+    setEditorReady((n) => n + 1)
+    // Status bar: track the caret position.
+    editor.onDidChangeCursorPosition((e: any) => {
+      setCursorPos({ line: e.position.lineNumber, col: e.position.column })
+    })
     // Set custom HSL dark theme values
     monaco.editor.defineTheme('vscode-dark-harmony', {
       base: 'vs-dark',
@@ -659,7 +1041,8 @@ export function IDEView() {
   }
 
   return (
-    <div className="h-full flex bg-zinc-950 text-zinc-200 overflow-hidden select-none font-sans">
+    <div className="h-full flex flex-col bg-zinc-950 text-zinc-200 overflow-hidden select-none font-sans">
+    <div className="flex-1 min-h-0 flex overflow-hidden">
       {/* 1. Icon-only Activity Bar */}
       <nav className="w-12 border-r border-zinc-800 bg-zinc-950 flex flex-col items-center py-3 gap-6 flex-shrink-0">
         <ActivityButton
@@ -737,12 +1120,18 @@ export function IDEView() {
           }}
         />
         <div className="mt-auto flex flex-col gap-4">
-          <ActivityButton
-            icon={<MessagesSquare size={20} />}
-            label="AI Chat"
-            active={chatOpen}
-            onClick={() => setChatOpen((v) => !v)}
-          />
+          <div className="relative">
+            <ActivityButton
+              icon={<MessagesSquare size={20} />}
+              label="AI Chat"
+              active={chatOpen}
+              onClick={() => { setChatOpen((v) => !v); setChatUnread(false) }}
+            />
+            {/* Unread badge: an agent run finished while the chat was closed. */}
+            {chatUnread && !chatOpen && (
+              <span className="absolute top-0 right-0.5 size-2 rounded-full bg-emerald-400 ring-2 ring-zinc-950 animate-pulse" />
+            )}
+          </div>
           <ActivityButton
             icon={<RefreshCw size={18} className={loadingWorkspace ? 'animate-spin text-blue-400' : ''} />}
             label="Refresh Workspace"
@@ -841,6 +1230,12 @@ export function IDEView() {
                   <button onClick={() => createFolderPrompt('')} title="New Folder" className="text-zinc-500 hover:text-zinc-200 p-0.5">
                     <FolderPlus size={13} />
                   </button>
+                  <button onClick={() => setRevealNonce((n) => n + 1)} title="Reveal Active File" className="text-zinc-500 hover:text-zinc-200 p-0.5">
+                    <Crosshair size={12} />
+                  </button>
+                  <button onClick={() => setCollapseNonce((n) => n + 1)} title="Collapse All" className="text-zinc-500 hover:text-zinc-200 p-0.5">
+                    <ChevronsDownUp size={12} />
+                  </button>
                   <button onClick={refreshWorkspace} title="Refresh" className="text-zinc-500 hover:text-zinc-200 p-0.5">
                     <RefreshCw size={12} className={loadingWorkspace ? 'animate-spin text-blue-400' : ''} />
                   </button>
@@ -868,10 +1263,13 @@ export function IDEView() {
                 selectedFile={activeTab}
                 onSelectFile={openFile}
                 gitChanges={gitChanges}
-                onRename={renamePrompt}
+                onRenameCommit={handleRenameCommit}
                 onDelete={deletePrompt}
-                onNewFile={createFilePrompt}
-                onNewFolder={createFolderPrompt}
+                onCreateCommit={handleCreateCommit}
+                onMove={handleMove}
+                createRequest={createReq}
+                revealNonce={revealNonce}
+                collapseNonce={collapseNonce}
               />
             )}
 
@@ -880,7 +1278,7 @@ export function IDEView() {
             )}
 
             {activeSidebar === 'git' && (
-              <GitPanel onOpenFile={openFile} onChanged={refreshWorkspace} />
+              <GitPanel onOpenFile={openFile} onChanged={refreshWorkspace} onDiscard={handleDiscardFile} />
             )}
 
             {activeSidebar === 'agents' && (
@@ -950,21 +1348,42 @@ export function IDEView() {
               return (
                 <div
                   key={tab}
+                  draggable
+                  onDragStart={() => { dragTabRef.current = tab }}
+                  onDragEnd={() => { dragTabRef.current = null }}
+                  onDragOver={(e) => {
+                    // Live-reorder: as the dragged tab passes over another, swap positions.
+                    e.preventDefault()
+                    const from = dragTabRef.current
+                    if (!from || from === tab) return
+                    setOpenTabs((tabs) => {
+                      const next = tabs.filter((t) => t !== from)
+                      next.splice(next.indexOf(tab), 0, from)
+                      return next
+                    })
+                  }}
                   onClick={() => openFile(tab)}
-                  className={`h-8 px-3 border-b-2 flex items-center gap-2 cursor-pointer transition-all text-xs font-mono select-none rounded-t ${tabColor}`}
+                  onAuxClick={(e) => {
+                    // Middle-click closes (through the dirty guard).
+                    if (e.button === 1) { e.preventDefault(); requestCloseTab(tab) }
+                  }}
+                  className={`group/tab h-8 px-3 border-b-2 flex items-center gap-2 cursor-pointer transition-all text-xs font-mono select-none rounded-t ${tabColor}`}
                 >
                   <span className="truncate max-w-[140px]">{tab.split('/').pop()}</span>
-                  
-                  {isDirty ? (
-                    <span className="size-1.5 rounded-full bg-blue-400 animate-pulse flex-shrink-0" />
-                  ) : (
-                    <button
-                      onClick={(e) => closeTab(e, tab)}
-                      className="text-zinc-600 hover:text-zinc-300 p-0.5 rounded-full flex-shrink-0 transition-colors"
-                    >
-                      <X size={10} />
-                    </button>
+
+                  {/* Dirty dot swaps to an X on hover so dirty tabs stay closable. */}
+                  {isDirty && (
+                    <span className="size-1.5 rounded-full bg-blue-400 animate-pulse flex-shrink-0 group-hover/tab:hidden" />
                   )}
+                  <button
+                    onClick={(e) => { e.stopPropagation(); requestCloseTab(tab) }}
+                    title="Close (Cmd+W)"
+                    className={`text-zinc-600 hover:text-zinc-300 p-0.5 rounded-full flex-shrink-0 transition-colors ${
+                      isDirty ? 'hidden group-hover/tab:block' : ''
+                    }`}
+                  >
+                    <X size={10} />
+                  </button>
                 </div>
               )
             })}
@@ -990,6 +1409,18 @@ export function IDEView() {
               >
                 <Save size={14} />
               </button>
+
+              {/* Save All (visible when more than one tab is dirty) */}
+              {dirtyCount > 1 && (
+                <button
+                  onClick={saveAllFiles}
+                  title="Save All (Cmd+Alt+S)"
+                  className="px-2 py-1.5 rounded border border-blue-500/40 bg-blue-500/10 text-blue-300 hover:bg-blue-500/20 transition-all flex items-center gap-1"
+                >
+                  <Save size={13} />
+                  <span className="text-[10px] font-semibold">All ({dirtyCount})</span>
+                </button>
+              )}
 
               {/* Diff Toggle Button */}
               <button
@@ -1038,12 +1469,12 @@ export function IDEView() {
                       renderSideBySide,
                       originalEditable: false,
                       readOnly: false,
-                      fontSize: 13,
+                      fontSize: ui.editorFontSize,
                       lineHeight: 1.5,
                       fontFamily: 'ui-monospace, SF Mono, JetBrains Mono, Consolas, monospace',
                       minimap: { enabled: false },
                       scrollBeyondLastLine: false,
-                      wordWrap: 'on',
+                      wordWrap: ui.wordWrap ? 'on' : 'off',
                     }}
                   />
                 </div>
@@ -1057,12 +1488,14 @@ export function IDEView() {
                     onMount={handleEditorDidMount}
                     theme="vscode-dark-harmony"
                     options={{
-                      fontSize: 13,
+                      fontSize: ui.editorFontSize,
                       lineHeight: 1.5,
                       fontFamily: 'ui-monospace, SF Mono, JetBrains Mono, Consolas, monospace',
-                      minimap: { enabled: minimapOn },
+                      // minimapOn = the flicker-avoidance toggle during panel
+                      // animations; ui.minimap = the user's persisted setting.
+                      minimap: { enabled: minimapOn && ui.minimap },
                       scrollBeyondLastLine: false,
-                      wordWrap: 'on',
+                      wordWrap: ui.wordWrap ? 'on' : 'off',
                       tabSize: 4,
                       insertSpaces: true,
                     }}
@@ -1176,6 +1609,58 @@ export function IDEView() {
                 </span>
               </button>
 
+              {/* Shell tabs: switch / rename (double-click) / close / add */}
+              {bottomTab === 'shell' && isBottomOpen && (
+                <div className="flex items-center gap-1 pl-1 border-l border-zinc-800">
+                  {shells.map((s) => (
+                    <div
+                      key={s.id}
+                      onClick={() => setActiveShell(s.id)}
+                      onDoubleClick={() => { setRenamingShell(s.id); setShellNameDraft(s.name) }}
+                      className={`group/shell flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-mono cursor-pointer ${
+                        s.id === activeShell ? 'bg-zinc-800 text-zinc-100' : 'text-zinc-500 hover:text-zinc-300'
+                      }`}
+                    >
+                      {renamingShell === s.id ? (
+                        <input
+                          autoFocus
+                          value={shellNameDraft}
+                          onChange={(e) => setShellNameDraft(e.target.value)}
+                          onClick={(e) => e.stopPropagation()}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') {
+                              const name = shellNameDraft.trim()
+                              if (name) setShells((prev) => prev.map((x) => (x.id === s.id ? { ...x, name } : x)))
+                              setRenamingShell(null)
+                            } else if (e.key === 'Escape') setRenamingShell(null)
+                            e.stopPropagation()
+                          }}
+                          onBlur={() => setRenamingShell(null)}
+                          className="w-16 px-1 bg-zinc-950 border border-blue-500/60 rounded text-[10px] text-zinc-100 focus:outline-none"
+                        />
+                      ) : (
+                        <span>{s.name}</span>
+                      )}
+                      {shells.length > 1 && (
+                        <button
+                          onClick={(e) => { e.stopPropagation(); closeShell(s.id) }}
+                          className="opacity-0 group-hover/shell:opacity-100 text-zinc-600 hover:text-rose-400"
+                        >
+                          <X size={9} />
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                  <button
+                    onClick={addShell}
+                    title="New terminal"
+                    className="px-1 text-zinc-500 hover:text-zinc-200 text-xs leading-none"
+                  >
+                    +
+                  </button>
+                </div>
+              )}
+
               <button
                 onClick={() => {
                   setBottomTab('logs')
@@ -1222,7 +1707,15 @@ export function IDEView() {
                 </div>
               ) : bottomTab === 'shell' ? (
                 <div className="h-full w-full relative">
-                  <ShellTerminal id="main-shell" active={isBottomOpen && bottomTab === 'shell'} />
+                  {shells.map((s) => (
+                    <div
+                      key={s.id}
+                      className="absolute inset-0"
+                      style={{ display: s.id === activeShell ? 'block' : 'none' }}
+                    >
+                      <ShellTerminal id={s.id} active={isBottomOpen && bottomTab === 'shell' && s.id === activeShell} />
+                    </div>
+                  ))}
                 </div>
               ) : (
                 <div className="h-full w-full bg-zinc-950 p-2 overflow-y-auto font-mono text-[11px] text-zinc-400 select-text scrollbar-thin">
@@ -1249,31 +1742,58 @@ export function IDEView() {
           smoothly alongside it. The inner content keeps a fixed width and is
           clipped by overflow-hidden, so it never reflows/repaints while the
           outer width animates (that clipping is what stops Monaco flicker). */}
-      <AnimatePresence>
-        {chatOpen && (
-          <motion.aside
-            className="border-l border-zinc-800 bg-zinc-950 flex-shrink-0 overflow-hidden"
-            initial={animationsOn ? { width: 0 } : false}
-            animate={{ width: 360 }}
-            exit={animationsOn ? { width: 0 } : { width: 0 }}
-            transition={{ duration: 0.26, ease: 'easeInOut' }}
-            onAnimationStart={startLayoutSync}
-            onAnimationComplete={stopLayoutSync}
-          >
-            <div className="w-[360px] h-full">
-              <ChatPanel
-                models={availableModels}
-                getContext={getChatContext}
-                onFileChanged={onAgentFileChanged}
-                onPendingChange={onPendingChange}
-                onChangeResolved={onChangeResolved}
-                onEditorRequest={onEditorRequest}
-                windup={animationsOn}
-              />
-            </div>
-          </motion.aside>
-        )}
-      </AnimatePresence>
+      {/* Always mounted (like the sidebar) so an in-flight agent run keeps
+          streaming when the user closes/reopens the chat — only the width
+          animates to 0. */}
+      <motion.aside
+        className="relative border-l border-zinc-800 bg-zinc-950 flex-shrink-0 overflow-hidden"
+        initial={false}
+        animate={{ width: chatOpen ? chatWidth : 0 }}
+        transition={{ duration: draggingChatRef.current ? 0 : 0.26, ease: 'easeInOut' }}
+        onAnimationStart={startLayoutSync}
+        onAnimationComplete={stopLayoutSync}
+      >
+        {/* Drag handle: resize the chat panel from its left edge. */}
+        <div
+          onMouseDown={startChatResize}
+          className="absolute left-0 top-0 h-full w-1.5 z-20 cursor-col-resize hover:bg-blue-500/50 transition-colors"
+          title="Drag to resize"
+        />
+        <div style={{ width: chatWidth }} className="h-full">
+          <ChatPanel
+            models={availableModels}
+            getContext={getChatContext}
+            onFileChanged={onAgentFileChanged}
+            onPendingChange={onPendingChange}
+            onChangeResolved={onChangeResolved}
+            onEditorRequest={onEditorRequest}
+            windup={animationsOn}
+            files={flatFiles}
+            onRunStateChange={setAgentBusy}
+            onContextUsage={setChatCtxUsage}
+            onRunFinished={(info) => {
+              if (chatOpen) return
+              setChatUnread(true)
+              if (info.kind === 'done') toast('Agent finished', 'success')
+              else if (info.kind === 'plan') toast('Plan ready for review', 'info')
+              else if (info.kind === 'blocked') toast('Agent blocked — see chat', 'error')
+              else toast('Agent run failed — see chat', 'error')
+            }}
+          />
+        </div>
+      </motion.aside>
+    </div>
+
+      {/* Status bar spans the full window width below all panels. */}
+      <StatusBar
+        branch={branchName}
+        dirtyCount={dirtyCount}
+        workspaceName={workspaceName}
+        cursor={activeTab ? cursorPos : null}
+        language={activeTab ? detectLanguage(activeTab) : ''}
+        agentBusy={agentBusy}
+        ctxUsage={chatCtxUsage}
+      />
 
       <CommandPalette
         open={paletteOpen}
@@ -1283,6 +1803,8 @@ export function IDEView() {
         onClose={() => setPaletteOpen(false)}
         onOpenFile={openFile}
       />
+
+      <ConfirmDialog dialog={dialog} />
     </div>
   )
 }

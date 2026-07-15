@@ -1499,13 +1499,20 @@ ipcMain.handle('workspace-delete', async (_evt, relPath: string) => {
 
 interface SearchMatch { file: string; line: number; column: number; text: string }
 
-ipcMain.handle('workspace-search', async (_evt, query: string, opts?: { caseSensitive?: boolean; regex?: boolean; maxResults?: number }) => {
+ipcMain.handle('workspace-search', async (_evt, query: string, opts?: { caseSensitive?: boolean; regex?: boolean; maxResults?: number; include?: string; exclude?: string }) => {
   const max = opts?.maxResults ?? 500
   if (!query) return { ok: true, matches: [] as SearchMatch[] }
   return await new Promise((resolve) => {
     const args = ['--no-heading', '--line-number', '--column', '--color', 'never']
     if (!opts?.caseSensitive) args.push('-i')
     if (!opts?.regex) args.push('--fixed-strings')
+    // Include/exclude glob filters (rg -g patterns; exclude is negated).
+    if (opts?.include?.trim()) {
+      for (const g of opts.include.split(',').map((s) => s.trim()).filter(Boolean)) args.push('-g', g)
+    }
+    if (opts?.exclude?.trim()) {
+      for (const g of opts.exclude.split(',').map((s) => s.trim()).filter(Boolean)) args.push('-g', `!${g}`)
+    }
     args.push('--max-count', '50', query, '.')
     execFile('rg', args, { cwd: workspaceRoot, maxBuffer: 20 * 1024 * 1024 }, (err, stdout) => {
       // rg exits 1 when no matches — not an error for us.

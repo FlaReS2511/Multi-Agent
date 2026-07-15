@@ -11,6 +11,7 @@ import { CostBadge } from './components/CostBadge'
 import { CostDashboardModal } from './components/CostDashboardModal'
 import { IDEView } from './components/IDEView'
 import { OrqonLogo } from './components/OrqonLogo'
+import { ToastHost } from './components/ToastHost'
 import { useAnimationsEnabled } from './lib/uiSettings'
 import { Task, InboxSummary, AgentsConfig, activeAgents } from './lib/api'
 
@@ -233,11 +234,7 @@ export default function App() {
         </AnimatePresence>
       </div>
 
-      {/* Footer */}
-      <footer className="h-6 px-3 border-t border-zinc-800 flex items-center justify-between text-[10px] text-zinc-600 bg-zinc-950 flex-shrink-0">
-        <span>API-only · SQLite state · polling {POLL_MS}ms</span>
-        <span>Orqon v0.4</span>
-      </footer>
+      {/* (Footer replaced by the live StatusBar inside IDEView.) */}
 
       <NewTaskDialog
         open={showNewTask}
@@ -254,6 +251,7 @@ export default function App() {
         open={showCostDashboard}
         onClose={() => setShowCostDashboard(false)}
       />
+      <ToastHost />
     </div>
   )
 }
