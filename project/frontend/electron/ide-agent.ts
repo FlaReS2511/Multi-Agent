@@ -348,6 +348,9 @@ function buildSystemPrompt(params: IdeAgentParams, workspaceRoot: string): strin
     'needs one, call LoadToolGroup(group) FIRST to enable it, then call its tools. ' +
     'If a browser page shows a CAPTCHA or login wall, do NOT retry or try to bypass it — tell ' +
     'the user to complete it by hand in the browser tab, then continue. ' +
+    'Every browser action (open/navigate/click/type) returns a fresh "CURRENT PAGE" snapshot ' +
+    'with numbered element refs — ALWAYS pick your next BrowserClick/BrowserType target from the ' +
+    'most recent snapshot; never guess a ref or an element that is not listed. ' +
     'When the user describes concrete UI steps (click this, type that, press enter), reproduce ' +
     'those steps with BrowserClick/BrowserType so they can watch — do not shortcut to a ' +
     'constructed URL unless they just ask for a destination. ' +

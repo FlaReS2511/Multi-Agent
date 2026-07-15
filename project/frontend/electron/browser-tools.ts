@@ -376,18 +376,50 @@ const SNAPSHOT_JS = `(() => {
   return out.join('\\n')
 })()`
 
-async function snapshot(pg: Page, waitMs?: number): Promise<string> {
-  if (waitMs) await pg.waitForTimeout(Math.min(Math.max(waitMs, 0), 5000))
+// Wait for the page to actually settle before snapshotting — 'load' fires
+// before SPA content hydrates, which used to hand the model a near-empty map
+// and force it to guess. Best-effort: every wait is optional (many sites never
+// reach networkidle) and capped so it never hangs.
+async function settle(pg: Page): Promise<void> {
+  try { await pg.waitForLoadState('domcontentloaded', { timeout: 8000 }) } catch { /* already past */ }
+  try { await pg.waitForLoadState('networkidle', { timeout: 2500 }) } catch { /* SPA that never idles */ }
+  await pg.waitForTimeout(300) // let late paint / client hydration flush
+}
+
+// `after` labels a snapshot produced automatically after an action, so the
+// model treats it as ground truth for its NEXT step instead of re-deriving.
+async function snapshot(pg: Page, opts?: { waitMs?: number; settleFirst?: boolean; after?: string }): Promise<string> {
+  if (opts?.settleFirst) await settle(pg)
+  if (opts?.waitMs) await pg.waitForTimeout(Math.min(Math.max(opts.waitMs, 0), 5000))
   const body = String(await pg.evaluate(SNAPSHOT_JS))
-  const head = `URL: ${pg.url()}\nTitle: ${await pg.title()}`
-  const text = `${head}\n${body || '(no interactive elements found)'}`
-  const capped = text.length > 6000 ? text.slice(0, 6000) + '\n… (truncated — use BrowserRead or scroll)' : text
+  const banner = opts?.after
+    ? `== CURRENT PAGE (${opts.after}) — use these refs for your next action, do not guess ==`
+    : '== CURRENT PAGE — use these refs for your next action, do not guess =='
+  const head = `${banner}\nURL: ${pg.url()}\nTitle: ${await pg.title()}`
+  const text = `${head}\n${body || '(no interactive elements found — try BrowserScroll or BrowserRead)'}`
+  // Cap generously: a truncated element list is the main cause of the model
+  // "guessing" a target it never saw (busy pages like GitHub list 100+
+  // elements). ~10k chars keeps a full typical page while bounding tokens.
+  const LIMIT = 10_000
+  const capped = text.length > LIMIT
+    ? text.slice(0, LIMIT) + `\n… (element list truncated — ${body.length - LIMIT}+ chars more; if your target is not listed above, BrowserRead the page or ask the user to narrow the view rather than guessing)`
+    : text
   return capped + challengeHint(capped)
 }
 
 function refLocator(pg: Page, ref: string) {
   const clean = String(ref).replace(/[^e0-9]/g, '')
   return pg.locator(`[data-orqon-ref="${clean}"]`).first()
+}
+
+// A ref only exists until the next snapshot re-tags the page. If the model
+// aims at a stale ref, hand back the current page instead of a bare timeout so
+// it can re-pick without a wasted turn.
+async function ensureRef(pg: Page, ref: string): Promise<string | null> {
+  const loc = refLocator(pg, ref)
+  if (await loc.count() > 0) return null
+  const fresh = await snapshot(pg, { after: `ref ${ref} no longer exists` })
+  return `error: element ${ref} is not on the current page (it changed since the last snapshot).\n${fresh}`
 }
 
 // ── virtual cursor ───────────────────────────────────────────────
@@ -496,17 +528,17 @@ export async function runBrowserTool(
       await pg.goto(url, { waitUntil: 'load', timeout: 25_000 }).catch((e) => {
         throw new Error(`navigation failed: ${e?.message || e}`)
       })
-      return snapshot(pg)
+      return snapshot(pg, { settleFirst: true, after: 'opened' })
     }
     case 'BrowserNavigate': {
       const pg = currentPage()
       const url = String(args.url ?? '')
       if (url === 'back') await pg.goBack({ timeout: 15_000 })
       else await pg.goto(normalizeUrl(url), { waitUntil: 'load', timeout: 25_000 })
-      return snapshot(pg)
+      return snapshot(pg, { settleFirst: true, after: 'navigated' })
     }
     case 'BrowserSnapshot':
-      return snapshot(currentPage(), Number(args.wait_ms) || 0)
+      return snapshot(currentPage(), { waitMs: Number(args.wait_ms) || 0, settleFirst: true })
     case 'BrowserRead': {
       const pg = currentPage()
       const text = String(await pg.evaluate('document.body ? document.body.innerText : ""'))
@@ -523,14 +555,18 @@ export async function runBrowserTool(
     }
     case 'BrowserClick': {
       const pg = currentPage()
+      const stale = await ensureRef(pg, String(args.ref))
+      if (stale) return stale
       const loc = refLocator(pg, String(args.ref))
       await pointAt(pg, loc, true) // glide the virtual cursor + pulse
       await loc.click({ timeout: 8000 })
       await pg.waitForLoadState('load', { timeout: 8000 }).catch(() => { /* no navigation happened */ })
-      return snapshot(pg)
+      return snapshot(pg, { settleFirst: true, after: 'after click' })
     }
     case 'BrowserType': {
       const pg = currentPage()
+      const stale = await ensureRef(pg, String(args.ref))
+      if (stale) return stale
       const loc = refLocator(pg, String(args.ref))
       await pointAt(pg, loc, false) // glide the virtual cursor to the field
       await loc.fill(String(args.text ?? ''), { timeout: 8000 })
@@ -538,7 +574,7 @@ export async function runBrowserTool(
         await loc.press('Enter')
         await pg.waitForLoadState('load', { timeout: 10_000 }).catch(() => { /* SPA — no full navigation */ })
       }
-      return snapshot(pg)
+      return snapshot(pg, { settleFirst: true, after: args.submit ? 'after submit' : 'after typing' })
     }
     case 'BrowserScroll': {
       const pg = currentPage()
