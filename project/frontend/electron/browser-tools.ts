@@ -461,7 +461,7 @@ const CURSOR_JS = `(() => {
 // animation so the real click lands right when the pointer "arrives".
 async function pointAt(pg: Page, loc: ReturnType<Page['locator']>, click: boolean): Promise<void> {
   try {
-    await loc.scrollIntoViewIfNeeded({ timeout: 4000 })
+    await loc.scrollIntoViewIfNeeded({ timeout: 2000 })
     const box = await loc.boundingBox()
     if (!box) return
     const x = box.x + box.width / 2
@@ -558,23 +558,61 @@ export async function runBrowserTool(
       const stale = await ensureRef(pg, String(args.ref))
       if (stale) return stale
       const loc = refLocator(pg, String(args.ref))
+      const urlBefore = pg.url()
       await pointAt(pg, loc, true) // glide the virtual cursor + pulse
-      await loc.click({ timeout: 8000 })
-      await pg.waitForLoadState('load', { timeout: 8000 }).catch(() => { /* no navigation happened */ })
-      return snapshot(pg, { settleFirst: true, after: 'after click' })
+      let clickErr: unknown = null
+      try {
+        // Short timeout: complex elements (aria-haspopup, overlays) can hang
+        // the actionability wait — fall through to a forced click fast.
+        await loc.click({ timeout: 4000 })
+      } catch (e1) {
+        clickErr = e1
+        try {
+          // force: skip the actionability checks that stalled (intercepting
+          // overlay, or the node detaching mid-navigation) but keep a real
+          // trusted mouse click.
+          await loc.scrollIntoViewIfNeeded({ timeout: 1500 }).catch(() => {})
+          await loc.click({ force: true, timeout: 3000 })
+          clickErr = null
+        } catch (e2) {
+          clickErr = e2
+          // Last resort: synthetic in-page click (fires even if covered).
+          try { await loc.dispatchEvent('click'); clickErr = null } catch { /* keep e2 */ }
+        }
+      }
+      // A click may navigate OR just open an overlay — wait for either to settle.
+      await pg.waitForLoadState('load', { timeout: 8000 }).catch(() => { /* overlay, no nav */ })
+      const navved = pg.url() !== urlBefore
+      // The click likely WORKED even if playwright threw: the element was torn
+      // down by the very navigation it triggered. Detect that and report the
+      // new page so the agent doesn't think it failed and re-navigate by hand.
+      if (clickErr && !navved) {
+        const snap = await snapshot(pg, { after: 'click may not have registered' })
+        return `error: could not click ${args.ref} (${String((clickErr as any)?.message || clickErr).slice(0, 120)}) — it may be covered, disabled, or off-screen. Current page below; pick another ref or scroll.\n${snap}`
+      }
+      return snapshot(pg, { settleFirst: true, after: navved ? `clicked → navigated to ${pg.url()}` : 'after click' })
     }
     case 'BrowserType': {
       const pg = currentPage()
       const stale = await ensureRef(pg, String(args.ref))
       if (stale) return stale
       const loc = refLocator(pg, String(args.ref))
+      const urlBefore = pg.url()
       await pointAt(pg, loc, false) // glide the virtual cursor to the field
-      await loc.fill(String(args.text ?? ''), { timeout: 8000 })
+      try {
+        await loc.fill(String(args.text ?? ''), { timeout: 5000 })
+      } catch {
+        // Some inputs reject fill() (contenteditable, custom widgets) — focus
+        // and type key-by-key instead.
+        await loc.click({ force: true, timeout: 3000 }).catch(() => {})
+        await loc.pressSequentially(String(args.text ?? ''), { timeout: 5000 }).catch(() => {})
+      }
       if (args.submit) {
-        await loc.press('Enter')
+        await loc.press('Enter').catch(() => {})
         await pg.waitForLoadState('load', { timeout: 10_000 }).catch(() => { /* SPA — no full navigation */ })
       }
-      return snapshot(pg, { settleFirst: true, after: args.submit ? 'after submit' : 'after typing' })
+      const navved = pg.url() !== urlBefore
+      return snapshot(pg, { settleFirst: true, after: navved ? `submitted → navigated to ${pg.url()}` : (args.submit ? 'after submit' : 'after typing') })
     }
     case 'BrowserScroll': {
       const pg = currentPage()
