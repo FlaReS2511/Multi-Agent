@@ -390,6 +390,56 @@ function refLocator(pg: Page, ref: string) {
   return pg.locator(`[data-orqon-ref="${clean}"]`).first()
 }
 
+// ── virtual cursor ───────────────────────────────────────────────
+// A purely-visual dark/gray pointer injected into the page so the user can
+// SEE what the agent is about to click/type into. pointer-events:none — the
+// real interaction is playwright's. Re-injected lazily (navigations wipe it),
+// glides to the target, pulses on click, fades out when idle.
+const CURSOR_JS = `(() => {
+  let c = document.getElementById('__orqon_cursor')
+  if (!c) {
+    c = document.createElement('div')
+    c.id = '__orqon_cursor'
+    c.style.cssText = 'position:fixed;left:40px;top:40px;z-index:2147483647;pointer-events:none;' +
+      'width:22px;height:22px;opacity:0;transition:left .38s cubic-bezier(.3,.7,.3,1),top .38s cubic-bezier(.3,.7,.3,1),opacity .3s'
+    c.innerHTML = '<svg width="22" height="22" viewBox="0 0 24 24" style="filter:drop-shadow(0 1px 2px rgba(0,0,0,.6))">' +
+      '<path d="M5 3 L5 17 L9 13.5 L11.5 19 L14 18 L11.5 12.5 L17 12.5 Z" fill="#27272a" stroke="#a1a1aa" stroke-width="1.2"/></svg>'
+    document.documentElement.appendChild(c)
+  }
+  window.__orqonCursor = (x, y, click) => {
+    c.style.opacity = '1'
+    c.style.left = x + 'px'
+    c.style.top = y + 'px'
+    clearTimeout(window.__orqonCursorFade)
+    window.__orqonCursorFade = setTimeout(() => { c.style.opacity = '0' }, 2200)
+    if (click) setTimeout(() => {
+      const r = document.createElement('div')
+      r.style.cssText = 'position:fixed;z-index:2147483646;pointer-events:none;width:30px;height:30px;' +
+        'left:' + (x - 12) + 'px;top:' + (y - 12) + 'px;border:2px solid #a1a1aa;border-radius:50%;' +
+        'animation:none;opacity:.85;transform:scale(.4);transition:transform .45s ease-out,opacity .45s ease-out'
+      document.documentElement.appendChild(r)
+      requestAnimationFrame(() => { r.style.transform = 'scale(1.5)'; r.style.opacity = '0' })
+      setTimeout(() => r.remove(), 600)
+    }, 400)
+  }
+  return true
+})()`
+
+// Glide the virtual cursor to the locator's center; returns after the travel
+// animation so the real click lands right when the pointer "arrives".
+async function pointAt(pg: Page, loc: ReturnType<Page['locator']>, click: boolean): Promise<void> {
+  try {
+    await loc.scrollIntoViewIfNeeded({ timeout: 4000 })
+    const box = await loc.boundingBox()
+    if (!box) return
+    const x = box.x + box.width / 2
+    const y = box.y + Math.min(box.height / 2, 200)
+    await pg.evaluate(CURSOR_JS)
+    await pg.evaluate(`window.__orqonCursor(${Math.round(x)}, ${Math.round(y)}, ${click})`)
+    await pg.waitForTimeout(click ? 620 : 450) // travel + (click) pulse start
+  } catch { /* cursor is decoration only — never block the real action */ }
+}
+
 // ── external browser launch (phase 2) ───────────────────────────
 
 async function cdpAlive(port: number): Promise<boolean> {
@@ -461,19 +511,28 @@ export async function runBrowserTool(
       const pg = currentPage()
       const text = String(await pg.evaluate('document.body ? document.body.innerText : ""'))
       const off = Math.max(0, Number(args.offset) || 0)
+      // Scroll the page along with the reading position so the user can watch
+      // the agent read instead of it slurping text invisibly.
+      const frac = text.length > 0 ? Math.min(off / text.length, 1) : 0
+      await pg.evaluate(
+        `window.scrollTo({ top: ${frac.toFixed(4)} * Math.max(0, document.body.scrollHeight - window.innerHeight), behavior: 'smooth' })`,
+      ).catch(() => { /* decoration only */ })
       const slice = text.slice(off, off + 8000)
       const more = off + 8000 < text.length ? `\n… (${text.length - off - 8000} more chars — call again with offset=${off + 8000})` : ''
       return `URL: ${pg.url()}\n${slice}${more}` + challengeHint(slice)
     }
     case 'BrowserClick': {
       const pg = currentPage()
-      await refLocator(pg, String(args.ref)).click({ timeout: 8000 })
+      const loc = refLocator(pg, String(args.ref))
+      await pointAt(pg, loc, true) // glide the virtual cursor + pulse
+      await loc.click({ timeout: 8000 })
       await pg.waitForLoadState('load', { timeout: 8000 }).catch(() => { /* no navigation happened */ })
       return snapshot(pg)
     }
     case 'BrowserType': {
       const pg = currentPage()
       const loc = refLocator(pg, String(args.ref))
+      await pointAt(pg, loc, false) // glide the virtual cursor to the field
       await loc.fill(String(args.text ?? ''), { timeout: 8000 })
       if (args.submit) {
         await loc.press('Enter')
@@ -484,9 +543,12 @@ export async function runBrowserTool(
     case 'BrowserScroll': {
       const pg = currentPage()
       const dir = String(args.direction ?? 'down')
-      const js = dir === 'top' ? 'window.scrollTo(0,0)' : dir === 'bottom' ? 'window.scrollTo(0,document.body.scrollHeight)'
-        : dir === 'up' ? 'window.scrollBy(0,-window.innerHeight*0.9)' : 'window.scrollBy(0,window.innerHeight*0.9)'
+      const js = dir === 'top' ? 'window.scrollTo({top:0,behavior:"smooth"})'
+        : dir === 'bottom' ? 'window.scrollTo({top:document.body.scrollHeight,behavior:"smooth"})'
+        : dir === 'up' ? 'window.scrollBy({top:-window.innerHeight*0.9,behavior:"smooth"})'
+        : 'window.scrollBy({top:window.innerHeight*0.9,behavior:"smooth"})'
       await pg.evaluate(js)
+      await pg.waitForTimeout(450) // let the smooth scroll settle before reporting
       return `scrolled ${dir} — ${await pg.evaluate('Math.round(window.scrollY) + "/" + Math.round(document.body.scrollHeight)')}px`
     }
     case 'BrowserConsole':
