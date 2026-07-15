@@ -228,6 +228,23 @@ const api = {
   },
   aiAgentEditorRes: (resp: { requestId: string; ok: boolean; result: string }) =>
     ipcRenderer.invoke('ai-agent-editor-res', resp),
+  // Embedded agent browser: renderer streams the placeholder rect, main
+  // positions the WebContentsView; url changes flow back for the address bar.
+  browserSetBounds: (rect: { x: number; y: number; width: number; height: number }) =>
+    ipcRenderer.send('browser-set-bounds', rect),
+  browserSetVisible: (visible: boolean) => ipcRenderer.send('browser-set-visible', visible),
+  browserUserNavigate: (url: string) => ipcRenderer.send('browser-user-navigate', url),
+  browserTabClosed: () => ipcRenderer.send('browser-tab-closed'),
+  onAgentBrowserShow: (cb: () => void) => {
+    const listener = () => cb()
+    ipcRenderer.on('agent-browser-show', listener)
+    return () => ipcRenderer.removeListener('agent-browser-show', listener)
+  },
+  onBrowserUrlChanged: (cb: (info: { url: string; title: string }) => void) => {
+    const listener = (_e: unknown, info: { url: string; title: string }) => cb(info)
+    ipcRenderer.on('browser-url-changed', listener)
+    return () => ipcRenderer.removeListener('browser-url-changed', listener)
+  },
   setAutoTrigger: (enabled: boolean) => ipcRenderer.invoke('set-auto-trigger', enabled),
   getAutoTrigger: () => ipcRenderer.invoke('get-auto-trigger'),
   onAutoTrigger: (cb: (info: { agent: string }) => void) => {
