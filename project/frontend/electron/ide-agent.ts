@@ -138,6 +138,27 @@ const ORCH_TOOL_SPECS: ToolSpec[] = [
 ]
 const ORCH_TOOL_NAMES = new Set(ORCH_TOOL_SPECS.map((s) => s.name))
 
+// SpawnAgent: delegate a sub-task to a CHILD instance of this same IDE agent
+// (full toolset — files, bash, browser). The child runs to completion in the
+// background and its summary is returned as the tool result. Always available
+// to the top-level chat agent; withheld from sub-agents themselves (depth cap).
+const SPAWN_AGENT_SPEC: ToolSpec = {
+  name: 'SpawnAgent',
+  description:
+    'Delegate a self-contained sub-task to a child agent that runs in the background with the FULL toolset ' +
+    '(read/write files, run commands, browse the web). It works autonomously and returns a summary of what it ' +
+    'did when finished. Use this to parallelize or offload a chunky, well-scoped piece of work — NOT for small ' +
+    'things you can just do yourself. Give it a clear, complete task description; it does not see this conversation.',
+  input_schema: {
+    type: 'object',
+    properties: {
+      task: { type: 'string', description: 'the complete, self-contained sub-task for the child agent' },
+      label: { type: 'string', description: 'a short label shown in the UI (e.g. "migrate auth")' },
+    },
+    required: ['task'],
+  },
+}
+
 // Control tool: let the agent bail out cleanly instead of looping to MAX_TURNS
 // on an impossible task. Always available.
 const REPORT_BLOCKED_SPEC: ToolSpec = {
@@ -169,16 +190,24 @@ const PRESENT_PLAN_SPEC: ToolSpec = {
   },
 }
 
+interface ToolSetOpts {
+  allowBash: boolean
+  orchestrationEnabled: boolean
+  isSubAgent?: boolean  // withhold editor round-trip + SpawnAgent + orch tools
+  canSpawn?: boolean    // top-level agent with a spawnSubAgent bridge available
+}
+
 // The FULL tool set for a run (used for plan-mode read-only filtering).
-function toolSpecsFor(opts: { allowBash: boolean; orchestrationEnabled: boolean }): ToolSpec[] {
+function toolSpecsFor(opts: ToolSetOpts): ToolSpec[] {
   const specs: ToolSpec[] = [
     ...FILE_TOOL_SPECS.filter((s) => opts.allowBash || s.name !== 'Bash'),
-    ...EDITOR_TOOL_SPECS,
+    ...(opts.isSubAgent ? [] : EDITOR_TOOL_SPECS),
     ...EXTRA_TOOL_SPECS,
     ...BROWSER_TOOL_SPECS,
     REPORT_BLOCKED_SPEC,
   ]
-  if (opts.orchestrationEnabled) specs.push(...ORCH_TOOL_SPECS)
+  if (opts.orchestrationEnabled && !opts.isSubAgent) specs.push(...ORCH_TOOL_SPECS)
+  if (opts.canSpawn && !opts.isSubAgent) specs.push(SPAWN_AGENT_SPEC)
   return specs
 }
 
@@ -224,14 +253,17 @@ const LOAD_GROUP_SPEC: ToolSpec = {
 const TODO_SPEC = EXTRA_BY_NAME.get('TodoWrite') // common + tiny → keep in core
 
 // Core tools sent every turn: file + editor + todo + control + LoadToolGroup.
-function coreSpecsFor(opts: { allowBash: boolean; orchestrationEnabled: boolean }): ToolSpec[] {
+// Sub-agents drop the editor round-trip (they don't drive the user's one
+// Monaco) and SpawnAgent (depth cap); they Write to disk directly.
+function coreSpecsFor(opts: ToolSetOpts): ToolSpec[] {
   const specs: ToolSpec[] = [
     ...FILE_TOOL_SPECS.filter((s) => opts.allowBash || s.name !== 'Bash'),
-    ...EDITOR_TOOL_SPECS,
+    ...(opts.isSubAgent ? [] : EDITOR_TOOL_SPECS),
   ]
   if (TODO_SPEC) specs.push(TODO_SPEC)
   specs.push(REPORT_BLOCKED_SPEC, LOAD_GROUP_SPEC)
-  if (opts.orchestrationEnabled) specs.push(...ORCH_TOOL_SPECS)
+  if (opts.orchestrationEnabled && !opts.isSubAgent) specs.push(...ORCH_TOOL_SPECS)
+  if (opts.canSpawn && !opts.isSubAgent) specs.push(SPAWN_AGENT_SPEC)
   return specs
 }
 
@@ -251,6 +283,10 @@ export interface IdeAgentParams {
   planMode?: boolean
   // Research mode: read-only deep investigation (web + code) → cited answer.
   researchMode?: boolean
+  // >0 when this run IS a spawned sub-agent (of the chat agent). Sub-agents
+  // get the full toolset minus editor round-trip and minus SpawnAgent (depth
+  // cap prevents fork-bombs).
+  subAgentDepth?: number
 }
 
 // Orchestration tools run in main (need db + coordinator), so they're routed
@@ -258,6 +294,9 @@ export interface IdeAgentParams {
 export interface OrchestrationBridge {
   createTask(input: { title: string; owner: string; description?: string; priority?: string }): Promise<string>
   createGroup(input: { task_id: string; worker_role: string }): Promise<string>
+  // Run a child IDE-agent to completion and return its final summary. Provided
+  // only for the top-level chat agent (sub-agents don't get SpawnAgent).
+  spawnSubAgent?(input: { task: string; label?: string }): Promise<string>
 }
 
 // A change awaiting the user's verdict in review mode.
@@ -302,6 +341,9 @@ export type IdeAgentEvent =
   | { type: 'plan'; plan: string; turns: number }
   | { type: 'done'; text: string; turns: number }
   | { type: 'error'; error: string }
+  // A child agent was spawned this turn: the renderer renders a nested card and
+  // subscribes to ai-agent-event:<childRunId> for its live transcript.
+  | { type: 'subagent_started'; childRunId: string; label: string; task: string }
 
 interface ProviderCfg extends ProviderCfgLike {
   models?: string[]
@@ -331,15 +373,24 @@ function estimateCostUsd(tokensIn: number, tokensOut: number, rates: [number, nu
   return (tokensIn * inRate + tokensOut * outRate) / 1_000_000
 }
 
-function buildSystemPrompt(params: IdeAgentParams, workspaceRoot: string): string {
+function buildSystemPrompt(params: IdeAgentParams, workspaceRoot: string, opts?: { canSpawn?: boolean }): string {
+  const isSubAgent = Boolean(params.subAgentDepth && params.subAgentDepth > 0)
+  const editorLine = isSubAgent
+    ? '' // sub-agents don't drive the user's editor; they write to disk directly
+    : 'You also have editor tools to work with what the user sees: OpenFile (show a file ' +
+      'in the editor, optionally at a line), GetOpenEditor (get the currently viewed file ' +
+      'and selection), and ShowDiff (preview a proposed change without writing it). '
   let s =
-    'You are an expert AI coding agent embedded in an IDE. You have tools ' +
+    (isSubAgent
+      ? 'You are a delegated sub-agent working autonomously on ONE self-contained sub-task handed to you ' +
+        'by the lead agent (given as the first user message). You do NOT see the main conversation. Complete ' +
+        'the task end to end, then reply with a SHORT summary of what you did and any result the lead needs. '
+      : 'You are an expert AI coding agent embedded in an IDE. ') +
+    'You have tools ' +
     'to read and modify the user\'s workspace directly: Read, Write, Edit, MultiEdit, ' +
     'Grep, Glob, ListDir, Move, Delete. ' +
-    'You also have editor tools to work with what the user sees: OpenFile (show a file ' +
-    'in the editor, optionally at a line), GetOpenEditor (get the currently viewed file ' +
-    'and selection), and ShowDiff (preview a proposed change without writing it), plus ' +
-    'TodoWrite to track a plan. ' +
+    editorLine +
+    'You have TodoWrite to track a plan. ' +
     'Extra tool groups are NOT loaded by default (to save context): git (status/diff/commit/' +
     'push/branch/checkout/config/account), github (PRs & issues), web (WebFetch, WebSearch), ' +
     'memory (remember/recall notes), background (long-running commands), and browser (drive a ' +
@@ -357,7 +408,14 @@ function buildSystemPrompt(params: IdeAgentParams, workspaceRoot: string): strin
     'Sensitive actions (git mutations, changing the identity, switching accounts, logging ' +
     'in, background commands) ask the user for confirmation automatically — just call the ' +
     'tool and the user will approve or decline. ' +
-    'Open the relevant file with OpenFile so the user can follow along. ' +
+    (isSubAgent ? '' : 'Open the relevant file with OpenFile so the user can follow along. ') +
+    (opts?.canSpawn
+      ? 'For large or parallelizable work, you can delegate a well-scoped sub-task to a child agent with ' +
+        'SpawnAgent(task, label) — it runs autonomously with the full toolset and returns a summary. Do NOT ' +
+        'delegate trivial things you can just do yourself. To run several sub-agents AT THE SAME TIME, emit ' +
+        'multiple SpawnAgent tool calls IN ONE turn (they execute in parallel); if the user asks for N agents, ' +
+        'make N SpawnAgent calls in that single turn. Give each a narrow, specific task — never "the whole workspace". '
+      : '') +
     'Work autonomously: inspect the code with Read/Grep/Glob before changing it, make ' +
     'the smallest correct edit, and prefer Edit over Write for existing files. ' +
     'Stay on-task: only explore the workspace when the task actually requires it — if the ' +
@@ -452,6 +510,11 @@ export async function runIdeAgent(
 
     const allowBash = Boolean(params.allowBash)
     const orchestrationEnabled = Boolean(params.orchestrationEnabled && orchestrationBridge)
+    const isSubAgent = Boolean(params.subAgentDepth && params.subAgentDepth > 0)
+    // Top-level chat agent can delegate to child agents; sub-agents cannot
+    // (depth cap). Gated on the same orchestration opt-in.
+    const canSpawn = orchestrationEnabled && !isSubAgent && Boolean(orchestrationBridge?.spawnSubAgent)
+    const toolOpts: ToolSetOpts = { allowBash, orchestrationEnabled, isSubAgent, canSpawn }
     const contextWindow = contextWindowFor(model, pc)
     const planMode = Boolean(params.planMode)
     const researchMode = Boolean(params.researchMode) && !planMode
@@ -459,16 +522,16 @@ export async function runIdeAgent(
     // sends only the core set + LoadToolGroup; extra groups load on demand.
     let activeSpecs: ToolSpec[]
     if (planMode) {
-      activeSpecs = toolSpecsFor({ allowBash, orchestrationEnabled }).filter((s) => PLAN_READONLY_TOOLS.has(s.name))
+      activeSpecs = toolSpecsFor(toolOpts).filter((s) => PLAN_READONLY_TOOLS.has(s.name))
       activeSpecs.push(PRESENT_PLAN_SPEC)
     } else if (researchMode) {
-      activeSpecs = toolSpecsFor({ allowBash, orchestrationEnabled }).filter((s) => RESEARCH_READONLY_TOOLS.has(s.name))
+      activeSpecs = toolSpecsFor(toolOpts).filter((s) => RESEARCH_READONLY_TOOLS.has(s.name))
     } else {
-      activeSpecs = coreSpecsFor({ allowBash, orchestrationEnabled })
+      activeSpecs = coreSpecsFor(toolOpts)
     }
     let adapter = buildAdapter(pc, key, model, activeSpecs)
     const loadedGroups = new Set<string>()
-    const system = buildSystemPrompt(params, workspaceRoot)
+    const system = buildSystemPrompt(params, workspaceRoot, { canSpawn })
     // Seed the conversation with the prior chat turns (user + assistant text).
     const messages: unknown[] = params.messages.map((m) => ({ role: m.role, content: m.content }))
 
@@ -578,6 +641,10 @@ export async function runIdeAgent(
 
       const reviewOn = Boolean(params.reviewMode && requestReview)
       const results: string[] = []
+      // SpawnAgent runs children CONCURRENTLY: each call reserves its result
+      // slot and kicks off immediately, so two SpawnAgent calls in one turn run
+      // in parallel instead of one-after-another. Filled after the loop.
+      const pendingSpawns: { index: number; callId: string; promise: Promise<string> }[] = []
 
       // Ask the user to approve a sensitive action (shared by the extra-tools
       // gate and the outside-workspace gate below).
@@ -700,6 +767,30 @@ export async function runIdeAgent(
           }
         }
 
+        // SpawnAgent: kick the child off WITHOUT awaiting so sibling spawns in
+        // the same turn run in parallel. Reserve this call's result slot now;
+        // the summary lands after the loop. Errors resolve synchronously.
+        if (call.name === 'SpawnAgent') {
+          const a = call.args as { task?: string; label?: string }
+          if (!canSpawn || !orchestrationBridge?.spawnSubAgent) {
+            const denied = 'error: SpawnAgent is unavailable — enable orchestration in Backend Settings'
+            results.push(denied)
+            emit({ type: 'tool_result', callId, name: call.name, result: denied, isError: true })
+          } else if (!a.task?.trim()) {
+            const denied = 'error: task is required — describe the complete self-contained sub-task'
+            results.push(denied)
+            emit({ type: 'tool_result', callId, name: call.name, result: denied, isError: true })
+          } else {
+            anyActivity = true
+            const index = results.length
+            results.push('') // placeholder; filled once the child finishes
+            const promise = orchestrationBridge.spawnSubAgent({ task: a.task, label: a.label })
+              .catch((e: any) => `error: ${e?.message || e}`)
+            pendingSpawns.push({ index, callId, promise })
+          }
+          continue
+        }
+
         let result: string
         let isError = false
         const isMutation = call.name === 'Write' || call.name === 'Edit'
@@ -807,6 +898,16 @@ export async function runIdeAgent(
 
         results.push(result)
         emit({ type: 'tool_result', callId, name: call.name, result: result.slice(0, 2000), isError })
+      }
+
+      // Wait for any concurrently-spawned children, fill their result slots,
+      // and emit their (suppressed-in-UI) tool_results now that they're done.
+      if (pendingSpawns.length > 0) {
+        await Promise.all(pendingSpawns.map(async ({ index, callId, promise }) => {
+          const r = await promise
+          results[index] = r
+          emit({ type: 'tool_result', callId, name: 'SpawnAgent', result: r.slice(0, 2000), isError: r.startsWith('error:') })
+        }))
       }
 
       messages.push(assistantMsg)

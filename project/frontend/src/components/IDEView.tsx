@@ -35,6 +35,7 @@ import { GitPanel } from './GitPanel'
 import { CommandPalette, Command } from './CommandPalette'
 import { ChatPanel } from './ChatPanel'
 import { GroupsPanel } from './GroupsPanel'
+import { AgentsLivePanel } from './AgentsLivePanel'
 import { DiffReviewCard } from './DiffReviewCard'
 import { ConfirmDialog, ConfirmDialogSpec } from './ConfirmDialog'
 import { StatusBar } from './StatusBar'
@@ -1357,6 +1358,8 @@ export function IDEView() {
 
             {activeSidebar === 'agents' && (
               <div className="flex flex-col gap-3 p-1">
+                {/* Live child agents the chat agent delegated to (SpawnAgent). */}
+                <AgentsLivePanel />
                 {residentAgents.map((agent) => (
                   <div
                     key={agent}
@@ -1884,6 +1887,7 @@ export function IDEView() {
             workspaceRoot={workspaceRootPath}
             onRunStateChange={setAgentBusy}
             onContextUsage={setChatCtxUsage}
+            onSubAgentStarted={() => { setActiveSidebar('agents'); setIsSidebarOpen(true) }}
             onRunFinished={(info) => {
               if (chatOpen) return
               setChatUnread(true)
