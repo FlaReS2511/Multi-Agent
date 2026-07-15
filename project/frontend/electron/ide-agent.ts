@@ -348,6 +348,9 @@ function buildSystemPrompt(params: IdeAgentParams, workspaceRoot: string): strin
     'needs one, call LoadToolGroup(group) FIRST to enable it, then call its tools. ' +
     'If a browser page shows a CAPTCHA or login wall, do NOT retry or try to bypass it — tell ' +
     'the user to complete it by hand in the browser tab, then continue. ' +
+    'When the user describes concrete UI steps (click this, type that, press enter), reproduce ' +
+    'those steps with BrowserClick/BrowserType so they can watch — do not shortcut to a ' +
+    'constructed URL unless they just ask for a destination. ' +
     'Sensitive actions (git mutations, changing the identity, switching accounts, logging ' +
     'in, background commands) ask the user for confirmation automatically — just call the ' +
     'tool and the user will approve or decline. ' +
