@@ -125,7 +125,7 @@
     }
   },
   "discord": {
-    "enabled": true,
+    "enabled": false,
     "allowed_user_ids": [
       "483558731662229504"
     ],
