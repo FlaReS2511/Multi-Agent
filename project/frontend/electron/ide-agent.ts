@@ -683,10 +683,10 @@ export async function runIdeAgent(
       // Report context fill: prompt tokens this turn = current context size.
       if (usage.input > 0) {
         emit({ type: 'context', used: usage.input, window: contextWindow, turn })
-        // Long runs: once the prompt nears the window, shrink OLD tool results
-        // in place so the next call doesn't overflow — overflow is what made
-        // gateways truncate/drop tool calls mid-run and the agent go silent.
-        if (usage.input > contextWindow * 0.8) trimOldToolResults(messages, 8)
+        // Emergency brake: prompt near the window → trim harder (keep only
+        // the last 4 messages intact) so the next call doesn't overflow —
+        // overflow made gateways truncate/drop tool calls mid-run.
+        if (usage.input > contextWindow * 0.8) trimOldToolResults(messages, 4)
       }
 
       if (text) finalText = continuing ? finalText + text : text
@@ -1026,6 +1026,11 @@ export async function runIdeAgent(
 
       messages.push(assistantMsg)
       for (const m of adapter.toolResultsMessages(toolCalls, results)) messages.push(m)
+      // Proactively shrink tool results older than the last ~4 turns — the
+      // model already acted on them, yet they were re-sent at full size every
+      // turn until the 80% emergency brake. The trim is deterministic, so the
+      // already-trimmed prefix stays byte-stable for provider prompt caches.
+      trimOldToolResults(messages, 8)
     }
 
     emit({ type: 'done', text: finalText, turns })

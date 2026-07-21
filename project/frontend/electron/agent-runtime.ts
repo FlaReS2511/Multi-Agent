@@ -99,14 +99,27 @@ function nowStamp(): string {
 
 let CTX_ROLE = ''
 
+// Read caps: everything returned here lands in the model's context AND is
+// re-sent on every later turn of the loop. Whole files used to go back
+// uncapped — one big Read could blow the window for the rest of the run.
+const READ_MAX_LINES = 2000
+const READ_MAX_CHARS = 50_000
+
 function toolRead(a: { path: string; limit?: number; offset?: number }): string {
   const p = path.resolve(process.cwd(), a.path)
   const text = fs.readFileSync(p, 'utf-8')
-  if (a.limit == null && !a.offset) return text
-  let lines = text.split('\n')
-  if (a.offset) lines = lines.slice(a.offset)
-  if (a.limit) lines = lines.slice(0, a.limit)
-  return lines.join('\n')
+  const all = text.split('\n')
+  let lines = a.offset ? all.slice(a.offset) : all
+  lines = lines.slice(0, Math.min(a.limit ?? READ_MAX_LINES, READ_MAX_LINES))
+  let out = lines.join('\n')
+  let truncated = (a.offset ?? 0) + lines.length < all.length
+  if (out.length > READ_MAX_CHARS) {
+    out = out.slice(0, READ_MAX_CHARS)
+    truncated = true
+  }
+  return truncated
+    ? out + `\n…[truncated — file has ${all.length} lines; pass offset/limit to read more]`
+    : out
 }
 
 function toolWrite(a: { path: string; content: string }): string {
@@ -541,16 +554,48 @@ interface Adapter {
   toolResultsMessages(toolCalls: ToolCall[], results: string[]): unknown[]
 }
 
+// Cap a tool result fed back to the model, and shrink OLD tool results in
+// place each turn (deterministic, so the already-shrunk prefix stays
+// byte-stable for provider prompt caches). Mirrors ide-agent.ts.
+const MODEL_RESULT_CAP = 30_000
+const TRIM_KEEP_CHARS = 600
+
+function capResult(r: string): string {
+  return r.length > MODEL_RESULT_CAP
+    ? r.slice(0, MODEL_RESULT_CAP) + '\n…[output truncated — re-run with a narrower scope for more]'
+    : r
+}
+
+function trimOldToolResults(messages: unknown[], keepTail: number): void {
+  const note = ' …[old tool output trimmed to save context]'
+  const end = Math.max(0, messages.length - keepTail)
+  for (let i = 0; i < end; i++) {
+    const m = messages[i] as any
+    if (!m) continue
+    if (m.role === 'tool' && typeof m.content === 'string' && m.content.length > TRIM_KEEP_CHARS + note.length) {
+      m.content = m.content.slice(0, TRIM_KEEP_CHARS) + note
+    } else if (m.role === 'user' && Array.isArray(m.content)) {
+      for (const b of m.content) {
+        if (b && b.type === 'tool_result' && typeof b.content === 'string' && b.content.length > TRIM_KEEP_CHARS + note.length) {
+          b.content = b.content.slice(0, TRIM_KEEP_CHARS) + note
+        }
+      }
+    }
+  }
+}
+
 class OpenAIAdapter implements Adapter {
   model: string
   private baseUrl: string
   private key: string
   private tools: unknown[]
+  private maxTokens: number
 
-  constructor(model: string, baseUrl: string | undefined, key: string) {
+  constructor(model: string, baseUrl: string | undefined, key: string, maxTokens = 8192) {
     this.model = model || 'gpt-5'
     this.baseUrl = (baseUrl || 'https://api.openai.com/v1').replace(/\/$/, '')
     this.key = key || 'no-key'
+    this.maxTokens = maxTokens
     this.tools = TOOL_SPECS.map((s) => ({
       type: 'function',
       function: { name: s.name, description: s.description, parameters: s.input_schema },
@@ -563,7 +608,7 @@ class OpenAIAdapter implements Adapter {
       messages: [{ role: 'system', content: system }, ...messages],
       tools: this.tools,
       tool_choice: 'auto',
-      max_tokens: 8192,
+      max_tokens: this.maxTokens,
     }
     const resp = await fetch(`${this.baseUrl}/chat/completions`, {
       method: 'POST',
@@ -614,16 +659,23 @@ class AnthropicAdapter implements Adapter {
   private baseUrl: string
   private key: string
   private tools: unknown[]
+  private maxTokens: number
 
-  constructor(model: string, key: string, baseUrl?: string) {
+  constructor(model: string, key: string, baseUrl?: string, maxTokens = 8192) {
     this.model = model || 'claude-sonnet-4-6'
     this.baseUrl = (baseUrl || 'https://api.anthropic.com').replace(/\/$/, '')
     this.key = key
+    this.maxTokens = maxTokens
     this.tools = TOOL_SPECS.map((s) => ({
       name: s.name,
       description: s.description,
       input_schema: s.input_schema,
     }))
+    // Prompt caching: a breakpoint after the (static) tool specs caches them
+    // across every turn of the loop instead of re-billing at full price.
+    if (this.tools.length > 0) {
+      (this.tools[this.tools.length - 1] as Record<string, unknown>).cache_control = { type: 'ephemeral' }
+    }
   }
 
   async chat(messages: unknown[], system: string): Promise<ChatResult> {
@@ -636,8 +688,9 @@ class AnthropicAdapter implements Adapter {
       },
       body: JSON.stringify({
         model: this.model,
-        max_tokens: 8192,
-        system,
+        max_tokens: this.maxTokens,
+        // System block carries its own cache breakpoint (static across turns).
+        system: [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }],
         tools: this.tools,
         messages,
       }),
@@ -681,7 +734,7 @@ class AnthropicAdapter implements Adapter {
 
 // ── config / provider resolution ─────────────────────────────────
 
-interface ProviderCfg { kind?: string; base_url?: string; models?: string[]; price_in?: number; price_out?: number; context_window?: number; context_windows?: Record<string, number> }
+interface ProviderCfg { kind?: string; base_url?: string; models?: string[]; price_in?: number; price_out?: number; context_window?: number; context_windows?: Record<string, number>; max_output?: number }
 interface AgentCfg { provider?: string; model?: string }
 interface Config { providers?: Record<string, ProviderCfg>; agents?: Record<string, AgentCfg> }
 
@@ -693,9 +746,10 @@ function apiKeyFor(providerId: string): string {
 function buildAdapter(providerCfg: ProviderCfg, providerId: string, model: string): Adapter {
   const kind = providerCfg.kind || 'openai-compatible'
   const key = apiKeyFor(providerId)
-  if (kind === 'anthropic') return new AnthropicAdapter(model, key, providerCfg.base_url)
+  const maxTokens = providerCfg.max_output && providerCfg.max_output > 0 ? providerCfg.max_output : 8192
+  if (kind === 'anthropic') return new AnthropicAdapter(model, key, providerCfg.base_url, maxTokens)
   if (kind === 'openai' || kind === 'openai-compatible') {
-    return new OpenAIAdapter(model, providerCfg.base_url, key)
+    return new OpenAIAdapter(model, providerCfg.base_url, key, maxTokens)
   }
   throw new Error(`agent-runtime does not handle provider kind: ${kind}`)
 }
@@ -749,7 +803,7 @@ async function handleMessage(
       const fn = TOOLS[call.name]
       if (!fn) { results.push(`error: unknown tool ${call.name}`); continue }
       try {
-        results.push(fn(call.args))
+        results.push(capResult(fn(call.args)))
       } catch (e: any) {
         results.push(`error: ${e?.constructor?.name || 'Error'}: ${e?.message || e}`)
       }
@@ -757,6 +811,9 @@ async function handleMessage(
     }
     messages.push(assistantMsg)
     for (const m of adapter.toolResultsMessages(toolCalls, results)) messages.push(m)
+    // Shrink tool results the model has already acted on — full history is
+    // re-sent every turn, up to MAX_TURNS times.
+    trimOldToolResults(messages, 8)
   }
 
   db.markProcessed(msgRow.id, nowStamp())
@@ -971,7 +1028,7 @@ async function runGroupSession(args: Args): Promise<void> {
       const fn = TOOLS[call.name]
       if (!fn) { results.push(`error: unknown tool ${call.name}`); continue }
       try {
-        results.push(fn(call.args))
+        results.push(capResult(fn(call.args)))
       } catch (e: any) {
         results.push(`error: ${e?.constructor?.name || 'Error'}: ${e?.message || e}`)
       }
@@ -979,6 +1036,9 @@ async function runGroupSession(args: Args): Promise<void> {
     }
     messages.push(assistantMsg)
     for (const m of adapter.toolResultsMessages(toolCalls, results)) messages.push(m)
+    // Shrink tool results the model has already acted on — full history is
+    // re-sent every turn, up to MAX_TURNS times.
+    trimOldToolResults(messages, 8)
 
     if (GROUP_SIGNAL) break
   }

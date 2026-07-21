@@ -223,8 +223,10 @@ async function handleVibe(i: ChatInputCommandInteraction) {
   const timer = setInterval(async () => {
     const g = db.getGroup(groupId)
     if (!g) { clearInterval(timer); return }
-    const spent = db.recomputeGroupSpend(groupId)
     const terminal = g.status === 'passed' || g.status === 'failed' || g.status === 'killed'
+    // The coordinator keeps spent_usd fresh for live groups — recomputing the
+    // unindexed usage scan (plus a DB write) every 3s here was redundant.
+    const spent = terminal ? db.recomputeGroupSpend(groupId) : (g.spent_usd ?? 0)
     const changed = g.status !== lastStatus || Math.abs(spent - lastSpent) > 0.001
     if (terminal) {
       clearInterval(timer)
@@ -560,6 +562,51 @@ function coreSpecs(allowBash: boolean, orchEnabled: boolean): ToolSpec[] {
   return specs
 }
 
+// ── Session-history hygiene ─────────────────────────────────────
+// Discord /agent sessions used to grow without bound and re-send the FULL
+// history to the model on every turn until a manual /compact.
+
+const TRIM_KEEP_CHARS = 600
+
+// Shrink tool results the model already acted on (deterministic — the
+// trimmed prefix stays byte-stable for provider prompt caches).
+function trimOldToolResults(messages: unknown[], keepTail: number): void {
+  const note = ' …[old tool output trimmed to save context]'
+  const end = Math.max(0, messages.length - keepTail)
+  for (let i = 0; i < end; i++) {
+    const m = messages[i] as any
+    if (!m) continue
+    if (m.role === 'tool' && typeof m.content === 'string' && m.content.length > TRIM_KEEP_CHARS + note.length) {
+      m.content = m.content.slice(0, TRIM_KEEP_CHARS) + note
+    } else if (m.role === 'user' && Array.isArray(m.content)) {
+      for (const b of m.content) {
+        if (b && b.type === 'tool_result' && typeof b.content === 'string' && b.content.length > TRIM_KEEP_CHARS + note.length) {
+          b.content = b.content.slice(0, TRIM_KEEP_CHARS) + note
+        }
+      }
+    }
+  }
+}
+
+// Drop the oldest turns wholesale once the transcript is huge. Cuts only at a
+// plain-text user message so no tool_result is orphaned from its tool call
+// (both OpenAI and Anthropic reject that).
+function dropOldTurns(messages: any[], keep: number): void {
+  if (messages.length <= keep) return
+  let cut = messages.length - keep
+  while (cut < messages.length) {
+    const m = messages[cut]
+    if (m && m.role === 'user' && typeof m.content === 'string') break
+    cut++
+  }
+  if (cut <= 0 || cut >= messages.length) return
+  messages.splice(0, cut)
+  messages[0] = {
+    ...messages[0],
+    content: '[Earlier conversation was trimmed to fit the context window — use /compact for a summary.]\n' + messages[0].content,
+  }
+}
+
 // Sensitive-action approval: runExtraTool calls confirm() for gated tools; we
 // post Approve/Decline buttons and resolve via the button interaction.
 const pendingActions = new Map<string, (approved: boolean) => void>()
@@ -569,20 +616,35 @@ type DiffRow = { kind: 'context' | 'add' | 'del'; text: string }
 function computeLineDiff(before: string, after: string): DiffRow[] {
   const a = before === '' ? [] : before.replace(/\n$/, '').split('\n')
   const b = after === '' ? [] : after.replace(/\n$/, '').split('\n')
-  const n = a.length, m = b.length
-  const lcs: number[][] = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0))
-  for (let i = n - 1; i >= 0; i--) for (let j = m - 1; j >= 0; j--) {
-    lcs[i][j] = a[i] === b[j] ? lcs[i + 1][j + 1] + 1 : Math.max(lcs[i + 1][j], lcs[i][j + 1])
+  // Trim the common prefix/suffix so the O(n·m) table only covers the edit.
+  let pre = 0
+  while (pre < a.length && pre < b.length && a[pre] === b[pre]) pre++
+  let suf = 0
+  while (suf < a.length - pre && suf < b.length - pre && a[a.length - 1 - suf] === b[b.length - 1 - suf]) suf++
+  const am = a.slice(pre, a.length - suf)
+  const bm = b.slice(pre, b.length - suf)
+  const n = am.length, m = bm.length
+  const rows: DiffRow[] = a.slice(0, pre).map((t) => ({ kind: 'context' as const, text: t }))
+  if (n > 0 && m > 0 && n * m > 4_000_000) {
+    // Too big for an exact LCS (the rendered diff is capped at 1700 chars
+    // anyway) — report the changed middle wholesale, bounded time and memory.
+    for (const t of am) rows.push({ kind: 'del', text: t })
+    for (const t of bm) rows.push({ kind: 'add', text: t })
+  } else {
+    const lcs: number[][] = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0))
+    for (let i = n - 1; i >= 0; i--) for (let j = m - 1; j >= 0; j--) {
+      lcs[i][j] = am[i] === bm[j] ? lcs[i + 1][j + 1] + 1 : Math.max(lcs[i + 1][j], lcs[i][j + 1])
+    }
+    let i = 0, j = 0
+    while (i < n && j < m) {
+      if (am[i] === bm[j]) { rows.push({ kind: 'context', text: am[i] }); i++; j++ }
+      else if (lcs[i + 1][j] >= lcs[i][j + 1]) { rows.push({ kind: 'del', text: am[i] }); i++ }
+      else { rows.push({ kind: 'add', text: bm[j] }); j++ }
+    }
+    while (i < n) { rows.push({ kind: 'del', text: am[i] }); i++ }
+    while (j < m) { rows.push({ kind: 'add', text: bm[j] }); j++ }
   }
-  const rows: DiffRow[] = []
-  let i = 0, j = 0
-  while (i < n && j < m) {
-    if (a[i] === b[j]) { rows.push({ kind: 'context', text: a[i] }); i++; j++ }
-    else if (lcs[i + 1][j] >= lcs[i][j + 1]) { rows.push({ kind: 'del', text: a[i] }); i++ }
-    else { rows.push({ kind: 'add', text: b[j] }); j++ }
-  }
-  while (i < n) { rows.push({ kind: 'del', text: a[i] }); i++ }
-  while (j < m) { rows.push({ kind: 'add', text: b[j] }); j++ }
+  for (let k = 0; k < suf; k++) rows.push({ kind: 'context', text: a[a.length - suf + k] })
   return rows
 }
 
@@ -843,6 +905,10 @@ async function runAgentTurn(post: Post, session: AgentSession, userText: string,
     }
     session.messages.push(assistantMsg)
     for (const m of adapter.toolResultsMessages(toolCalls, results)) session.messages.push(m)
+    // Keep the transcript bounded: shrink old tool results every turn, and
+    // past ~120 messages drop the oldest turns wholesale (at a safe boundary).
+    trimOldToolResults(session.messages, 8)
+    if (session.messages.length > 120) dropOldTurns(session.messages, 80)
   }
   await send('⏱️ Đã đạt giới hạn số bước cho lượt này.')
 }

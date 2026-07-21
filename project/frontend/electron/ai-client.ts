@@ -120,6 +120,15 @@ export async function streamInlineEdit(
 // Reuses the same providers/keys as inline edit, but keeps full conversation
 // history and injects the open file(s) as context.
 
+// Context caps: per-file, file count, and total — an uncapped attachment list
+// re-bills the whole bundle on every message of the conversation.
+const CTX_FILE_CHARS = 12_000
+const CTX_MAX_FILES = 5
+const CTX_TOTAL_CHARS = 48_000
+// Newest-first history budget (~25k tokens) — ask-mode threads previously
+// resent every turn ever typed, unbounded.
+const CHAT_HISTORY_CHAR_BUDGET = 100_000
+
 function buildChatSystem(params: ChatParams): string {
   let system =
     'You are an expert AI coding assistant embedded in an IDE. ' +
@@ -129,9 +138,11 @@ function buildChatSystem(params: ChatParams): string {
 
   if (params.contextFiles && params.contextFiles.length > 0) {
     system += '\n\nThe user is working in these files:\n'
-    for (const f of params.contextFiles) {
-      // Cap each file so a huge file cannot blow the context / cost budget.
-      const body = f.content.length > 12000 ? f.content.slice(0, 12000) + '\n… (truncated)' : f.content
+    let total = 0
+    for (const f of params.contextFiles.slice(0, CTX_MAX_FILES)) {
+      const body = f.content.length > CTX_FILE_CHARS ? f.content.slice(0, CTX_FILE_CHARS) + '\n… (truncated)' : f.content
+      if (total + body.length > CTX_TOTAL_CHARS) break
+      total += body.length
       system += `\n--- ${f.path} ---\n\`\`\`${f.language ?? ''}\n${body}\n\`\`\`\n`
     }
   }
@@ -139,6 +150,19 @@ function buildChatSystem(params: ChatParams): string {
     system += `\n\nThe user has selected this snippet:\n\`\`\`\n${params.selection.slice(0, 4000)}\n\`\`\`\n`
   }
   return system
+}
+
+// Keep the NEWEST messages that fit the budget, starting on a user turn
+// (Anthropic requires the first message to be from the user).
+function trimChatHistory(messages: ChatMessage[]): ChatMessage[] {
+  let total = 0
+  let start = 0
+  for (let i = messages.length - 1; i >= 0; i--) {
+    total += messages[i].content.length
+    if (total > CHAT_HISTORY_CHAR_BUDGET) { start = i + 1; break }
+  }
+  while (start > 0 && start < messages.length && messages[start].role !== 'user') start++
+  return start > 0 ? messages.slice(start) : messages
 }
 
 // Stream a chat completion. onChunk receives incremental text; resolves with
@@ -157,11 +181,12 @@ export async function streamChat(
   const model = params.model || pc.models?.[0] || ''
   if (!model) throw new Error(`no model for provider ${params.provider}`)
   const system = buildChatSystem(params)
+  const history = trimChatHistory(params.messages)
 
   if (pc.kind === 'anthropic') {
-    return streamAnthropicChat(pc, model, key, system, params.messages, onChunk, signal)
+    return streamAnthropicChat(pc, model, key, system, history, onChunk, signal)
   }
-  return streamOpenAIChat(pc, model, key, system, params.messages, onChunk, signal)
+  return streamOpenAIChat(pc, model, key, system, history, onChunk, signal)
 }
 
 async function streamOpenAI(
@@ -312,7 +337,9 @@ async function streamAnthropicChat(
     body: JSON.stringify({
       model,
       max_tokens: 8192,
-      system,
+      // Cache breakpoint: the system prompt carries the (re-sent) file
+      // context — cache-read it instead of full-price input every message.
+      system: [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }],
       messages,
       stream: true,
     }),
