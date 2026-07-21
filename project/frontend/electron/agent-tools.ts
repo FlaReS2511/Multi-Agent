@@ -12,7 +12,17 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { exec, execFile } from 'node:child_process'
-import ExcelJS from 'exceljs'
+
+// exceljs costs ~150ms of require() — paid on first Excel tool use instead of
+// at app boot (this module loads with the main process).
+let excelMod: any = null
+async function excel(): Promise<any> {
+  if (!excelMod) {
+    const m: any = await import('exceljs')
+    excelMod = m.default ?? m
+  }
+  return excelMod
+}
 
 const BASH_TIMEOUT_MS = 120_000
 const DIAG_TIMEOUT_MS = 180_000
@@ -710,6 +720,7 @@ function normArgb(c: string): string {
   return h.length === 6 ? 'FF' + h : h
 }
 async function loadWorkbook(p: string, allowNew: boolean): Promise<any> {
+  const ExcelJS = await excel()
   const wb = new ExcelJS.Workbook()
   if (fs.existsSync(p)) await wb.xlsx.readFile(p)
   else if (!allowNew) throw new Error(`file not found: ${p}`)
@@ -746,6 +757,7 @@ async function toolExcelRead(cwd: string, a: { path: string; sheet?: string; ran
 async function toolExcelWrite(cwd: string, a: { path: string; sheets: { name?: string; rows: unknown[][] }[] }): Promise<string> {
   const p = resolveInside(cwd, a.path)
   fs.mkdirSync(path.dirname(p), { recursive: true })
+  const ExcelJS = await excel()
   const wb = new ExcelJS.Workbook()
   const sheets = a.sheets || []
   sheets.forEach((s, i) => {

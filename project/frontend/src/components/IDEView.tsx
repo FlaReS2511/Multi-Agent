@@ -1,5 +1,6 @@
-import React, { useEffect, useState, useCallback, useRef, useMemo } from 'react'
+import React, { useEffect, useState, useCallback, useRef, useMemo, lazy, Suspense } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
+import '../lib/monacoSetup' // local Monaco + workers (no CDN) — before <Editor>
 import Editor, { DiffEditor } from '@monaco-editor/react'
 import {
   FolderTree,
@@ -30,12 +31,8 @@ import { AgentTerminal } from './AgentTerminal'
 import { ShellTerminal } from './ShellTerminal'
 import { InlineAIPrompt } from './InlineAIPrompt'
 import { InlineAICard } from './InlineAICard'
-import { SearchPanel } from './SearchPanel'
-import { GitPanel } from './GitPanel'
 import { CommandPalette, Command } from './CommandPalette'
 import { ChatPanel } from './ChatPanel'
-import { GroupsPanel } from './GroupsPanel'
-import { AgentsLivePanel } from './AgentsLivePanel'
 import { DiffReviewCard } from './DiffReviewCard'
 import { ConfirmDialog, ConfirmDialogSpec } from './ConfirmDialog'
 import { StatusBar } from './StatusBar'
@@ -45,6 +42,14 @@ import { toast } from '../lib/toast'
 import { computeLineDiff } from '../lib/lineDiff'
 import { useInlineAIEdit } from './useInlineAIEdit'
 import { activeAgents, AgentsConfig, colorFor, ModelOption, isResidentRole, PendingChange } from '../lib/api'
+
+// Sidebar panels that aren't part of the first paint load as their own
+// chunks — the explorer is the default view; git/search/groups/agents come
+// in on demand.
+const SearchPanel = lazy(() => import('./SearchPanel').then((m) => ({ default: m.SearchPanel })))
+const GitPanel = lazy(() => import('./GitPanel').then((m) => ({ default: m.GitPanel })))
+const GroupsPanel = lazy(() => import('./GroupsPanel').then((m) => ({ default: m.GroupsPanel })))
+const AgentsLivePanel = lazy(() => import('./AgentsLivePanel').then((m) => ({ default: m.AgentsLivePanel })))
 
 // Sentinel tab id for the embedded agent browser (not a file on disk).
 const BROWSER_TAB = 'orqon://browser'
@@ -1418,6 +1423,7 @@ export function IDEView() {
             animate={animationsOn ? 'show' : false}
             className={`flex-1 overflow-y-auto scrollbar-thin ${activeSidebar === 'search' || activeSidebar === 'git' ? '' : 'p-2'}`}
           >
+            <Suspense fallback={null}>
             {activeSidebar === 'explorer' && (
               <IDEFileTree
                 files={files}
@@ -1490,6 +1496,7 @@ export function IDEView() {
             {activeSidebar === 'groups' && (
               <GroupsPanel windup={animationsOn} />
             )}
+            </Suspense>
           </motion.div>
             </motion.div>
           </motion.aside>

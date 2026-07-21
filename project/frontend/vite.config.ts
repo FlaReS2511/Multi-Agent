@@ -29,36 +29,15 @@ export default defineConfig({
       },
       renderer: {},
     }),
-    // Second Electron build: the agent runtime. It's a standalone Node entry
-    // (spawned as a child process by the main process), not part of the app
-    // window. Built to dist-electron/agent-runtime.js.
+    // Second Electron build: the CHILD-PROCESS entries (agent runtime +
+    // Discord bot) share one build — they used to be two separate plugin
+    // instances, each re-bundling the shared electron/*.ts modules.
     electron({
       main: {
-        entry: 'electron/agent-runtime.ts',
+        entry: ['electron/agent-runtime.ts', 'electron/discord-bot.ts'],
         onstart() {
-          // Do NOT auto-start Electron for this entry — it's a child process
-          // launched on demand by main.ts, not the app itself.
-        },
-        vite: {
-          build: {
-            outDir: 'dist-electron',
-            emptyOutDir: false,
-            rollupOptions: {
-              external: nativeExternal,
-              output: { entryFileNames: 'agent-runtime.js' },
-            },
-          },
-        },
-      },
-    }),
-    // Third Electron build: the Discord bot. Like agent-runtime, it's a
-    // standalone Node entry spawned as a child process by main.ts (only when
-    // discord.enabled=true). Built to dist-electron/discord-bot.js.
-    electron({
-      main: {
-        entry: 'electron/discord-bot.ts',
-        onstart() {
-          // Do NOT auto-start Electron for this entry — main.ts spawns it.
+          // Do NOT auto-start Electron for these — main.ts spawns them as
+          // child processes on demand.
         },
         vite: {
           build: {
@@ -66,13 +45,28 @@ export default defineConfig({
             emptyOutDir: false,
             rollupOptions: {
               external: botExternal,
-              output: { entryFileNames: 'discord-bot.js' },
+              output: { entryFileNames: '[name].js' },
             },
           },
         },
       },
     }),
   ],
+  build: {
+    rollupOptions: {
+      output: {
+        // Keep the heavyweights out of the entry chunk. Monaco/xterm still
+        // load from local disk (Electron loadFile — no network), but the
+        // entry parses sooner and lazy panels only pull what they need.
+        manualChunks(id: string) {
+          if (id.includes('monaco-editor')) return 'monaco'
+          if (id.includes('@xterm')) return 'xterm'
+          if (id.includes('react-markdown') || id.includes('remark') || id.includes('mdast') || id.includes('micromark') || id.includes('unified')) return 'markdown'
+          if (id.includes('framer-motion')) return 'motion'
+        },
+      },
+    },
+  },
   server: {
     port: 5173,
   },

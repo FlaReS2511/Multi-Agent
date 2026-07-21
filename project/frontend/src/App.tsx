@@ -1,12 +1,17 @@
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useState, useCallback, lazy, Suspense } from 'react'
 import { X, Minus, Square, Copy } from 'lucide-react'
-import { BackendSettingsModal } from './components/BackendSettingsModal'
 import { CostBadge } from './components/CostBadge'
-import { CostDashboardModal } from './components/CostDashboardModal'
 import { IDEView } from './components/IDEView'
 import { OrqonLogo } from './components/OrqonLogo'
 import { ToastHost } from './components/ToastHost'
 import { AgentsConfig } from './lib/api'
+
+// Modals load as their own chunks the first time they open — neither is part
+// of the first paint (BackendSettingsModal alone is ~1000 lines of source).
+const BackendSettingsModal = lazy(() =>
+  import('./components/BackendSettingsModal').then((m) => ({ default: m.BackendSettingsModal })))
+const CostDashboardModal = lazy(() =>
+  import('./components/CostDashboardModal').then((m) => ({ default: m.CostDashboardModal })))
 
 // IDE-first shell: the IDE is the whole surface. The old multi-agent task
 // board / plan / artifacts UI has been removed — the chat agent now spawns and
@@ -57,14 +62,20 @@ export default function App() {
         </div>
       </div>
 
-      <BackendSettingsModal
-        open={showBackendSettings}
-        onClose={() => { setShowBackendSettings(false); refreshConfig() }}
-      />
-      <CostDashboardModal
-        open={showCostDashboard}
-        onClose={() => setShowCostDashboard(false)}
-      />
+      <Suspense fallback={null}>
+        {showBackendSettings && (
+          <BackendSettingsModal
+            open={showBackendSettings}
+            onClose={() => { setShowBackendSettings(false); refreshConfig() }}
+          />
+        )}
+        {showCostDashboard && (
+          <CostDashboardModal
+            open={showCostDashboard}
+            onClose={() => setShowCostDashboard(false)}
+          />
+        )}
+      </Suspense>
       <ToastHost />
     </div>
   )
