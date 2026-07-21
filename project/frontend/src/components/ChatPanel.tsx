@@ -5,7 +5,7 @@
 // the currently open file (+ selection) as context so the model can reason
 // about the code the user is looking at.
 
-import { useEffect, useRef, useState, ReactNode } from 'react'
+import { memo, useEffect, useRef, useState, ReactNode } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
@@ -263,7 +263,11 @@ const itemVariants = {
   show: { opacity: 1, y: 0, transition: { duration: 0.28, ease: 'easeOut' } },
 }
 
-export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, onChangeResolved, onEditorRequest, windup = true, visible = true, onRunStateChange, onContextUsage, onRunFinished, files = [], workspaceRoot = '', onSubAgentStarted }: Props) {
+// Memoized: the host keeps every prop referentially stable, so IDE-side state
+// changes (typing, git polls, caret moves) no longer re-render the chat tree.
+export const ChatPanel = memo(ChatPanelImpl)
+
+function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onChangeResolved, onEditorRequest, windup = true, visible = true, onRunStateChange, onContextUsage, onRunFinished, files = [], workspaceRoot = '', onSubAgentStarted }: Props) {
   const { chatFontSize } = useUiSettings()
   const [mode, setMode] = useState<'ask' | 'agent'>('ask')
   // Plan mode is a toggle WITHIN agent mode (via /plan): runs read-only and

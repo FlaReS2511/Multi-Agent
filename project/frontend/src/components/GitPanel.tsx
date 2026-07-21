@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import React, { useState, useCallback } from 'react'
 import {
   GitBranch,
   GitCommit,
@@ -19,6 +19,10 @@ interface StatusEntry {
 }
 
 interface Props {
+  /** Git status + branch come from the HOST's single 2s poll — this panel
+      used to run its own duplicate 3s polling loop (3 more git spawns/3s). */
+  status: StatusEntry[]
+  branch: { current: string; branches: string[] }
   onOpenFile: (file: string) => void
   onChanged?: () => void
   /** Discard a file's working-tree changes (confirmed by the host). */
@@ -49,12 +53,7 @@ function truncate(s: string, n = 200): string {
   return s.slice(0, n) + '…'
 }
 
-export function GitPanel({ onOpenFile, onChanged, onDiscard }: Props) {
-  const [status, setStatus] = useState<StatusEntry[]>([])
-  const [branch, setBranch] = useState<{ current: string; branches: string[] }>({
-    current: '',
-    branches: [],
-  })
+export const GitPanel = React.memo(function GitPanel({ status, branch, onOpenFile, onChanged, onDiscard }: Props) {
   const [branchOpen, setBranchOpen] = useState(false)
   const [newBranchMode, setNewBranchMode] = useState(false)
   const [newBranchName, setNewBranchName] = useState('')
@@ -64,25 +63,11 @@ export function GitPanel({ onOpenFile, onChanged, onDiscard }: Props) {
   const [pushing, setPushing] = useState(false)
   const [opStatus, setOpStatus] = useState<string | null>(null)
 
-  const reload = useCallback(async () => {
-    const [s, b] = await Promise.all([
-      window.api.workspaceGitStatus(),
-      window.api.workspaceGitBranch(),
-    ])
-    setStatus(s)
-    setBranch(b)
-  }, [])
-
-  useEffect(() => {
-    reload()
-    const id = setInterval(reload, 3000)
-    return () => clearInterval(id)
-  }, [reload])
-
+  // After a mutation the host re-fetches status/branch and the new props
+  // arrive on the next render.
   const afterMutation = useCallback(async () => {
-    await reload()
     onChanged?.()
-  }, [reload, onChanged])
+  }, [onChanged])
 
   const staged = status.filter((s) => s.staged === true)
   const unstaged = status.filter((s) => s.staged !== true)
@@ -352,4 +337,4 @@ export function GitPanel({ onOpenFile, onChanged, onDiscard }: Props) {
       </div>
     </div>
   )
-}
+})
