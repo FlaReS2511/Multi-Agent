@@ -499,15 +499,26 @@ function deriveAvailableModels(config: FullConfig): { provider: string; id: stri
   return out
 }
 
+// mtime-cached: the coordinator tick (1s) and the inbox watcher (1.5s) both
+// read the config forever — re-parse only when the file actually changed.
+// External edits are still picked up (the mtime check is a cheap stat).
+let configCache: { mtime: number; value: FullConfig } | null = null
+
 async function readConfig(): Promise<FullConfig> {
+  const file = path.join(SHARED, 'agents-config.json')
   try {
-    return JSON.parse(await fs.readFile(path.join(SHARED, 'agents-config.json'), 'utf-8'))
+    const st = await fs.stat(file)
+    if (configCache && configCache.mtime === st.mtimeMs) return configCache.value
+    const value = JSON.parse(await fs.readFile(file, 'utf-8')) as FullConfig
+    configCache = { mtime: st.mtimeMs, value }
+    return value
   } catch {
     return { agents: {}, providers: {} }
   }
 }
 
 async function writeConfig(config: FullConfig) {
+  configCache = null // next read re-parses (mtime granularity can be coarse)
   await fs.writeFile(path.join(SHARED, 'agents-config.json'), JSON.stringify(config, null, 2) + '\n')
 }
 
@@ -1282,11 +1293,13 @@ async function watchInboxes() {
     } catch {
       return
     }
-    // Include any role that already has unread messages even if not in config
-    // (e.g. clones), via the DB's recipient list.
-    const allRoles = new Set<string>([...roles, ...db.distinctRecipients()])
+    // ONE grouped query per tick (was a DISTINCT scan + a count per role).
+    // Roles with unread messages but absent from config (e.g. clones) appear
+    // in the grouped result, so they're still covered.
+    const counts = db.unreadCountsByRole()
+    const allRoles = new Set<string>([...roles, ...counts.keys()])
     for (const agent of allRoles) {
-      const count = db.unreadCount(agent)
+      const count = counts.get(agent) ?? 0
       const prev = unreadBaseline.get(agent) ?? 0
       unreadBaseline.set(agent, count)
       if (count > prev) {
@@ -1450,6 +1463,7 @@ ipcMain.handle('workspace-read-file', async (_evt, relPath: string) => {
 })
 
 ipcMain.handle('workspace-write-file', async (_evt, relPath: string, content: string) => {
+  bustGitCache()
   const absPath = resolveInWorkspace(relPath)
   if (!absPath) return { ok: false, error: 'Access denied: path is outside workspace root' }
   try {
@@ -1590,7 +1604,23 @@ function gitExec(args: string[]): Promise<{ ok: boolean; stdout: string; stderr:
   })
 }
 
-ipcMain.handle('workspace-git-status', async () => {
+// Short-TTL memo for the read-only git polls: multiple renderer consumers
+// poll status/branch every couple of seconds — they now share one spawn.
+// Mutating git handlers call bustGitCache() so the next read is fresh.
+const gitReadCache = new Map<string, { at: number; promise: Promise<unknown> }>()
+const GIT_CACHE_TTL_MS = 1200
+function gitCached<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const hit = gitReadCache.get(key)
+  if (hit && Date.now() - hit.at < GIT_CACHE_TTL_MS) return hit.promise as Promise<T>
+  const promise = fn()
+  gitReadCache.set(key, { at: Date.now(), promise })
+  return promise
+}
+function bustGitCache(): void {
+  gitReadCache.clear()
+}
+
+ipcMain.handle('workspace-git-status', async () => gitCached('status', async () => {
   const { ok, stdout } = await gitExec(['status', '--porcelain'])
   if (!ok) return []
   const lines = stdout.trim().split('\n').filter(Boolean)
@@ -1599,7 +1629,7 @@ ipcMain.handle('workspace-git-status', async () => {
     const file = line.slice(3).trim().replace(/^"|"$/g, '')
     return { file, type, staged: line[0] !== ' ' && line[0] !== '?' }
   })
-})
+}))
 
 ipcMain.handle('workspace-git-show-head', async (_evt, relPath: string) => {
   const gitPath = relPath.replace(/\\/g, '/')
@@ -1607,48 +1637,55 @@ ipcMain.handle('workspace-git-show-head', async (_evt, relPath: string) => {
   return { ok: true, content: ok ? stdout : '' }
 })
 
-ipcMain.handle('workspace-git-branch', async () => {
+ipcMain.handle('workspace-git-branch', async () => gitCached('branch', async () => {
   const cur = await gitExec(['rev-parse', '--abbrev-ref', 'HEAD'])
   const all = await gitExec(['branch', '--format=%(refname:short)'])
   return {
     current: cur.ok ? cur.stdout.trim() : '',
     branches: all.ok ? all.stdout.split('\n').map((s) => s.trim()).filter(Boolean) : [],
   }
-})
+}))
 
 ipcMain.handle('workspace-git-stage', async (_evt, file: string) => {
+  bustGitCache()
   const { ok, stderr } = await gitExec(['add', '--', file])
   return { ok, error: ok ? undefined : stderr }
 })
 
 ipcMain.handle('workspace-git-unstage', async (_evt, file: string) => {
+  bustGitCache()
   const { ok, stderr } = await gitExec(['restore', '--staged', '--', file])
   return { ok, error: ok ? undefined : stderr }
 })
 
 ipcMain.handle('workspace-git-stage-all', async () => {
+  bustGitCache()
   const { ok, stderr } = await gitExec(['add', '-A'])
   return { ok, error: ok ? undefined : stderr }
 })
 
 ipcMain.handle('workspace-git-commit', async (_evt, message: string) => {
+  bustGitCache()
   if (!message?.trim()) return { ok: false, error: 'commit message required' }
   const { ok, stdout, stderr } = await gitExec(['commit', '-m', message])
   return { ok, output: stdout, error: ok ? undefined : (stderr || stdout) }
 })
 
 ipcMain.handle('workspace-git-checkout', async (_evt, branch: string, create?: boolean) => {
+  bustGitCache()
   const args = create ? ['checkout', '-b', branch] : ['checkout', branch]
   const { ok, stderr } = await gitExec(args)
   return { ok, error: ok ? undefined : stderr }
 })
 
 ipcMain.handle('workspace-git-push', async () => {
+  bustGitCache()
   const { ok, stdout, stderr } = await gitExec(['push'])
   return { ok, output: stdout + stderr }
 })
 
 ipcMain.handle('workspace-git-pull', async () => {
+  bustGitCache()
   const { ok, stdout, stderr } = await gitExec(['pull'])
   return { ok, output: stdout + stderr }
 })
@@ -1664,6 +1701,7 @@ ipcMain.handle('workspace-git-dirty-count', async () => {
 // are checked out from HEAD; files the agent newly created (untracked) are
 // deleted. Paths are workspace-relative and validated to stay inside the root.
 ipcMain.handle('workspace-git-restore-files', async (_evt, files: string[]) => {
+  bustGitCache()
   if (!workspaceRoot) return { ok: false, error: 'no workspace open' }
   const restored: string[] = []
   const removed: string[] = []
