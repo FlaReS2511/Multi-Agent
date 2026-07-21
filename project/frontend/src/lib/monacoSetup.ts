@@ -27,3 +27,7 @@ self.MonacoEnvironment = {
 }
 
 loader.config({ monaco })
+
+// Debug handle (harmless in prod): inspect models/editors from the devtools
+// console — the ESM build sets no global otherwise.
+;(self as unknown as Record<string, unknown>).__monaco = monaco

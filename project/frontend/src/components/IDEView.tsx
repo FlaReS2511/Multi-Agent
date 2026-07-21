@@ -1669,6 +1669,11 @@ export function IDEView() {
                     modified={contentsRef.current.get(activeTab) || ''}
                     theme="vscode-dark-harmony"
                     options={{
+                      // Monaco sizes itself via its own ResizeObserver. The
+                      // locally-bundled loader initializes synchronously, so
+                      // without this the editor could be created inside a
+                      // still-zero-sized container and stay 5×5px.
+                      automaticLayout: true,
                       renderSideBySide,
                       originalEditable: false,
                       readOnly: false,
@@ -1696,6 +1701,9 @@ export function IDEView() {
                     onMount={handleEditorDidMount}
                     theme="vscode-dark-harmony"
                     options={{
+                      // See the DiffEditor note — required with the local
+                      // (synchronous) Monaco loader.
+                      automaticLayout: true,
                       fontSize: ui.editorFontSize,
                       lineHeight: 1.5,
                       fontFamily: 'ui-monospace, SF Mono, JetBrains Mono, Consolas, monospace',
