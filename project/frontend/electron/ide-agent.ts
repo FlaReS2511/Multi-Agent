@@ -960,7 +960,7 @@ export async function runIdeAgent(
           }
         } else {
           try {
-            const r = runFileTool(workspaceRoot, call.name, call.args)
+            const r = await runFileTool(workspaceRoot, call.name, call.args)
             result = r == null ? `error: unknown tool ${call.name}` : r
             if (r == null || r.startsWith('error:')) isError = true
           } catch (e: any) {

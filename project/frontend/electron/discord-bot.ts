@@ -825,7 +825,7 @@ async function runAgentTurn(post: Post, session: AgentSession, userText: string,
         result = await runOrchTool(call.name, args, orch, discord, modelFor, post)
       } else {
         try {
-          const r = runFileTool(ws, call.name, args)
+          const r = await runFileTool(ws, call.name, args)
           result = r == null ? `error: unknown tool ${call.name}` : r
         } catch (e) {
           result = `error: ${(e as Error).message}`
@@ -854,12 +854,12 @@ async function runTrackedMutation(
   session: AgentSession, changed: Set<string>, post: Post,
 ): Promise<string> {
   const readFile = (rel: string): string => { try { return fs.readFileSync(path.resolve(ws, rel), 'utf-8') } catch { return '' } }
-  const run = (): string => { try { return runFileTool(ws, name, args) ?? `error: unknown tool ${name}` } catch (e) { return `error: ${(e as Error).message}` } }
+  const run = async (): Promise<string> => { try { return (await runFileTool(ws, name, args)) ?? `error: unknown tool ${name}` } catch (e) { return `error: ${(e as Error).message}` } }
 
   if (name === 'MultiEdit') {
     const p = String(args.path || '')
     const before = readFile(p)
-    const result = run()
+    const result = await run()
     if (result.startsWith('error')) { await post.text(`⚠️ MultiEdit ${p}: ${result}`.slice(0, 1900)); return result }
     session.changed.add(p); changed.add(p)
     const { block, added, removed } = renderDiff(before, readFile(p))
@@ -868,7 +868,7 @@ async function runTrackedMutation(
   }
   if (name === 'Move') {
     const from = String(args.from || ''); const to = String(args.to || '')
-    const result = run()
+    const result = await run()
     if (result.startsWith('error')) { await post.text(`⚠️ Move ${from}→${to}: ${result}`.slice(0, 1900)); return result }
     session.changed.add(from); session.created.add(to); changed.add(to)
     await post.text(`🔀 **${from}** → **${to}**`.slice(0, 400))
@@ -876,7 +876,7 @@ async function runTrackedMutation(
   }
   // Delete
   const p = String(args.path || '')
-  const result = run()
+  const result = await run()
   if (result.startsWith('error')) { await post.text(`⚠️ Delete ${p}: ${result}`.slice(0, 1900)); return result }
   session.changed.add(p); changed.add(p) // git checkout HEAD restores it on /undo if tracked
   await post.text(`🗑️ Deleted **${p}**`.slice(0, 400))

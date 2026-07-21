@@ -11,12 +11,55 @@
 
 import fs from 'node:fs'
 import path from 'node:path'
-import { execSync, execFileSync } from 'node:child_process'
+import { exec, execFile } from 'node:child_process'
 import ExcelJS from 'exceljs'
 
 const BASH_TIMEOUT_MS = 120_000
 const DIAG_TIMEOUT_MS = 180_000
 const DOWNLOAD_MAX_BYTES = 26_214_400 // 25 MB cap for DownloadFile
+// Read refuses to return whole files bigger than this — the content goes
+// straight into the model's context, and it would also be re-sent every turn.
+const READ_WHOLE_FILE_MAX_BYTES = 2 * 1024 * 1024
+
+interface RunResult {
+  stdout: string
+  stderr: string
+  code: number
+  timedOut: boolean
+  spawnError?: string // 'ENOENT' etc — the binary itself failed to start
+}
+
+// Run a child process WITHOUT blocking the event loop. These tools execute in
+// the Electron main process — the previous execSync calls froze the entire app
+// (all IPC, PTYs, even the Stop button) for the duration of a build or test
+// run. `argv === null` runs `command` through the shell (Bash tool).
+function runChild(
+  command: string,
+  argv: string[] | null,
+  opts: { cwd?: string; timeout: number; shell?: boolean },
+): Promise<RunResult> {
+  return new Promise((resolve) => {
+    const common = {
+      cwd: opts.cwd,
+      timeout: opts.timeout,
+      killSignal: 'SIGTERM' as const,
+      encoding: 'utf-8' as const,
+      maxBuffer: 10 * 1024 * 1024,
+      windowsHide: true,
+    }
+    const cb = (err: any, stdout: string | Buffer, stderr: string | Buffer) => resolve({
+      stdout: String(stdout ?? ''),
+      stderr: String(stderr ?? ''),
+      code: err == null ? 0 : typeof err.code === 'number' ? err.code : 1,
+      timedOut: Boolean(err?.killed && err?.signal === 'SIGTERM'),
+      spawnError: typeof err?.code === 'string' ? err.code : undefined,
+    })
+    const child = argv === null
+      ? exec(command, { ...common, shell: process.platform === 'win32' ? 'powershell.exe' : '/bin/sh' }, cb)
+      : execFile(command, argv, { ...common, shell: opts.shell === true }, cb)
+    child.stdin?.end()
+  })
+}
 
 // Directories OUTSIDE the workspace the user has explicitly approved (via the
 // agent's Approve/Decline prompt). Grants last until the process exits.
@@ -50,6 +93,11 @@ function resolveInside(cwd: string, rel: string): string {
 
 export function toolRead(cwd: string, a: { path: string; limit?: number; offset?: number }): string {
   const p = resolveInside(cwd, a.path)
+  const size = fs.statSync(p).size
+  if (size > READ_WHOLE_FILE_MAX_BYTES && a.limit == null) {
+    return `error: ${a.path} is ${(size / 1048576).toFixed(1)}MB — too large to read whole. ` +
+      'Pass limit (and offset) to read a window, e.g. limit=2000.'
+  }
   const text = fs.readFileSync(p, 'utf-8')
   if (a.limit == null && !a.offset) return text
   let lines = text.split('\n')
@@ -138,36 +186,20 @@ export function applyChange(cwd: string, relPath: string, content: string): void
   fs.writeFileSync(p, content, 'utf-8')
 }
 
-export function toolBash(cwd: string, a: { command: string }): string {
-  try {
-    const out = execSync(a.command, {
-      cwd,
-      timeout: BASH_TIMEOUT_MS,
-      encoding: 'utf-8',
-      stdio: ['ignore', 'pipe', 'pipe'],
-      shell: process.platform === 'win32' ? 'powershell.exe' : '/bin/sh',
-      maxBuffer: 10 * 1024 * 1024,
-    })
-    return `exit 0\n${String(out).slice(-4000)}`
-  } catch (e: any) {
-    if (e?.killed && e?.signal === 'SIGTERM') return `error: command timed out after ${BASH_TIMEOUT_MS / 1000}s`
-    const out = `${e?.stdout ?? ''}${e?.stderr ?? ''}`
-    return `exit ${e?.status ?? 1}\n${out.slice(-4000)}`
-  }
+export async function toolBash(cwd: string, a: { command: string }): Promise<string> {
+  const r = await runChild(a.command, null, { cwd, timeout: BASH_TIMEOUT_MS })
+  if (r.timedOut) return `error: command timed out after ${BASH_TIMEOUT_MS / 1000}s`
+  if (r.code === 0) return `exit 0\n${r.stdout.slice(-4000)}`
+  return `exit ${r.code}\n${(r.stdout + r.stderr).slice(-4000)}`
 }
 
-export function toolGrep(cwd: string, a: { pattern: string; path?: string; glob?: string }): string {
+export async function toolGrep(cwd: string, a: { pattern: string; path?: string; glob?: string }): Promise<string> {
   const searchPath = a.path || '.'
-  try {
-    const cmd = ['rg', '--no-heading', '-n', JSON.stringify(a.pattern), JSON.stringify(searchPath)]
-    if (a.glob) cmd.push('--glob', JSON.stringify(a.glob))
-    const out = execSync(cmd.join(' '), { cwd, encoding: 'utf-8', timeout: 30_000, maxBuffer: 10 * 1024 * 1024 })
-    return (out || 'no matches').slice(0, 4000)
-  } catch (e: any) {
-    if (e?.code === 'ENOENT') return grepFallback(cwd, a.pattern, searchPath)
-    const out = String(e?.stdout ?? '')
-    return (out || 'no matches').slice(0, 4000)
-  }
+  const args = ['--no-heading', '-n', a.pattern, searchPath]
+  if (a.glob) args.push('--glob', a.glob)
+  const r = await runChild('rg', args, { cwd, timeout: 30_000 })
+  if (r.spawnError === 'ENOENT') return grepFallback(cwd, a.pattern, searchPath)
+  return (r.stdout || 'no matches').slice(0, 4000)
 }
 
 function grepFallback(cwd: string, pattern: string, searchPath: string): string {
@@ -178,7 +210,7 @@ function grepFallback(cwd: string, pattern: string, searchPath: string): string 
     try { entries = fs.readdirSync(dir, { withFileTypes: true }) } catch { return }
     for (const ent of entries) {
       const fp = path.join(dir, ent.name)
-      if (ent.isDirectory()) { walk(fp); continue }
+      if (ent.isDirectory()) { if (!GLOB_SKIP_DIRS.has(ent.name)) walk(fp); continue }
       if (!ent.isFile()) continue
       try {
         const lines = fs.readFileSync(fp, 'utf-8').split('\n')
@@ -198,29 +230,20 @@ function grepFallback(cwd: string, pattern: string, searchPath: string): string 
 const GLOB_SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'build', '.next', 'out', '.cache', 'coverage'])
 const GLOB_MAX = 300
 
-export function toolGlob(cwd: string, a: { pattern: string; path?: string }): string {
+export async function toolGlob(cwd: string, a: { pattern: string; path?: string }): Promise<string> {
   const searchPath = a.path || '.'
   // Prefer ripgrep: it honours .gitignore, expands `{ts,tsx}`, skips junk dirs
   // and is fast. `--files -g <pattern>` lists files matching the glob.
-  try {
-    const cmd = ['rg', '--files', '-g', JSON.stringify(a.pattern), JSON.stringify(searchPath)]
-    const out = execSync(cmd.join(' '), { cwd, encoding: 'utf-8', timeout: 30_000, maxBuffer: 10 * 1024 * 1024 })
-    const files = out.split('\n').map((l) => l.trim()).filter(Boolean)
-    if (!files.length) return 'no matches'
-    return sortByMtime(cwd, files).slice(0, GLOB_MAX).join('\n')
-  } catch (e: any) {
-    if (e?.code !== 'ENOENT') {
-      // rg ran but matched nothing (exit 1) or errored — fall through to walk
-      const out = String(e?.stdout ?? '').trim()
-      if (out) return sortByMtime(cwd, out.split('\n').filter(Boolean)).slice(0, GLOB_MAX).join('\n')
-    }
-    return globFallback(cwd, a.pattern, searchPath)
-  }
+  const r = await runChild('rg', ['--files', '-g', a.pattern, searchPath], { cwd, timeout: 30_000 })
+  if (r.spawnError === 'ENOENT') return globFallback(cwd, a.pattern, searchPath)
+  const files = r.stdout.split('\n').map((l) => l.trim()).filter(Boolean)
+  if (!files.length) return 'no matches'
+  return (await sortByMtime(cwd, files)).slice(0, GLOB_MAX).join('\n')
 }
 
 // Manual walk used only when ripgrep is missing. Skips heavy dirs, matches with
 // a properly-compiled regex, sorts newest-first like the ripgrep path.
-function globFallback(cwd: string, pattern: string, searchPath: string): string {
+async function globFallback(cwd: string, pattern: string, searchPath: string): Promise<string> {
   const base = path.resolve(cwd)
   const root = resolveInside(cwd, searchPath)
   const rx = globToRegex(pattern)
@@ -242,15 +265,19 @@ function globFallback(cwd: string, pattern: string, searchPath: string): string 
   }
   walk(root)
   if (!matches.length) return 'no matches'
-  return sortByMtime(cwd, matches).join('\n')
+  return (await sortByMtime(cwd, matches)).join('\n')
 }
 
-function sortByMtime(cwd: string, rels: string[]): string[] {
-  const withTime = rels.map((rel) => {
+// Newest-first ordering. Skipped for very large candidate sets — stat-ing
+// thousands of files to sort a list that gets capped at GLOB_MAX anyway is
+// wasted IO; rg's own ordering is good enough there.
+async function sortByMtime(cwd: string, rels: string[]): Promise<string[]> {
+  if (rels.length > 2000) return rels
+  const withTime = await Promise.all(rels.map(async (rel) => {
     let mtime = 0
-    try { mtime = fs.statSync(path.resolve(cwd, rel)).mtimeMs } catch { /* keep 0 */ }
+    try { mtime = (await fs.promises.stat(path.resolve(cwd, rel))).mtimeMs } catch { /* keep 0 */ }
     return { rel, mtime }
-  })
+  }))
   withTime.sort((a, b) => b.mtime - a.mtime || a.rel.localeCompare(b.rel))
   return withTime.map((x) => x.rel)
 }
@@ -388,24 +415,21 @@ export function toolMultiEdit(
 // Run the project's typechecker / linter / tests and return the output so the
 // agent can close the loop after edits. Safer than raw Bash: a fixed command
 // set, auto-detected from the workspace. Not a mutator.
-function runDiag(cwd: string, cmd: string, args: string[]): string {
-  try {
-    const out = execSync([cmd, ...args].join(' '), {
-      cwd, timeout: DIAG_TIMEOUT_MS, encoding: 'utf-8',
-      stdio: ['ignore', 'pipe', 'pipe'],
-      shell: process.platform === 'win32' ? 'powershell.exe' : '/bin/sh',
-      maxBuffer: 10 * 1024 * 1024,
-    })
-    const text = String(out).trim()
+async function runDiag(cwd: string, cmd: string, args: string[]): Promise<string> {
+  // execFile directly (no shell hop); npx/python are .cmd shims on Windows so
+  // they still need the shell there.
+  const r = await runChild(cmd, args, { cwd, timeout: DIAG_TIMEOUT_MS, shell: process.platform === 'win32' })
+  if (r.timedOut) return `error: ${cmd} timed out after ${DIAG_TIMEOUT_MS / 1000}s`
+  if (r.spawnError) return `error: cannot run ${cmd} (${r.spawnError})`
+  if (r.code === 0) {
+    const text = r.stdout.trim()
     return text ? `clean (exit 0)\n${text.slice(-4000)}` : 'clean (exit 0) — no diagnostics'
-  } catch (e: any) {
-    if (e?.killed && e?.signal === 'SIGTERM') return `error: ${cmd} timed out after ${DIAG_TIMEOUT_MS / 1000}s`
-    const out = `${e?.stdout ?? ''}${e?.stderr ?? ''}`.trim()
-    return `exit ${e?.status ?? 1}\n${out.slice(-4000) || '(no output)'}`
   }
+  const out = (r.stdout + r.stderr).trim()
+  return `exit ${r.code}\n${out.slice(-4000) || '(no output)'}`
 }
 
-export function toolGetDiagnostics(cwd: string, a: { tool?: string; path?: string }): string {
+export async function toolGetDiagnostics(cwd: string, a: { tool?: string; path?: string }): Promise<string> {
   const has = (rel: string) => fs.existsSync(path.join(cwd, rel))
   let tool = a.tool || 'auto'
   if (tool === 'auto') {
@@ -455,19 +479,20 @@ export function toolNotebookEdit(
 }
 
 // ── DownloadFile ─────────────────────────────────────────────────
-// Fetch a URL into the workspace via curl (execFileSync avoids shell injection
+// Fetch a URL into the workspace via curl (execFile args avoid shell injection
 // from a model-supplied URL). Creates a file. Mutator.
-export function toolDownloadFile(cwd: string, a: { url: string; path: string }): string {
+export async function toolDownloadFile(cwd: string, a: { url: string; path: string }): Promise<string> {
   if (!/^https?:\/\//i.test(a.url)) return 'error: url must be http(s)'
   const dest = resolveInside(cwd, a.path)
   fs.mkdirSync(path.dirname(dest), { recursive: true })
-  try {
-    execFileSync('curl', ['-fsSL', '--max-filesize', String(DOWNLOAD_MAX_BYTES), '-o', dest, a.url], {
-      timeout: BASH_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 10 * 1024 * 1024,
-    })
-  } catch (e: any) {
-    const out = `${e?.stderr ?? ''}${e?.stdout ?? ''}`.trim()
-    return `error: download failed (${e?.status ?? '?'}): ${out.slice(-300) || a.url}`
+  const r = await runChild(
+    'curl',
+    ['-fsSL', '--max-filesize', String(DOWNLOAD_MAX_BYTES), '-o', dest, a.url],
+    { timeout: BASH_TIMEOUT_MS },
+  )
+  if (r.timedOut || r.code !== 0 || r.spawnError) {
+    const out = (r.stderr + r.stdout).trim()
+    return `error: download failed (${r.timedOut ? 'timeout' : r.spawnError ?? r.code}): ${out.slice(-300) || a.url}`
   }
   let size = 0
   try { size = fs.statSync(dest).size } catch { /* ignore */ }
@@ -625,7 +650,7 @@ export const FILE_TOOL_SPECS: ToolSpec[] = [
 
 // Dispatch a file/shell tool by name. Returns the tool result string, or null
 // if the name is not a file/shell tool (caller handles other tool families).
-export function runFileTool(cwd: string, name: string, args: any): string | null {
+export async function runFileTool(cwd: string, name: string, args: any): Promise<string | null> {
   switch (name) {
     case 'Read': return toolRead(cwd, args)
     case 'Write': return toolWrite(cwd, args)
