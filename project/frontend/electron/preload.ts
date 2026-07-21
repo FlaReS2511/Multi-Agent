@@ -289,6 +289,18 @@ const api = {
     ipcRenderer.on('window-maximized-changed', listener)
     return () => ipcRenderer.removeListener('window-maximized-changed', listener)
   },
+
+  // Quit guard: main asks before closing; the renderer confirms when safe.
+  onAppCloseRequest: (cb: () => void) => {
+    const listener = () => cb()
+    ipcRenderer.on('app-close-request', listener)
+    return () => ipcRenderer.removeListener('app-close-request', listener)
+  },
+  appCloseConfirm: () => ipcRenderer.send('app-close-confirm'),
+
+  // OS notification (used when the agent needs attention and the window is
+  // unfocused).
+  osNotify: (title: string, body: string) => ipcRenderer.send('os-notify', title, body),
 }
 
 contextBridge.exposeInMainWorld('api', api)

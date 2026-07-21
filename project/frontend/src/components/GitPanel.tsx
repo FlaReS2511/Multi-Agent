@@ -73,10 +73,17 @@ export const GitPanel = React.memo(function GitPanel({ status, branch, onOpenFil
   const unstaged = status.filter((s) => s.staged !== true)
 
   const checkout = async (name: string, create = false) => {
+    setNewBranchName('')
+    const res = await window.api.workspaceGitCheckout(name, create)
+    if (!res.ok) {
+      // Keep the dropdown open so the user sees they are still on the old
+      // branch; surface why (dirty tree, conflicts…) instead of failing mute.
+      setOpStatus(res.error || 'Checkout failed')
+      toast(res.error || `Could not switch to ${name}`, 'error')
+      return
+    }
     setBranchOpen(false)
     setNewBranchMode(false)
-    setNewBranchName('')
-    await window.api.workspaceGitCheckout(name, create)
     await afterMutation()
   }
 
@@ -124,18 +131,24 @@ export const GitPanel = React.memo(function GitPanel({ status, branch, onOpenFil
     }
   }
 
+  // Stage/unstage report their errors instead of failing silently (a common
+  // one: staging a path git can't add). afterMutation always refreshes so the
+  // panel reflects reality even on partial success.
   const stage = async (file: string) => {
-    await window.api.workspaceGitStage(file)
+    const res = await window.api.workspaceGitStage(file)
+    if (!res.ok) toast(res.error || `Could not stage ${file}`, 'error')
     await afterMutation()
   }
 
   const unstage = async (file: string) => {
-    await window.api.workspaceGitUnstage(file)
+    const res = await window.api.workspaceGitUnstage(file)
+    if (!res.ok) toast(res.error || `Could not unstage ${file}`, 'error')
     await afterMutation()
   }
 
   const stageAll = async () => {
-    await window.api.workspaceGitStageAll()
+    const res = await window.api.workspaceGitStageAll()
+    if (!res.ok) toast(res.error || 'Could not stage changes', 'error')
     await afterMutation()
   }
 

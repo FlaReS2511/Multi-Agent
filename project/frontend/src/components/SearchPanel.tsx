@@ -152,9 +152,14 @@ export const SearchPanel = React.memo(function SearchPanel({ onOpenResult }: Pro
   const groups = useMemo(() => groupByFile(matches), [matches])
   // Groups the user explicitly expanded past the row cap.
   const [uncapped, setUncapped] = useState<Set<string>>(new Set())
+  // Two-step arm for Replace All — it rewrites files on disk with no undo.
+  const [confirmReplace, setConfirmReplace] = useState(false)
+  useEffect(() => { setConfirmReplace(false) }, [query, replaceText, matches])
 
   const replaceAll = async () => {
     if (!query || !groups.length) return
+    if (!confirmReplace) { setConfirmReplace(true); return }
+    setConfirmReplace(false)
     setSearching(true)
     try {
       for (const g of groups) {
@@ -242,14 +247,25 @@ export const SearchPanel = React.memo(function SearchPanel({ onOpenResult }: Pro
                   placeholder="Replace"
                   className="flex-1 py-1 bg-transparent text-zinc-100 placeholder-zinc-600 focus:outline-none"
                 />
-                <button
-                  onClick={replaceAll}
-                  disabled={!query || !groups.length || searching}
-                  title="Replace All"
-                  className="p-0.5 rounded text-zinc-400 hover:text-white hover:bg-zinc-700 disabled:text-zinc-700 disabled:hover:bg-transparent"
-                >
-                  <Replace className="w-3.5 h-3.5" />
-                </button>
+                {confirmReplace ? (
+                  <button
+                    onClick={replaceAll}
+                    disabled={searching}
+                    title="Click to confirm — this rewrites files and cannot be undone"
+                    className="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-rose-600 text-white hover:bg-rose-500 shrink-0 whitespace-nowrap"
+                  >
+                    Replace {matches.length} in {groups.length}?
+                  </button>
+                ) : (
+                  <button
+                    onClick={replaceAll}
+                    disabled={!query || !groups.length || searching}
+                    title="Replace All"
+                    className="p-0.5 rounded text-zinc-400 hover:text-white hover:bg-zinc-700 disabled:text-zinc-700 disabled:hover:bg-transparent"
+                  >
+                    <Replace className="w-3.5 h-3.5" />
+                  </button>
+                )}
               </div>
             )}
 

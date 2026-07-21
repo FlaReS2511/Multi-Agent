@@ -272,6 +272,9 @@ interface Props {
   // Fired when the agent spawns a child agent (so the host can surface the
   // live sub-agents sidebar panel).
   onSubAgentStarted?: () => void
+  // Fired when the agent needs the user (approval/review) while they aren't
+  // looking, so the host can raise the chat badge.
+  onAttentionNeeded?: () => void
 }
 
 // Wind-up choreography: the frame slides open first (handled by the parent),
@@ -291,7 +294,7 @@ const itemVariants = {
 // changes (typing, git polls, caret moves) no longer re-render the chat tree.
 export const ChatPanel = memo(ChatPanelImpl)
 
-function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onChangeResolved, onEditorRequest, windup = true, visible = true, onRunStateChange, onContextUsage, onRunFinished, files = [], workspaceRoot = '', onSubAgentStarted }: Props) {
+function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onChangeResolved, onEditorRequest, windup = true, visible = true, onRunStateChange, onContextUsage, onRunFinished, files = [], workspaceRoot = '', onSubAgentStarted, onAttentionNeeded }: Props) {
   const { chatFontSize } = useUiSettings()
   const [mode, setMode] = useState<'ask' | 'agent'>('ask')
   // Plan mode is a toggle WITHIN agent mode (via /plan): runs read-only and
@@ -307,6 +310,10 @@ function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onC
   // Plan text stashed while a git-dirty warning is shown before running it.
   const pendingPlanRef = useRef<string | null>(null)
   const [reviewMode, setReviewMode] = useState(false)
+  // Once the user clicks "Run anyway" on the dirty-tree warning, don't nag
+  // again this session — the agent's own edits keep the tree dirty, so the
+  // warning otherwise fired before every single message.
+  const dirtyWarnAckedRef = useRef(false)
   const [planWave, setPlanWave] = useState(false) // one-shot activation sweep
   // Files the current agent run has written (for the "Undo run" affordance).
   const runFilesRef = useRef<Set<string>>(new Set())
@@ -447,8 +454,14 @@ function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onC
   }
   useEffect(() => { if (showSessions) refreshSessions() }, [showSessions])
 
+  // Session ids the user has manually renamed — their title must NOT be
+  // overwritten by the auto-derived one on the next persist (that silently
+  // reverted every rename of an active session).
+  const renamedSessionsRef = useRef<Set<number>>(new Set())
+
   // Persist the current transcript. Creates a session row on first save, then
-  // updates it in place. Titles are derived from the opening user message.
+  // updates it in place. Title is derived from the opening user message unless
+  // the user gave the session a custom name.
   const persistSession = async (items: AgentItem[]) => {
     const serialized = JSON.stringify(serializeItems(items))
     const title = deriveTitle(items)
@@ -457,7 +470,8 @@ function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onC
         const res = await window.api.agentSessionCreate(title, serialized)
         if (res.ok && res.id != null) { setSessionId(res.id); sessionIdRef.current = res.id }
       } else {
-        await window.api.agentSessionUpdate(sessionIdRef.current, serialized, title)
+        const keepTitle = renamedSessionsRef.current.has(sessionIdRef.current)
+        await window.api.agentSessionUpdate(sessionIdRef.current, serialized, keepTitle ? undefined : title)
       }
     } catch { /* best-effort persistence */ }
   }
@@ -493,9 +507,13 @@ function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onC
 
   const deleteSession = async (id: number) => {
     try { await window.api.agentSessionDelete(id) } catch { /* ignore */ }
+    renamedSessionsRef.current.delete(id)
     if (sessionIdRef.current === id) newSession()
     refreshSessions()
   }
+  // Two-step delete: the trash icon arms this; a second click confirms. Avoids
+  // one-misclick permanent loss of a transcript.
+  const [confirmDeleteSession, setConfirmDeleteSession] = useState<number | null>(null)
 
   // Inline session rename (pencil in the History dropdown).
   const [renamingSession, setRenamingSession] = useState<number | null>(null)
@@ -505,6 +523,7 @@ function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onC
     const title = renameValue.trim()
     setRenamingSession(null)
     if (id == null || !title) return
+    renamedSessionsRef.current.add(id) // don't let auto-title overwrite it
     try { await window.api.agentSessionRename(id, title) } catch { /* ignore */ }
     refreshSessions()
   }
@@ -577,9 +596,14 @@ function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onC
     return () => window.clearTimeout(t)
   }, [planMode])
 
+  // Two-step confirm for Undo run — it reverts every file the run wrote to
+  // its last committed state, which can't itself be undone.
+  const [confirmUndo, setConfirmUndo] = useState(false)
+
   // Revert every file the last run wrote (git checkout tracked, delete new).
   const undoLastRun = async () => {
     if (undoing || lastRunFiles.length === 0) return
+    setConfirmUndo(false)
     setUndoing(true)
     try {
       const res = await window.api.workspaceGitRestoreFiles(lastRunFiles)
@@ -662,8 +686,16 @@ function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onC
         setMessages((prev) => {
           const copy = [...prev]
           const last = copy[copy.length - 1]
-          if (last && last.role === 'assistant' && !last.content) {
-            copy[copy.length - 1] = { ...last, content: `⚠ ${info.error}` }
+          if (last && last.role === 'assistant') {
+            // If text already streamed, a mid-stream error used to be dropped —
+            // a truncated answer then looked complete. Append the error so the
+            // user knows the reply was cut off.
+            copy[copy.length - 1] = {
+              ...last,
+              content: last.content
+                ? `${last.content}\n\n⚠ Response interrupted: ${info.error}`
+                : `⚠ ${info.error}`,
+            }
           }
           return copy
         })
@@ -735,6 +767,16 @@ function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onC
 
   useEffect(() => () => { if (rafRef.current != null) cancelAnimationFrame(rafRef.current) }, [])
 
+  // Fire an OS notification when the agent needs attention but the user isn't
+  // looking (window unfocused, or the chat panel is closed). Also flags the
+  // host so it can show the chat badge.
+  const notifyAttention = (msg: string) => {
+    if (!document.hasFocus() || !visible) {
+      try { window.api.osNotify?.('Orqon — agent needs you', msg) } catch { /* ignore */ }
+      onAttentionNeeded?.()
+    }
+  }
+
   // Agent mode: run the tool-calling loop, rendering tool activity inline.
   const sendAgent = (opts?: { text?: string; planMode?: boolean; researchMode?: boolean }) => {
     const text = (opts?.text ?? input).trim()
@@ -794,9 +836,9 @@ function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onC
         ensureReveal()
         return
       }
-      if (e.type === 'pending_change') { onPendingChange?.(e.change); return }
+      if (e.type === 'pending_change') { onPendingChange?.(e.change); notifyAttention('Agent is waiting for you to review a change'); return }
       if (e.type === 'change_resolved') { onChangeResolved?.(e.changeId); return }
-      if (e.type === 'pending_action') { setPendingAction(e.action); return }
+      if (e.type === 'pending_action') { setPendingAction(e.action); notifyAttention(`Agent needs approval: ${e.action.title}`); return }
       if (e.type === 'action_resolved') { setPendingAction(null); return }
       if (e.type === 'todos') { setTodos(e.todos); return }
       if (e.type === 'context') { setCtxUsage({ used: e.used, window: e.window }); return }
@@ -823,6 +865,12 @@ function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onC
       if (e.type === 'file_changed') { runFilesRef.current.add(e.path); onFileChanged?.(e.path) }
       if (e.type === 'done' || e.type === 'error' || e.type === 'blocked' || e.type === 'plan') {
         onRunFinishedRef.current?.({ kind: e.type })
+        if (!document.hasFocus()) {
+          const label = e.type === 'plan' ? 'Plan ready for review'
+            : e.type === 'blocked' ? 'Agent is blocked — needs you'
+            : e.type === 'error' ? 'Agent run failed' : 'Agent finished'
+          try { window.api.osNotify?.('Orqon', label) } catch { /* ignore */ }
+        }
         off()
         offEditor()
         reqIdRef.current = null
@@ -909,8 +957,9 @@ function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onC
 
   const stop = () => {
     if (pendingAction) { resolveAction(false) }
+    const wasAgent = mode !== 'ask'
     if (reqIdRef.current) {
-      if (mode !== 'ask') window.api.aiAgentCancel(reqIdRef.current)
+      if (wasAgent) window.api.aiAgentCancel(reqIdRef.current)
       else window.api.aiChatCancel(reqIdRef.current)
     }
     if (rafRef.current != null) { cancelAnimationFrame(rafRef.current); rafRef.current = null }
@@ -925,12 +974,23 @@ function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onC
         shownRef.current.set(tid, target.length)
       }
     }
-    setAgentItems((prev) => flattenFinished(prev.map((it) => {
-      if ((it.kind === 'text' || it.kind === 'reasoning') && it.id && tails.has(it.id)) {
-        return { ...it, chunks: [...(it.chunks ?? []), tails.get(it.id) as string] }
-      }
-      return it
-    })))
+    // Surface an Undo affordance for files the (now-stopped) run already wrote
+    // — stopping used to lose it. Mark the turn for persistence so the partial
+    // transcript survives, and note it was stopped (not a failure).
+    if (wasAgent && runFilesRef.current.size > 0) {
+      setLastRunFiles(Array.from(runFilesRef.current))
+    }
+    pendingPersistRef.current = wasAgent
+    setAgentItems((prev) => {
+      const snapped = flattenFinished(prev.map((it) => {
+        if ((it.kind === 'text' || it.kind === 'reasoning') && it.id && tails.has(it.id)) {
+          return { ...it, chunks: [...(it.chunks ?? []), tails.get(it.id) as string] }
+        }
+        return it
+      }))
+      if (wasAgent) snapped.push({ kind: 'text', role: 'assistant', content: '⏹ Stopped.' })
+      return snapped
+    })
     setStreaming(false)
   }
 
@@ -1028,8 +1088,9 @@ function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onC
     // Plan mode: read-only investigation → a plan to approve. No dirty check.
     if (planMode) { sendAgent({ planMode: true }); return }
     // Agent: auto-apply on a dirty tree is risky (no clean git baseline to undo
-    // to). Warn once; review mode is safe (each change is gated) so skip.
-    if (!reviewMode && input.trim() && !streaming) {
+    // to). Warn ONCE per session — after the user accepts, the agent's own
+    // edits keep the tree dirty, so re-warning would gate every message.
+    if (!reviewMode && !dirtyWarnAckedRef.current && input.trim() && !streaming) {
       try {
         const d = await window.api.workspaceGitDirtyCount()
         if (d.ok && d.count > 0) { setDirtyWarn({ count: d.count }); return }
@@ -1042,9 +1103,23 @@ function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onC
   // stashed (approve → dirty), run that; otherwise a normal agent run.
   const confirmDirtyRun = () => {
     setDirtyWarn(null)
+    dirtyWarnAckedRef.current = true // don't nag again this session
     if (pendingPlanRef.current) { const p = pendingPlanRef.current; pendingPlanRef.current = null; runPlan(p) }
     else sendAgent()
   }
+
+  // "Run in Review mode" from the dirty warning: flip review on (each change
+  // is then gated, so a dirty tree is safe) and run.
+  const runDirtyInReview = () => {
+    setDirtyWarn(null)
+    if (!reviewMode) toggleReview()
+    if (pendingPlanRef.current) { const p = pendingPlanRef.current; pendingPlanRef.current = null; runPlan(p) }
+    else sendAgent()
+  }
+
+  // Cancel the dirty warning — also drop any stashed approved plan so a later
+  // "Run anyway" runs the NEXT message, not the stale plan.
+  const cancelDirtyWarn = () => { setDirtyWarn(null); pendingPlanRef.current = null }
 
   // Approve or decline a sensitive git/login/background action.
   const resolveAction = (approved: boolean) => {
@@ -1140,7 +1215,7 @@ function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onC
                   <History size={14} />
                 </button>
                 {showSessions && (
-                  <div className="absolute right-0 top-6 z-20 w-64 max-h-72 overflow-y-auto scrollbar-thin rounded-lg border border-zinc-800 bg-zinc-900 shadow-xl py-1">
+                  <div className="absolute right-0 top-6 z-20 w-64 max-h-72 overflow-y-auto scrollbar-thin rounded-lg border border-zinc-800 bg-zinc-900 shadow-xl py-1" onMouseLeave={() => setConfirmDeleteSession(null)}>
                     {sessions.length === 0 ? (
                       <div className="px-3 py-2 text-[11px] text-zinc-600">No saved sessions</div>
                     ) : (
@@ -1163,7 +1238,7 @@ function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onC
                                 else if (e.key === 'Escape') { e.preventDefault(); setRenamingSession(null) }
                                 e.stopPropagation()
                               }}
-                              onBlur={() => setRenamingSession(null)}
+                              onBlur={() => commitRename()}
                               className="flex-1 min-w-0 px-1 py-0.5 bg-zinc-950 border border-blue-500/60 rounded text-[11px] text-zinc-100 focus:outline-none"
                             />
                           ) : (
@@ -1177,13 +1252,23 @@ function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onC
                           >
                             <Pencil size={11} />
                           </button>
-                          <button
-                            onClick={(e) => { e.stopPropagation(); deleteSession(s.id) }}
-                            title="Delete session"
-                            className="opacity-0 group-hover:opacity-100 text-zinc-600 hover:text-rose-400 flex-shrink-0"
-                          >
-                            <Trash size={11} />
-                          </button>
+                          {confirmDeleteSession === s.id ? (
+                            <button
+                              onClick={(e) => { e.stopPropagation(); setConfirmDeleteSession(null); deleteSession(s.id) }}
+                              title="Click again to confirm delete"
+                              className="text-[9px] font-semibold px-1 rounded bg-rose-600 text-white flex-shrink-0"
+                            >
+                              Delete?
+                            </button>
+                          ) : (
+                            <button
+                              onClick={(e) => { e.stopPropagation(); setConfirmDeleteSession(s.id) }}
+                              title="Delete session"
+                              className="opacity-0 group-hover:opacity-100 text-zinc-600 hover:text-rose-400 flex-shrink-0"
+                            >
+                              <Trash size={11} />
+                            </button>
+                          )}
                         </div>
                       ))
                     )}
@@ -1393,8 +1478,15 @@ function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onC
           <div className="flex-1 text-[11px] text-zinc-300 leading-relaxed">
             You have {dirtyWarn.count} uncommitted change{dirtyWarn.count > 1 ? 's' : ''}. The agent applies
             edits directly — undoing a run reverts files to their last committed state, which would also drop
-            your current changes. Commit first, or turn on Review mode.
-            <div className="flex items-center gap-2 mt-1.5">
+            your current changes. Review mode gates each change instead.
+            <div className="flex items-center gap-2 mt-1.5 flex-wrap">
+              <button
+                onClick={runDirtyInReview}
+                title="Turn on Review mode and run — you approve each change before it applies"
+                className="text-[11px] font-medium px-2 py-0.5 rounded bg-emerald-600 hover:bg-emerald-500 text-white flex items-center gap-1"
+              >
+                <ShieldCheck size={11} /> Run in Review mode
+              </button>
               <button
                 onClick={confirmDirtyRun}
                 className="text-[11px] font-medium px-2 py-0.5 rounded bg-amber-600 hover:bg-amber-500 text-white"
@@ -1402,7 +1494,7 @@ function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onC
                 Run anyway
               </button>
               <button
-                onClick={() => setDirtyWarn(null)}
+                onClick={cancelDirtyWarn}
                 className="text-[11px] px-2 py-0.5 rounded border border-zinc-700 text-zinc-400 hover:text-zinc-200"
               >
                 Cancel
@@ -1415,21 +1507,27 @@ function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onC
       {/* Undo-run bar: revert everything the last agent run wrote */}
       {mode === 'agent' && !streaming && lastRunFiles.length > 0 && (
         <div className="flex items-center gap-2 px-3 py-2 border-t border-zinc-800 bg-zinc-900/40 flex-shrink-0">
-          <span className="text-[11px] text-zinc-400 flex-1">
-            Agent changed {lastRunFiles.length} file{lastRunFiles.length > 1 ? 's' : ''}
+          <span className="text-[11px] text-zinc-400 flex-1" title={lastRunFiles.join('\n')}>
+            {confirmUndo
+              ? `Revert ${lastRunFiles.length} file${lastRunFiles.length > 1 ? 's' : ''} to last commit? This can't be undone.`
+              : `Agent changed ${lastRunFiles.length} file${lastRunFiles.length > 1 ? 's' : ''}`}
           </span>
           <button
-            onClick={() => setLastRunFiles([])}
+            onClick={() => { setConfirmUndo(false); setLastRunFiles([]) }}
             className="text-[10px] text-zinc-500 hover:text-zinc-300 px-1.5 py-0.5"
           >
-            Dismiss
+            {confirmUndo ? 'Keep' : 'Dismiss'}
           </button>
           <button
-            onClick={undoLastRun}
+            onClick={() => (confirmUndo ? undoLastRun() : setConfirmUndo(true))}
             disabled={undoing}
-            className="flex items-center gap-1 text-[11px] font-medium px-2 py-0.5 rounded border border-amber-500/40 bg-amber-500/10 text-amber-300 hover:bg-amber-500/20 disabled:opacity-60"
+            className={`flex items-center gap-1 text-[11px] font-medium px-2 py-0.5 rounded border disabled:opacity-60 ${
+              confirmUndo
+                ? 'border-rose-500/50 bg-rose-600 text-white hover:bg-rose-500'
+                : 'border-amber-500/40 bg-amber-500/10 text-amber-300 hover:bg-amber-500/20'
+            }`}
           >
-            <Undo2 size={11} /> {undoing ? 'Undoing…' : 'Undo run'}
+            <Undo2 size={11} /> {undoing ? 'Undoing…' : confirmUndo ? 'Revert' : 'Undo run'}
           </button>
         </div>
       )}

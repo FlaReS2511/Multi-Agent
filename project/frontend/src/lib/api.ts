@@ -389,6 +389,9 @@ declare global {
       windowMinimize(): Promise<void>
       windowMaximizeToggle(): Promise<boolean>
       windowClose(): Promise<void>
+      onAppCloseRequest(cb: () => void): () => void
+      appCloseConfirm(): void
+      osNotify(title: string, body: string): void
       windowIsMaximized(): Promise<boolean>
       onWindowMaximizedChanged(cb: (maximized: boolean) => void): () => void
       onAgentKilled(cb: (info: { agent: string; reason: string }) => void): () => void

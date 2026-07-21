@@ -191,6 +191,8 @@ export function IDEView() {
   useEffect(() => { dirtyRef.current = dirtyFiles }, [dirtyFiles])
   const openTabsRef = useRef<string[]>([])
   useEffect(() => { openTabsRef.current = openTabs }, [openTabs])
+  const activeTabRef = useRef<string | null>(null)
+  useEffect(() => { activeTabRef.current = activeTab }, [activeTab])
   const gitChangesRef = useRef<GitChange[]>([])
   useEffect(() => { gitChangesRef.current = gitChanges }, [gitChanges])
 
@@ -470,26 +472,64 @@ export function IDEView() {
     } catch { /* corrupted session — start clean */ }
   }, [bumpBuffers])
 
+  // Gate a destructive transition (workspace switch, app quit) on unsaved
+  // buffers: if any tab is dirty, ask Save All / Discard / Cancel; otherwise
+  // proceed straight away. Self-contained (writes via the IPC directly) so it
+  // doesn't depend on later-declared save helpers.
+  const confirmUnsaved = useCallback((proceed: () => void) => {
+    const dirty = Object.keys(dirtyRef.current).filter((t) => dirtyRef.current[t])
+    if (dirty.length === 0) { proceed(); return }
+    setDialog({
+      title: `Save ${dirty.length} unsaved file${dirty.length > 1 ? 's' : ''}?`,
+      message: dirty.join('\n'),
+      buttons: [
+        {
+          label: 'Save All', kind: 'primary',
+          onClick: async () => {
+            setDialog(null)
+            for (const rel of dirty) {
+              try { await window.api.workspaceWriteFile(rel, contentsRef.current.get(rel) ?? '') } catch { /* keep going */ }
+            }
+            proceed()
+          },
+        },
+        { label: 'Discard', kind: 'danger', onClick: () => { setDialog(null); proceed() } },
+        { label: 'Cancel', onClick: () => setDialog(null) },
+      ],
+    })
+  }, [])
+
   // Switch to a different workspace folder, then reset editor state and
-  // restore that workspace's own session.
+  // restore that workspace's own session. Guards unsaved buffers first —
+  // switching used to clear every dirty buffer with no warning.
   const switchWorkspace = useCallback(async (dir?: string) => {
     const res = dir
       ? await window.api.workspaceSetRoot(dir)
       : await window.api.workspaceOpenDialog()
     if (!res.ok) return
-    setShowWorkspaceMenu(false)
-    setOpenTabs([])
-    setActiveTab(null)
-    for (const rel of Array.from(contentsRef.current.keys())) disposeModel(rel)
-    contentsRef.current.clear()
-    originalsRef.current.clear()
-    bumpBuffers()
-    setDirtyFiles({})
-    closedTabsRef.current = []
-    const root = await loadWorkspaceInfo()
-    await refreshWorkspace()
-    if (root) await restoreSession(root)
-  }, [loadWorkspaceInfo, restoreSession, refreshWorkspace, disposeModel, bumpBuffers])
+    confirmUnsaved(async () => {
+      setShowWorkspaceMenu(false)
+      setOpenTabs([])
+      setActiveTab(null)
+      for (const rel of Array.from(contentsRef.current.keys())) disposeModel(rel)
+      contentsRef.current.clear()
+      originalsRef.current.clear()
+      bumpBuffers()
+      setDirtyFiles({})
+      closedTabsRef.current = []
+      const root = await loadWorkspaceInfo()
+      await refreshWorkspace()
+      if (root) await restoreSession(root)
+    })
+  }, [confirmUnsaved, loadWorkspaceInfo, restoreSession, refreshWorkspace, disposeModel, bumpBuffers])
+
+  // Quit guard: main intercepts the window close and asks here. Confirm the
+  // unsaved buffers, then tell main it's safe to close.
+  useEffect(() => {
+    return window.api.onAppCloseRequest(() => {
+      confirmUnsaved(() => window.api.appCloseConfirm())
+    })
+  }, [confirmUnsaved])
 
   // Load agents config to get the list of active agents
   useEffect(() => {
@@ -705,7 +745,8 @@ export function IDEView() {
   // memoized tree/palette/panels that receive it don't re-render for nothing.
   const openFile = useCallback(async (relPath: string) => {
     // If not already in tabs, load content + HEAD baseline (in parallel), then add it
-    if (!openTabsRef.current.includes(relPath)) {
+    const firstOpen = !openTabsRef.current.includes(relPath)
+    if (firstOpen) {
       const [diskFile, originalFile] = await Promise.all([
         window.api.workspaceReadFile(relPath),
         window.api.workspaceGitShowHead(relPath).catch(() => ({ ok: false, content: '' })),
@@ -714,12 +755,13 @@ export function IDEView() {
       originalsRef.current.set(relPath, originalFile.ok ? originalFile.content : '')
       bumpBuffers()
       setOpenTabs((prev) => (prev.includes(relPath) ? prev : [...prev, relPath]))
+      // Suggest diff view for git-modified files — but only on the FIRST
+      // open. Re-clicking a tab used to force diff mode back on and override
+      // the user's explicit view choice.
+      setDiffMode(gitChangesRef.current.some((c) => c.file === relPath))
     }
 
     setActiveTab(relPath)
-
-    // Automatically enable diff mode if the file is modified in git (added/modified)
-    setDiffMode(gitChangesRef.current.some((c) => c.file === relPath))
   }, [bumpBuffers])
 
   // Open a file and jump the editor to a specific line/column (search results).
@@ -869,6 +911,7 @@ export function IDEView() {
   const chatOpenRef = useRef(chatOpen)
   useEffect(() => { chatOpenRef.current = chatOpen }, [chatOpen])
   const onSubAgentStarted = useCallback(() => { setActiveSidebar('agents'); setIsSidebarOpen(true) }, [])
+  const onChatAttentionNeeded = useCallback(() => { if (!chatOpenRef.current) setChatUnread(true) }, [])
   const onChatRunFinished = useCallback((info: { kind: 'done' | 'error' | 'blocked' | 'plan' }) => {
     if (chatOpenRef.current) return
     setChatUnread(true)
@@ -999,6 +1042,23 @@ export function IDEView() {
     contentsRef.current.set(activeTab, value)
     setDirtyFiles((prev) => (prev[activeTab] ? prev : { ...prev, [activeTab]: true }))
   }
+
+  // Diff view: the modified pane is editable, but nothing used to capture what
+  // the user typed there — Cmd+S no-oped and toggling back to Normal silently
+  // discarded the edits. Route its changes into the same buffer + dirty flag.
+  const handleDiffEditorMount = useCallback((editor: any) => {
+    const mod = editor.getModifiedEditor()
+    mod.onDidChangeModelContent(() => {
+      const rel = activeTabRef.current
+      if (!rel || rel === BROWSER_TAB) return
+      const value = mod.getValue()
+      // Prop-driven model swaps (tab switch) also fire this event with an
+      // unchanged value — only user edits may mark the buffer dirty.
+      if (value === contentsRef.current.get(rel)) return
+      contentsRef.current.set(rel, value)
+      setDirtyFiles((prev) => (prev[rel] ? prev : { ...prev, [rel]: true }))
+    })
+  }, [])
 
   // Save one file (any tab, not just the active one).
   const saveFile = async (relPath: string): Promise<boolean> => {
@@ -1667,6 +1727,7 @@ export function IDEView() {
                     language={detectLanguage(activeTab)}
                     original={originalsRef.current.get(activeTab) || ''}
                     modified={contentsRef.current.get(activeTab) || ''}
+                    onMount={handleDiffEditorMount}
                     theme="vscode-dark-harmony"
                     options={{
                       // Monaco sizes itself via its own ResizeObserver. The
@@ -1733,24 +1794,30 @@ export function IDEView() {
                         onReject={inlineAI.reject}
                       />
                     )}
-                    {pendingChange && pendingChange.path === activeTab && (
-                      <DiffReviewCard
-                        change={pendingChange}
-                        onAccept={() => resolvePending('accept')}
-                        onReject={() => resolvePending('reject')}
-                      />
-                    )}
-                    {!pendingChange && previewDiff && previewDiff.path === activeTab && (
-                      <DiffReviewCard
-                        change={previewDiff}
-                        readOnly
-                        onAccept={() => setPreviewDiff(null)}
-                        onReject={() => setPreviewDiff(null)}
-                      />
-                    )}
                   </AnimatePresence>
                 </div>
               )}
+              {/* Agent review / preview cards float over the editor — kept
+                  OUTSIDE the diff/normal branch so an active diff view (or a
+                  tab switch) can't hide the approve/decline card while the
+                  agent stays blocked waiting on it. */}
+              <AnimatePresence>
+                {pendingChange && pendingChange.path === activeTab && (
+                  <DiffReviewCard
+                    change={pendingChange}
+                    onAccept={() => resolvePending('accept')}
+                    onReject={() => resolvePending('reject')}
+                  />
+                )}
+                {!pendingChange && previewDiff && previewDiff.path === activeTab && (
+                  <DiffReviewCard
+                    change={previewDiff}
+                    readOnly
+                    onAccept={() => setPreviewDiff(null)}
+                    onReject={() => setPreviewDiff(null)}
+                  />
+                )}
+              </AnimatePresence>
             </div>
           ) : !activeTab ? (
             <div className="relative flex-1 flex flex-col items-center justify-center text-zinc-500 select-none bg-zinc-950 overflow-hidden">
@@ -2000,6 +2067,7 @@ export function IDEView() {
             onRunStateChange={setAgentBusy}
             onContextUsage={setChatCtxUsage}
             onSubAgentStarted={onSubAgentStarted}
+            onAttentionNeeded={onChatAttentionNeeded}
             onRunFinished={onChatRunFinished}
           />
         </div>

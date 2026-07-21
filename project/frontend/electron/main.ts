@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, safeStorage, dialog, Menu } from 'electron'
+import { app, BrowserWindow, ipcMain, safeStorage, dialog, Menu, Notification } from 'electron'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 import fs from 'node:fs/promises'
@@ -87,10 +87,24 @@ const IDLE_KILL_MS = 15 * 60 * 1000
 const GC_INTERVAL_MS = 60 * 1000
 
 let mainWindow: BrowserWindow | null = null
+// Set once the renderer has confirmed it is safe to close (no unsaved
+// buffers, or the user chose Save/Discard in the quit dialog).
+let allowClose = false
 
 function createWindow() {
-  // Remove the default application menu (File/Edit/View/Window/Help) entirely.
-  Menu.setApplicationMenu(null)
+  // macOS routes Cmd+C/V/X/A through the application menu — with a null menu
+  // those shortcuts were dead app-wide (you could not even paste an API key).
+  // Keep a minimal hidden menu on darwin; Windows/Linux handle clipboard keys
+  // natively, so the menu stays removed there.
+  if (process.platform === 'darwin') {
+    Menu.setApplicationMenu(Menu.buildFromTemplate([
+      { role: 'appMenu' },
+      { role: 'editMenu' },
+      { role: 'windowMenu' },
+    ]))
+  } else {
+    Menu.setApplicationMenu(null)
+  }
 
   // Window/taskbar icon. In dev, __dirname is dist-electron; the build/ folder
   // sits next to it under project/frontend. Prefer .ico on Windows.
@@ -121,6 +135,16 @@ function createWindow() {
 
   mainWindow.on('maximize', () => mainWindow?.webContents.send('window-maximized-changed', true))
   mainWindow.on('unmaximize', () => mainWindow?.webContents.send('window-maximized-changed', false))
+
+  // Quit guard: Cmd+Q / window close used to destroy unsaved buffers with no
+  // warning. Hand the decision to the renderer (it knows the dirty files and
+  // owns the Save/Discard dialog); it replies via 'app-close-confirm'. A
+  // crashed renderer closes unconditionally so a hung page can't trap the app.
+  mainWindow.on('close', (e) => {
+    if (allowClose || !mainWindow || mainWindow.webContents.isCrashed()) return
+    e.preventDefault()
+    mainWindow.webContents.send('app-close-request')
+  })
 
   // Agent-driven embedded browser (WebContentsView over the editor area).
   initBrowserTools({
@@ -154,6 +178,20 @@ function createWindow() {
 }
 
 // ── IPC handlers ───────────────────────────────────────────────
+
+// Renderer's verdict on the quit guard: safe to close now.
+ipcMain.on('app-close-confirm', () => {
+  allowClose = true
+  mainWindow?.close()
+})
+
+// OS-level notification (agent finished / awaits approval while the window
+// is unfocused). Electron Notification works on both macOS and Windows.
+ipcMain.on('os-notify', (_e, title: string, body: string) => {
+  try {
+    new Notification({ title: String(title).slice(0, 80), body: String(body).slice(0, 200) }).show()
+  } catch { /* notifications unsupported — never break the caller */ }
+})
 
 // Window controls (custom title bar)
 ipcMain.handle('window-minimize', () => {
@@ -1991,6 +2029,18 @@ ipcMain.handle('ai-agent-run', async (_evt, runId: string, params: IdeAgentParam
       else if (e.type === 'error') summary = `error: ${e.error}`
       if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.webContents.send(`ai-agent-event:${childRunId}`, e)
+        // Approval requests and file writes must ALSO reach the parent
+        // channel — that is where the approve/decline UI and the editor
+        // reload live. Without this, review mode + SpawnAgent deadlocked
+        // (the child waited forever on a pending_change no surface showed)
+        // and files a sub-agent wrote never live-reloaded in the editor.
+        if (
+          e.type === 'pending_change' || e.type === 'change_resolved' ||
+          e.type === 'pending_action' || e.type === 'action_resolved' ||
+          e.type === 'file_changed'
+        ) {
+          mainWindow.webContents.send(`ai-agent-event:${runId}`, e)
+        }
       }
     }
     const childParams: IdeAgentParams = {
