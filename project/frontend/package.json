@@ -1,7 +1,7 @@
 {
   "name": "orqon",
   "private": true,
-  "version": "0.1.0",
+  "version": "1.0.0-dirty",
   "description": "Orqon — AI-native IDE for the multi-agent system",
   "main": "dist-electron/main.js",
   "type": "module",

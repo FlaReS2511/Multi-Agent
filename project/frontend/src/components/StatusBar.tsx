@@ -90,7 +90,7 @@ export function StatusBar({ branch, dirtyCount, workspaceName, editorRef, editor
           <span className="font-mono text-zinc-400">Ln {cursor.line}, Col {cursor.col}</span>
         )}
         {language && <span className="uppercase tracking-wider">{language}</span>}
-        <span className="text-zinc-600">Orqon v0.4</span>
+        <span className="text-zinc-600">Orqon v1-dirty</span>
       </div>
     </div>
   )
