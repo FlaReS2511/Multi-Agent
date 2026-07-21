@@ -92,23 +92,38 @@ html, body, #root {
   box-shadow: inset 0 0 20px rgba(96, 165, 250, 0.28);
   animation: plan-glow-breathe 3s ease-in-out infinite;
 }
-/* Rotating multicolor rim on the border only (xor/exclude mask), softly blurred
-   — the flowing colored border of the Apple Intelligence look. */
-.plan-glow::before {
-  content: '';
+/* Rotating multicolor rim on the border only (xor/exclude mask), softly
+   blurred — the flowing colored border of the Apple Intelligence look.
+   Structure: .glow-rim owns the STATIC rim mask; .glow-spin is an oversized
+   layer holding a static conic-gradient rotated via `transform` keyframes.
+   (The old version animated the gradient's angle custom property, which
+   re-rasterized the full-panel gradient on the CPU every frame, forever.) */
+.glow-rim {
   position: absolute;
   inset: 0;
   border-radius: inherit;
   padding: 2px;
-  background: conic-gradient(from var(--plan-angle),
-    #1d4ed8, #60a5fa, #ffffff, #3b82f6, #dbeafe, #2563eb, #93c5fd, #1d4ed8);
   -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
           mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
   -webkit-mask-composite: xor;
           mask-composite: exclude;
-  filter: blur(4px);
-  animation: plan-glow-spin 6s linear infinite;
+  overflow: hidden;
 }
+.glow-spin {
+  position: absolute;
+  /* Oversized square so the rotating gradient always covers the rim. */
+  left: 50%;
+  top: 50%;
+  width: 200vmax;
+  height: 200vmax;
+  margin: -100vmax 0 0 -100vmax;
+  background: conic-gradient(
+    #1d4ed8, #60a5fa, #ffffff, #3b82f6, #dbeafe, #2563eb, #93c5fd, #1d4ed8);
+  filter: blur(4px);
+  animation: glow-rotate 6s linear infinite;
+  will-change: transform;
+}
+@keyframes glow-rotate { to { transform: rotate(360deg); } }
 /* Bottom-edge emphasis: a low glow hugging the very bottom edge (below the
    composer), NOT rising up into the chat. Rises in once. */
 .plan-glow::after {
@@ -122,7 +137,6 @@ html, body, #root {
   filter: blur(6px);
   animation: plan-bottom-in 0.9s ease-out;
 }
-@keyframes plan-glow-spin { to { --plan-angle: 360deg; } }
 @keyframes plan-glow-breathe { 0%, 100% { opacity: 0.78; } 50% { opacity: 1; } }
 @keyframes plan-bottom-in { from { opacity: 0; transform: translateY(40%); } to { opacity: 1; transform: none; } }
 
@@ -137,20 +151,9 @@ html, body, #root {
   box-shadow: inset 0 0 20px rgba(167, 139, 250, 0.28);
   animation: plan-glow-breathe 3s ease-in-out infinite;
 }
-.research-glow::before {
-  content: '';
-  position: absolute;
-  inset: 0;
-  border-radius: inherit;
-  padding: 2px;
-  background: conic-gradient(from var(--plan-angle),
+.research-glow .glow-spin {
+  background: conic-gradient(
     #6d28d9, #a78bfa, #ffffff, #7c3aed, #ddd6fe, #8b5cf6, #c4b5fd, #6d28d9);
-  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
-          mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
-  -webkit-mask-composite: xor;
-          mask-composite: exclude;
-  filter: blur(4px);
-  animation: plan-glow-spin 6s linear infinite;
 }
 .research-glow::after {
   content: '';
@@ -267,13 +270,16 @@ html, body, #root {
    types (JS removes the decoration then). Blue = distinct from the green
    "applied edit" flash. */
 .agent-reveal-line {
-  animation: agent-reveal-pulse 1.15s ease-in-out infinite;
+  /* Finite: 6 pulses (~7s), then settles to a static tint — an infinite
+     background-color animation kept Monaco repainting the line forever. */
+  background: rgba(59, 130, 246, 0.16);
+  animation: agent-reveal-pulse 1.15s ease-in-out 6;
 }
 .agent-reveal-gutter {
   background: #3b82f6;
   width: 3px !important;
   margin-left: 2px;
-  animation: agent-reveal-gutter-pulse 1.15s ease-in-out infinite;
+  animation: agent-reveal-gutter-pulse 1.15s ease-in-out 6;
 }
 @keyframes agent-reveal-pulse {
   0%, 100% { background: rgba(59, 130, 246, 0.10); }
@@ -282,6 +288,16 @@ html, body, #root {
 @keyframes agent-reveal-gutter-pulse {
   0%, 100% { opacity: 0.35; }
   50%      { opacity: 1; }
+}
+
+/* Transcript items rising in as they appear — a one-shot CSS animation that
+   runs on mount only (replaces a per-item framer-motion wrapper). */
+.rise-in {
+  animation: rise-in 0.32s cubic-bezier(0.22, 1, 0.36, 1);
+}
+@keyframes rise-in {
+  from { opacity: 0; transform: translateY(10px); }
+  to   { opacity: 1; transform: none; }
 }
 
 /* Streaming text: each freshly revealed chunk fades from dark → bright,

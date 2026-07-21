@@ -79,6 +79,10 @@ function itemText(it: AgentItem): string {
 // Per-tool result budget when folding tool activity into cross-turn history.
 const TOOL_RESULT_BUDGET = 800
 
+// Transcript items rendered by default; older ones sit behind "Show earlier"
+// so a long session doesn't keep hundreds of markdown blocks in the DOM.
+const RENDER_CAP = 150
+
 // Some models imitate the internal tool-log format (they see prior tool
 // activity in history and start pasting "[used Tool] → result" and element
 // refs like [e30] straight into their visible reply). Strip those machine
@@ -192,8 +196,28 @@ function serializeItems(items: AgentItem[]): AgentItem[] {
     .map((it) => {
       if (it.kind === 'text') return { kind: 'text', role: it.role, content: itemText(it) }
       if (it.kind === 'reasoning') return { kind: 'reasoning', id: it.id, content: itemText(it) }
-      return { ...it, running: false }
+      // Tool results longer than the history budget are never read back
+      // (buildHistory truncates, the UI shows 1000 chars) — don't store them.
+      const t = it as ToolEntry
+      return {
+        ...t,
+        running: false,
+        result: t.result && t.result.length > 1000 ? t.result.slice(0, 1000) + ' …(truncated)' : t.result,
+      }
     })
+}
+
+// Collapse finished streamed items (chunks[]) into plain `content` so old
+// messages render as ONE static markdown block — no more per-render
+// chunks.join + span soup once a reply is done.
+function flattenFinished(items: AgentItem[]): AgentItem[] {
+  return items.map((it) => {
+    if ((it.kind === 'text' || it.kind === 'reasoning') && it.chunks) {
+      if (it.kind === 'text') return { kind: 'text' as const, id: it.id, role: it.role, content: it.chunks.join('') }
+      return { kind: 'reasoning' as const, id: it.id, content: it.chunks.join('') }
+    }
+    return it
+  })
 }
 
 // Shorten a long file path for a one-line chip, keeping the tail (filename +
@@ -363,8 +387,19 @@ function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onC
     window.api.ideAgentConfigGet().then((c) => setReviewMode(c.reviewMode)).catch(() => {})
   }, [])
 
-  // Keep refs in sync so async persistence reads the latest values.
-  useEffect(() => { agentItemsRef.current = agentItems }, [agentItems])
+  // Keep refs in sync so async persistence reads the latest values. When a
+  // run-end handler requested persistence, do it HERE — after the final array
+  // committed — instead of inside the setState updater (updaters must stay
+  // pure; StrictMode double-invokes them).
+  const pendingPersistRef = useRef(false)
+  useEffect(() => {
+    agentItemsRef.current = agentItems
+    if (pendingPersistRef.current) {
+      pendingPersistRef.current = false
+      void persistSession(agentItems)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agentItems])
   useEffect(() => { sessionIdRef.current = sessionId }, [sessionId])
 
   // Restore the most recent session for the CURRENT workspace — on first load
@@ -436,6 +471,7 @@ function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onC
     sessionIdRef.current = null
     setTodos([])
     setShowSessions(false)
+    setShowAllItems(false)
   }
 
   // Load a saved session into the panel.
@@ -452,6 +488,7 @@ function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onC
       setMode('agent')
     } catch { /* ignore */ }
     setShowSessions(false)
+    setShowAllItems(false)
   }
 
   const deleteSession = async (id: number) => {
@@ -592,19 +629,33 @@ function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onC
     const requestId = `chat-${Date.now()}`
     reqIdRef.current = requestId
 
-    const offChunk = window.api.onAiChatChunk(requestId, (delta) => {
+    // Coalesce streamed deltas: main emits one IPC event per SSE token, and a
+    // setState per token re-rendered (and re-parsed) the growing reply 30-100
+    // times a second. Buffer in a ref and flush once per animation frame.
+    const buf = { text: '', raf: null as number | null }
+    const flush = () => {
+      buf.raf = null
+      const chunk = buf.text
+      buf.text = ''
+      if (!chunk) return
       setMessages((prev) => {
         const copy = [...prev]
         const last = copy[copy.length - 1]
         if (last && last.role === 'assistant') {
-          copy[copy.length - 1] = { ...last, content: last.content + delta }
+          copy[copy.length - 1] = { ...last, content: last.content + chunk }
         }
         return copy
       })
+    }
+    const offChunk = window.api.onAiChatChunk(requestId, (delta) => {
+      buf.text += delta
+      if (buf.raf == null) buf.raf = requestAnimationFrame(flush)
     })
     const offDone = window.api.onAiChatDone(requestId, (info) => {
       offChunk()
       offDone()
+      if (buf.raf != null) cancelAnimationFrame(buf.raf)
+      flush() // drain whatever arrived after the last frame
       reqIdRef.current = null
       setStreaming(false)
       if (!info.ok && info.error) {
@@ -802,6 +853,7 @@ function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onC
             shownRef.current.set(tid, target.length)
           }
         }
+        pendingPersistRef.current = true // persisted by the ref-sync effect after commit
         setAgentItems((prev) => {
           const copy = prev.map((it) => {
             if ((it.kind === 'text' || it.kind === 'reasoning') && it.id && tails.has(it.id)) {
@@ -812,10 +864,9 @@ function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onC
           if (e.type === 'error') copy.push({ kind: 'text', role: 'assistant', content: `⚠ ${e.error}` })
           if (e.type === 'blocked') copy.push({ kind: 'text', role: 'assistant', content: `⛔ Blocked: ${e.reason}` })
           if (e.type === 'plan') copy.push({ kind: 'text', role: 'assistant', content: `📋 **Plan**\n\n${e.plan}` })
-          // Persist the finished transcript so memory survives a restart.
-          agentItemsRef.current = copy
-          void persistSession(copy)
-          return copy
+          // Snap chunks → content: finished replies render as ONE static
+          // markdown block instead of a growing span list from here on.
+          return flattenFinished(copy)
         })
       }
     })
@@ -874,12 +925,12 @@ function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onC
         shownRef.current.set(tid, target.length)
       }
     }
-    setAgentItems((prev) => prev.map((it) => {
+    setAgentItems((prev) => flattenFinished(prev.map((it) => {
       if ((it.kind === 'text' || it.kind === 'reasoning') && it.id && tails.has(it.id)) {
         return { ...it, chunks: [...(it.chunks ?? []), tails.get(it.id) as string] }
       }
       return it
-    }))
+    })))
     setStreaming(false)
   }
 
@@ -893,6 +944,7 @@ function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onC
     setSessionId(null)
     sessionIdRef.current = null
     setTodos([])
+    setShowAllItems(false)
   }
 
   // ── Slash-command popup (agent mode) ──────────────────────────
@@ -1004,9 +1056,15 @@ function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onC
   const ctxPreview = useFileContext ? getContext() : null
 
   // The most recent reasoning item — docked above the composer, not inline.
-  const latestReasoning = [...agentItems].reverse().find((it) => it.kind === 'reasoning') as
-    | Extract<AgentItem, { kind: 'reasoning' }>
-    | undefined
+  let latestReasoning: Extract<AgentItem, { kind: 'reasoning' }> | undefined
+  for (let i = agentItems.length - 1; i >= 0; i--) {
+    const it = agentItems[i]
+    if (it.kind === 'reasoning') { latestReasoning = it; break }
+  }
+
+  // Long transcripts: render only the newest RENDER_CAP items unless expanded.
+  const [showAllItems, setShowAllItems] = useState(false)
+  const hiddenCount = !showAllItems && agentItems.length > RENDER_CAP ? agentItems.length - RENDER_CAP : 0
 
   return (
     <motion.div
@@ -1182,8 +1240,17 @@ function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onC
                 read and edit files in your workspace directly.
               </div>
             )}
-            {agentItems.map((it, i) =>
-              it.kind === 'text' ? (
+            {hiddenCount > 0 && (
+              <button
+                onClick={() => setShowAllItems(true)}
+                className="w-full py-1.5 rounded border border-zinc-800 bg-zinc-900/40 text-[11px] text-zinc-400 hover:text-zinc-200 hover:border-zinc-700"
+              >
+                Show {hiddenCount} earlier items…
+              </button>
+            )}
+            {agentItems.map((it, i) => {
+              if (i < hiddenCount) return null
+              return it.kind === 'text' ? (
                 <RiseIn key={i}>
                   {it.chunks
                     ? <GlowMessage role={it.role} chunks={it.chunks} />
@@ -1195,8 +1262,8 @@ function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onC
                 // The SpawnAgent tool entry is kept in state for cross-turn
                 // history but shown as the richer nested SubAgentCard instead.
                 it.name === 'SpawnAgent' ? null : <RiseIn key={i}><ToolActivity entry={it} /></RiseIn>
-              ) : null,
-            )}
+              ) : null
+            })}
             {streaming && (
               <div className="flex items-center gap-1.5 text-[11px] text-zinc-500 px-1">
                 <span className="size-1.5 rounded-full bg-blue-400 animate-pulse" />
@@ -1216,7 +1283,7 @@ function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onC
 
       {/* Thinking dock — reasoning lives here, not in the chat flow */}
       {mode !== 'ask' && latestReasoning && (
-        <ThinkingDock chunks={latestReasoning.chunks ?? []} active={streaming} />
+        <ThinkingDock text={itemText(latestReasoning)} active={streaming} />
       )}
 
       {/* Sensitive action confirmation (git mutate / account switch / login) */}
@@ -1513,7 +1580,7 @@ function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onC
           enter and DIMS OUT on exit (the wrapper animates opacity; the inner
           rim/breathe keep their own CSS animation). Clipped, no pointer. */}
       <AnimatePresence>
-        {mode === 'agent' && (planMode || researchMode) && (
+        {mode === 'agent' && (planMode || researchMode) && visible && (
           <motion.div
             key={planMode ? 'plan-glow' : 'research-glow'}
             className="absolute inset-0 z-30 pointer-events-none"
@@ -1522,7 +1589,11 @@ function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onC
             exit={{ opacity: 0 }}
             transition={{ duration: 0.6, ease: 'easeInOut' }}
           >
-            <div className={planMode ? 'plan-glow' : 'research-glow'} aria-hidden="true" />
+            <div className={planMode ? 'plan-glow' : 'research-glow'} aria-hidden="true">
+              {/* Static conic gradient rotated on the compositor; the rim mask
+                  lives on .glow-rim (see index.css). */}
+              <div className="glow-rim"><div className="glow-spin" /></div>
+            </div>
           </motion.div>
         )}
       </AnimatePresence>
@@ -1545,7 +1616,7 @@ function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onC
   )
 }
 
-function MessageBubble({ role, content, streaming }: { role: 'user' | 'assistant'; content: string; streaming: boolean }) {
+const MessageBubble = memo(function MessageBubble({ role, content, streaming }: { role: 'user' | 'assistant'; content: string; streaming: boolean }) {
   const isUser = role === 'user'
   const contentRef = useRef<HTMLDivElement>(null)
   return (
@@ -1559,7 +1630,14 @@ function MessageBubble({ role, content, streaming }: { role: 'user' | 'assistant
       >
         <div ref={contentRef}>
           {content
-            ? (isUser ? <div className="whitespace-pre-wrap break-words">{content}</div> : <MessageContent text={content} />)
+            ? (isUser
+                // While streaming, render plain text — re-parsing the whole
+                // growing reply as markdown per frame was O(n²). One markdown
+                // parse happens when the stream finishes.
+                ? <div className="whitespace-pre-wrap break-words">{content}</div>
+                : streaming
+                  ? <div className="whitespace-pre-wrap break-words">{content}</div>
+                  : <MessageContent text={content} />)
             : streaming ? (
               <span className="inline-flex gap-1 items-center text-zinc-500">
                 <span className="size-1.5 rounded-full bg-zinc-500 animate-pulse" />
@@ -1572,7 +1650,7 @@ function MessageBubble({ role, content, streaming }: { role: 'user' | 'assistant
       </div>
     </div>
   )
-}
+})
 
 // Copy-to-clipboard button. `getText` returns the RENDERED text (innerText of
 // the message), so the clipboard gets the readable version — no markdown syntax.
@@ -1619,7 +1697,7 @@ function PreBlock(props: React.HTMLAttributes<HTMLPreElement>) {
 // Full markdown renderer (GFM: tables, lists, code, links, headings, hr…).
 // Styling lives in `.md-body` in index.css; wide tables/code scroll inside the
 // bubble so nothing overflows.
-function MessageContent({ text }: { text: string }) {
+const MessageContent = memo(function MessageContent({ text }: { text: string }) {
   // Scrub any tool-log echo the model leaked into its prose (see stripToolEcho).
   const clean = stripToolEcho(text)
   return (
@@ -1635,65 +1713,35 @@ function MessageContent({ text }: { text: string }) {
       </ReactMarkdown>
     </div>
   )
-}
+})
 
-// Render streamed chunks with a dark→bright glow reveal. Only the last few
-// chunks are animated <span>s; everything older is collapsed into ONE static
-// text node. This keeps the DOM tiny (a handful of spans, not hundreds) so the
-// animation never bogs down on long outputs.
-const GLOW_TAIL = 12
-function GlowChunks({ chunks }: { chunks: string[] }) {
-  if (chunks.length <= GLOW_TAIL) {
-    return (
-      <>
-        {chunks.map((c, i) => <span key={i} className="stream-chunk">{c}</span>)}
-      </>
-    )
-  }
-  const splitAt = chunks.length - GLOW_TAIL
-  const head = chunks.slice(0, splitAt).join('')
-  const tail = chunks.slice(splitAt)
-  return (
-    <>
-      <span>{head}</span>
-      {tail.map((c, i) => <span key={splitAt + i} className="stream-chunk">{c}</span>)}
-    </>
-  )
-}
-
-// Assistant text (agent mode). User prompts stay plain; assistant text renders
-// as markdown (updates live as chunks stream in).
-function GlowMessage({ role, chunks }: { role: 'user' | 'assistant'; chunks: string[] }) {
+// A message that is STILL STREAMING (items keep `chunks` only while live —
+// they're flattened to `content` when the run ends). Streams as plain text:
+// re-parsing the growing reply as markdown on every reveal tick was O(n²).
+// The finished message renders once through MessageBubble's markdown path.
+const GlowMessage = memo(function GlowMessage({ role, chunks }: { role: 'user' | 'assistant'; chunks: string[] }) {
   const isUser = role === 'user'
   const text = chunks.join('')
-  const contentRef = useRef<HTMLDivElement>(null)
   return (
     <div className={isUser ? 'flex justify-end' : 'flex justify-start'}>
       <div
-        className={`group relative select-text max-w-[92%] min-w-0 overflow-hidden break-words rounded-lg px-3 py-2 text-xs leading-relaxed ${
+        className={`group relative select-text max-w-[92%] min-w-0 overflow-hidden break-words whitespace-pre-wrap rounded-lg px-3 py-2 text-xs leading-relaxed ${
           isUser
-            ? 'bg-blue-600/20 border border-blue-500/30 text-zinc-100 whitespace-pre-wrap'
+            ? 'bg-blue-600/20 border border-blue-500/30 text-zinc-100'
             : 'bg-zinc-900 border border-zinc-800 text-zinc-200'
         }`}
       >
-        <div ref={contentRef}>{isUser ? text : <MessageContent text={text} />}</div>
-        {!isUser && text.trim() && <CopyButton getText={() => contentRef.current?.innerText || text} />}
+        {text}
       </div>
     </div>
   )
-}
+})
 
-// Fade + rise-in wrapper for transcript items appearing one by one.
+// Fade + rise-in wrapper for transcript items appearing one by one. A plain
+// CSS animation (runs once on mount) — the previous framer-motion wrapper put
+// hundreds of live motion components in long transcripts.
 function RiseIn({ children }: { children: ReactNode }) {
-  return (
-    <motion.div
-      initial={{ opacity: 0, y: 10 }}
-      animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.32, ease: [0.22, 1, 0.36, 1] }}
-    >
-      {children}
-    </motion.div>
-  )
+  return <div className="rise-in">{children}</div>
 }
 
 // Renders text as per-word spans whose dark-dip animation is staggered by word
@@ -1728,7 +1776,7 @@ function ContextMeter({ used, window }: { used: number; window: number }) {
 // The model's reasoning ("thinking"), docked above the composer so it doesn't
 // clutter the chat. Collapsed by default: shows the last couple of lines auto-
 // scrolling like a ticker. Expand for the full, scrollable chain.
-function ThinkingDock({ chunks, active }: { chunks: string[]; active: boolean }) {
+function ThinkingDock({ text, active }: { text: string; active: boolean }) {
   const [expanded, setExpanded] = useState(false)
   // "settled" = text has fully streamed in but the model is still thinking
   // (no new chunk for a beat). Drives the loading shimmer sweep.
@@ -1738,17 +1786,16 @@ function ThinkingDock({ chunks, active }: { chunks: string[]; active: boolean })
   // Keep the collapsed ticker pinned to the newest text as it streams.
   useEffect(() => {
     if (!expanded) tickerRef.current?.scrollTo({ top: tickerRef.current.scrollHeight })
-  }, [chunks, expanded])
+  }, [text, expanded])
 
   // Whenever new reasoning text arrives, reset "settled"; if nothing new comes
   // for 700ms while still active, mark settled so the shimmer kicks in.
-  const total = chunks.length
   useEffect(() => {
     setSettled(false)
     if (!active) return
     const t = setTimeout(() => setSettled(true), 700)
     return () => clearTimeout(t)
-  }, [total, active])
+  }, [text.length, active])
   const shimmer = active && settled
 
   return (
@@ -1773,7 +1820,10 @@ function ThinkingDock({ chunks, active }: { chunks: string[]; active: boolean })
         } ${expanded ? 'max-h-60' : 'max-h-10'}`}
         style={expanded ? undefined : { maskImage: 'linear-gradient(to bottom, transparent, black 40%)' }}
       >
-        {shimmer ? <ShimmerText text={chunks.join('')} /> : <GlowChunks chunks={chunks} />}
+        {/* Shimmer only on the small collapsed ticker — animating
+            background-clip:text across the FULL expanded reasoning repainted
+            a large text block every frame. */}
+        {shimmer && !expanded ? <ShimmerText text={text} /> : <span>{text}</span>}
       </div>
     </motion.div>
   )
@@ -1783,22 +1833,39 @@ function ThinkingDock({ chunks, active }: { chunks: string[]; active: boolean })
 // (icon + name + target). Expand to see the tool's output.
 // A delegated child agent, rendered as a nested collapsible card that
 // subscribes to the child's own run channel and streams its live activity.
-function SubAgentCard({ entry }: { entry: SubAgentEntry }) {
+const SubAgentCard = memo(function SubAgentCard({ entry }: { entry: SubAgentEntry }) {
   const [open, setOpen] = useState(false)
   const [tools, setTools] = useState<ToolEntry[]>([])
   const [text, setText] = useState('')
   const [status, setStatus] = useState<'running' | 'done' | 'error' | 'blocked'>('running')
 
   useEffect(() => {
+    // Coalesce the child's token stream into one setState per frame — a
+    // setState per IPC token re-rendered this card 30+ times a second.
+    const buf = { text: '', raf: null as number | null }
+    const flush = () => {
+      buf.raf = null
+      const chunk = buf.text
+      buf.text = ''
+      if (chunk) setText((t) => t + chunk)
+    }
     const off = window.api.onAiAgentEvent(entry.childRunId, (e: IdeAgentEvent) => {
-      if (e.type === 'token') setText((t) => t + e.delta)
-      else if (e.type === 'tool_call') setTools((ts) => [...ts, { kind: 'tool', callId: e.callId, name: e.name, args: e.args, running: true }])
+      if (e.type === 'token') {
+        buf.text += e.delta
+        if (buf.raf == null) buf.raf = requestAnimationFrame(flush)
+        return
+      }
+      if (buf.raf != null) { cancelAnimationFrame(buf.raf); flush() }
+      if (e.type === 'tool_call') setTools((ts) => [...ts, { kind: 'tool', callId: e.callId, name: e.name, args: e.args, running: true }])
       else if (e.type === 'tool_result') setTools((ts) => ts.map((t) => t.callId === e.callId ? { ...t, result: e.result, isError: e.isError, running: false } : t))
       else if (e.type === 'done') { setStatus('done'); if (e.text) setText(e.text) }
       else if (e.type === 'error') { setStatus('error'); setText((t) => t + `\n⚠ ${e.error}`) }
       else if (e.type === 'blocked') { setStatus('blocked'); setText((t) => t + `\n⛔ ${e.reason}`) }
     })
-    return off
+    return () => {
+      if (buf.raf != null) cancelAnimationFrame(buf.raf)
+      off()
+    }
   }, [entry.childRunId])
 
   const dot = status === 'running'
@@ -1827,7 +1894,10 @@ function SubAgentCard({ entry }: { entry: SubAgentEntry }) {
           {tools.map((t, i) => <ToolActivity key={i} entry={t} />)}
           {text.trim() && (
             <div className="rounded bg-zinc-900/60 border border-zinc-800 px-2 py-1.5">
-              <MessageContent text={text} />
+              {/* Plain text while streaming; parse markdown once when done. */}
+              {status === 'running'
+                ? <div className="whitespace-pre-wrap break-words text-xs text-zinc-300">{text}</div>
+                : <MessageContent text={text} />}
             </div>
           )}
         </div>
@@ -1837,9 +1907,9 @@ function SubAgentCard({ entry }: { entry: SubAgentEntry }) {
       )}
     </div>
   )
-}
+})
 
-function ToolActivity({ entry }: { entry: ToolEntry }) {
+const ToolActivity = memo(function ToolActivity({ entry }: { entry: ToolEntry }) {
   const [open, setOpen] = useState(false)
   const icon = {
     Read: <FileText size={12} />,
@@ -1920,4 +1990,4 @@ function ToolActivity({ entry }: { entry: ToolEntry }) {
       )}
     </div>
   )
-}
+})
