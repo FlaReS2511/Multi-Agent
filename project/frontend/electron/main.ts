@@ -891,13 +891,49 @@ ipcMain.handle('group-memory', (_evt, groupId: string) => {
 interface PtySession {
   proc: import('node-pty').IPty
   agent: string
-  history: string           // recent output buffer for late-attaching renderers
+  history: string[]         // recent output chunks for late-attaching renderers
+  historyBytes: number      // running total; whole chunks trimmed from the front
   lastActivityAt: number    // millis; bumped on inbox event, proc.onData, pty-write
   spawnedAt: number         // millis; for warm-up gating + diagnostics
 }
 
 const ptySessions = new Map<string, PtySession>()
 const HISTORY_MAX = 50_000  // keep last ~50KB per session
+
+// Append a chunk to a history buffer, trimming whole chunks from the front —
+// the old string concat + slice(-50k) reallocated the full 50KB per chunk.
+function pushHistory(h: { history: string[]; historyBytes: number }, data: string): void {
+  h.history.push(data)
+  h.historyBytes += data.length
+  while (h.historyBytes > HISTORY_MAX && h.history.length > 1) {
+    h.historyBytes -= h.history[0].length
+    h.history.shift()
+  }
+}
+
+// Batch terminal output crossing IPC: one webContents.send per ~16ms per
+// channel instead of one per PTY chunk — fast producers (builds, `yes`)
+// emitted hundreds of individually-serialized messages a second.
+function makeIpcBatcher(channel: string): { push: (data: string) => void; flush: () => void } {
+  let buf = ''
+  let timer: ReturnType<typeof setTimeout> | null = null
+  const flush = () => {
+    if (timer) { clearTimeout(timer); timer = null }
+    if (!buf) return
+    const chunk = buf
+    buf = ''
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send(channel, chunk)
+    }
+  }
+  return {
+    push: (data: string) => {
+      buf += data
+      if (!timer) timer = setTimeout(flush, 16)
+    },
+    flush,
+  }
+}
 
 // In-flight spawn promises so two concurrent ensurePty() calls don't double-spawn.
 const spawnLocks = new Map<string, Promise<PtySession>>()
@@ -939,24 +975,21 @@ async function doSpawn(agent: string): Promise<PtySession> {
 
   const now = Date.now()
   const s: PtySession = {
-    proc, agent, history: '',
+    proc, agent, history: [], historyBytes: 0,
     lastActivityAt: now,
     spawnedAt: now,
   }
   ptySessions.set(agent, s)
 
+  const batcher = makeIpcBatcher(`pty-data:${agent}`)
   proc.onData((data) => {
-    s.history += data
-    if (s.history.length > HISTORY_MAX) {
-      s.history = s.history.slice(-HISTORY_MAX)
-    }
+    pushHistory(s, data)
     s.lastActivityAt = Date.now()
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send(`pty-data:${agent}`, data)
-    }
+    batcher.push(data)
   })
 
   proc.onExit(({ exitCode, signal }) => {
+    batcher.flush() // deliver the tail before the exit marker
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send(`pty-exit:${agent}`, { exitCode, signal })
     }
@@ -997,7 +1030,7 @@ function startIdleGc() {
 
 ipcMain.handle('pty-start', async (_evt, agent: string) => {
   const s = await ensurePty(agent)
-  return { ok: true, history: s.history }
+  return { ok: true, history: s.history.join('') }
 })
 
 // pty-attach: read-only attach. Returns existing session's history without
@@ -1006,7 +1039,7 @@ ipcMain.handle('pty-start', async (_evt, agent: string) => {
 ipcMain.handle('pty-attach', (_evt, agent: string) => {
   const s = ptySessions.get(agent)
   if (!s) return { alive: false, history: '' }
-  return { alive: true, history: s.history }
+  return { alive: true, history: s.history.join('') }
 })
 
 // ── Cost summary (aggregated from the usage table) ───────────
@@ -1161,7 +1194,8 @@ app.on('before-quit', () => {
 
 interface ShellSession {
   proc: import('node-pty').IPty
-  history: string
+  history: string[]
+  historyBytes: number
 }
 const shellSessions = new Map<string, ShellSession>()
 
@@ -1186,23 +1220,22 @@ ipcMain.handle('shell-start', (_evt, id: string) => {
       cwd: workspaceRoot,
       env: { ...process.env, TERM: 'xterm-256color' },
     })
-    s = { proc, history: '' }
+    s = { proc, history: [], historyBytes: 0 }
     shellSessions.set(id, s)
+    const batcher = makeIpcBatcher(`shell-data:${id}`)
     proc.onData((data) => {
-      s!.history += data
-      if (s!.history.length > HISTORY_MAX) s!.history = s!.history.slice(-HISTORY_MAX)
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send(`shell-data:${id}`, data)
-      }
+      pushHistory(s!, data)
+      batcher.push(data)
     })
     proc.onExit(({ exitCode }) => {
+      batcher.flush() // deliver the tail before the exit marker
       if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.webContents.send(`shell-exit:${id}`, { exitCode })
       }
       shellSessions.delete(id)
     })
   }
-  return { ok: true, history: s.history }
+  return { ok: true, history: s.history.join('') }
 })
 
 ipcMain.handle('shell-write', (_evt, id: string, data: string) => {

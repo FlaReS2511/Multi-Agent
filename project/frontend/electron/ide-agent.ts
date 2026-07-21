@@ -58,6 +58,33 @@ function trimOldToolResults(messages: unknown[], keepTail: number): void {
   }
 }
 
+// Coalesce token/reasoning deltas into one renderer event per ~25ms — one
+// webContents.send per SSE token flooded IPC (and the renderer) at 30-100
+// messages a second for the main run AND every sub-agent. Non-text events
+// flush the buffer first so ordering (text before its tool card) is kept.
+function coalesceEmit(raw: (e: IdeAgentEvent) => void): (e: IdeAgentEvent) => void {
+  let buf: { type: 'reasoning' | 'token'; delta: string; turn: number } | null = null
+  let timer: ReturnType<typeof setTimeout> | null = null
+  const flush = () => {
+    if (timer) { clearTimeout(timer); timer = null }
+    if (buf) { const b = buf; buf = null; raw(b) }
+  }
+  return (e: IdeAgentEvent) => {
+    if (e.type === 'token' || e.type === 'reasoning') {
+      if (buf && buf.type === e.type && buf.turn === e.turn) {
+        buf.delta += e.delta
+      } else {
+        flush()
+        buf = { type: e.type, delta: e.delta, turn: e.turn }
+      }
+      if (!timer) timer = setTimeout(flush, 25)
+      return
+    }
+    flush()
+    raw(e)
+  }
+}
+
 // "I'll do X:" and then silence — the model narrated an action instead of
 // calling the tool and ended its turn. These patterns (EN + VI) detect an
 // announced-but-unexecuted action at the END of a text-only reply so the loop
@@ -535,13 +562,16 @@ export async function runIdeAgent(
   sharedDir: string,
   params: IdeAgentParams,
   decrypt: (b64: string) => string,
-  emit: (e: IdeAgentEvent) => void,
+  emitRaw: (e: IdeAgentEvent) => void,
   signal: AbortSignal,
   requestReview?: (change: PendingChange) => Promise<ReviewDecision>,
   editorBridge?: (op: EditorRequest['op'], args: Record<string, unknown>) => Promise<EditorResponse>,
   orchestrationBridge?: OrchestrationBridge,
   requestAction?: (action: PendingAction) => Promise<boolean>,
 ): Promise<void> {
+  // Every terminal path below ends with a non-token event (done/error/
+  // blocked/plan), which flushes any buffered text first.
+  const emit = coalesceEmit(emitRaw)
   try {
     const providers = loadProviders(sharedDir)
     const pc = providers[params.provider]
