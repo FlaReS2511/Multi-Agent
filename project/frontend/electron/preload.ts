@@ -2,8 +2,6 @@ import { contextBridge, ipcRenderer, webFrame } from 'electron'
 
 const api = {
   getTasks: () => ipcRenderer.invoke('get-tasks'),
-  getInboxSummary: () => ipcRenderer.invoke('get-inbox-summary'),
-  getInboxContent: (agent: string) => ipcRenderer.invoke('get-inbox-content', agent),
   getLogs: () => ipcRenderer.invoke('get-logs'),
   getRoot: () => ipcRenderer.invoke('get-root'),
   createTask: (input: {
@@ -43,7 +41,6 @@ const api = {
     ipcRenderer.invoke('set-provider-key', input),
   clearProviderKey: (provider: string) =>
     ipcRenderer.invoke('clear-provider-key', provider),
-  getAllLogs: () => ipcRenderer.invoke('get-all-logs'),
   updateTask: (id: string, changes: { deps?: string[]; priority?: 'low' | 'medium' | 'high' }) =>
     ipcRenderer.invoke('update-task', id, changes),
   listArtifactTasks: () => ipcRenderer.invoke('list-artifact-tasks'),
@@ -245,6 +242,13 @@ const api = {
     ipcRenderer.on('browser-url-changed', listener)
     return () => ipcRenderer.removeListener('browser-url-changed', listener)
   },
+  // Sub-agents spawned by the chat agent (live list for the sidebar).
+  subagentList: () => ipcRenderer.invoke('subagent-list'),
+  onSubagentEvent: (cb: (list: unknown[]) => void) => {
+    const listener = (_e: unknown, list: unknown[]) => cb(list)
+    ipcRenderer.on('subagent-event', listener)
+    return () => ipcRenderer.removeListener('subagent-event', listener)
+  },
   setAutoTrigger: (enabled: boolean) => ipcRenderer.invoke('set-auto-trigger', enabled),
   getAutoTrigger: () => ipcRenderer.invoke('get-auto-trigger'),
   onAutoTrigger: (cb: (info: { agent: string }) => void) => {
@@ -285,6 +289,18 @@ const api = {
     ipcRenderer.on('window-maximized-changed', listener)
     return () => ipcRenderer.removeListener('window-maximized-changed', listener)
   },
+
+  // Quit guard: main asks before closing; the renderer confirms when safe.
+  onAppCloseRequest: (cb: () => void) => {
+    const listener = () => cb()
+    ipcRenderer.on('app-close-request', listener)
+    return () => ipcRenderer.removeListener('app-close-request', listener)
+  },
+  appCloseConfirm: () => ipcRenderer.send('app-close-confirm'),
+
+  // OS notification (used when the agent needs attention and the window is
+  // unfocused).
+  osNotify: (title: string, body: string) => ipcRenderer.send('os-notify', title, body),
 }
 
 contextBridge.exposeInMainWorld('api', api)

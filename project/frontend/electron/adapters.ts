@@ -7,7 +7,68 @@
 
 import { ToolSpec } from './agent-tools'
 
-export interface ToolCall { id: string; name: string; args: Record<string, unknown> }
+export interface ToolCall {
+  id: string
+  name: string
+  args: Record<string, unknown>
+  // The argument JSON arrived truncated/malformed (output cap or dropped
+  // stream) — the caller should NOT execute this call with empty args.
+  invalid?: boolean
+}
+
+// Some OpenAI-compatible gateways don't translate a model's native tool-call
+// tokens, so the call leaks into the visible text as JSON/XML instead of
+// arriving in `tool_calls` — the reply reads "I'll do X:" plus a JSON blob and
+// the loop sees no tool call at all. Recover those: scan the text for the
+// common leak formats and convert any whose name matches a real tool.
+export function extractLeakedToolCalls(
+  text: string,
+  toolNames: Set<string>,
+): { calls: ToolCall[]; cleaned: string } | null {
+  if (!text || !text.includes('{')) return null
+  const calls: ToolCall[] = []
+  const tryAdd = (raw: string): boolean => {
+    let obj: unknown
+    try { obj = JSON.parse(raw) } catch { return false }
+    const items = Array.isArray(obj) ? obj : [obj]
+    if (items.length === 0) return false
+    const found: ToolCall[] = []
+    for (const item of items as any[]) {
+      const name = item?.name ?? item?.tool ?? item?.function?.name
+      if (typeof name !== 'string' || !toolNames.has(name)) return false
+      let args = item?.arguments ?? item?.parameters ?? item?.input ?? item?.function?.arguments ?? {}
+      if (typeof args === 'string') { try { args = JSON.parse(args) } catch { return false } }
+      if (typeof args !== 'object' || args === null || Array.isArray(args)) return false
+      found.push({ id: `leak-${calls.length + found.length}-${Date.now()}`, name, args })
+    }
+    calls.push(...found)
+    return true
+  }
+  // Formats, most specific first: <tool_call>{…}</tool_call> (Hermes/Qwen),
+  // [TOOL_CALLS][{…}] (Mistral), fenced ```json blocks, and as a last resort a
+  // bare {"name": …, "arguments": {…}} object ending the reply (bounded to the
+  // last ~4KB so a long prose reply isn't scanned wholesale). tryAdd only
+  // accepts objects naming a KNOWN tool, so ordinary JSON in prose survives.
+  const patterns = [
+    /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g,
+    /\[TOOL_CALLS\]\s*(\[[\s\S]*?\])\s*$/,
+    /```(?:json|tool_call|tool)?\s*\n?([\s\S]*?)```/g,
+    /(\{[\s\S]{0,4000}\})\s*$/,
+  ]
+  let cleaned = text
+  for (const re of patterns) {
+    const matchedAny = calls.length
+    cleaned = cleaned.replace(re, (m, g1: string) => {
+      const s = g1.trim()
+      // Only bother JSON-parsing candidates that even look like JSON.
+      if (!s.startsWith('{') && !s.startsWith('[')) return m
+      return tryAdd(s) ? '' : m
+    })
+    if (calls.length > matchedAny) break // one leak format per reply
+  }
+  if (calls.length === 0) return null
+  return { calls, cleaned: cleaned.trim() }
+}
 export interface ChatResult {
   text: string
   toolCalls: ToolCall[]
@@ -69,15 +130,22 @@ export class OpenAIAdapter implements Adapter {
   private baseUrl: string
   private key: string
   private tools: unknown[]
+  private toolNames: Set<string>
+  private maxTokens: number
+  // Once the provider has delivered structured tool calls, skip the
+  // leaked-call text recovery — that gateway clearly translates them.
+  private sawNativeToolCalls = false
 
-  constructor(model: string, baseUrl: string | undefined, key: string, toolSpecs: ToolSpec[]) {
+  constructor(model: string, baseUrl: string | undefined, key: string, toolSpecs: ToolSpec[], maxTokens = 8192) {
     this.model = model || 'gpt-5'
     this.baseUrl = (baseUrl || 'https://api.openai.com/v1').replace(/\/$/, '')
     this.key = key || 'no-key'
+    this.maxTokens = maxTokens
     this.tools = toolSpecs.map((s) => ({
       type: 'function',
       function: { name: s.name, description: s.description, parameters: s.input_schema },
     }))
+    this.toolNames = new Set(toolSpecs.map((s) => s.name))
   }
 
   async chat(messages: unknown[], system: string): Promise<ChatResult> {
@@ -86,7 +154,7 @@ export class OpenAIAdapter implements Adapter {
       messages: [{ role: 'system', content: system }, ...messages],
       tools: this.tools,
       tool_choice: 'auto',
-      max_tokens: 8192,
+      max_tokens: this.maxTokens,
     }
     const resp = await fetch(`${this.baseUrl}/chat/completions`, {
       method: 'POST',
@@ -103,13 +171,19 @@ export class OpenAIAdapter implements Adapter {
     if (Array.isArray(msg.tool_calls)) {
       for (const tc of msg.tool_calls) {
         let args: Record<string, unknown> = {}
-        try { args = JSON.parse(tc.function?.arguments || '{}') } catch { /* leave empty */ }
-        toolCalls.push({ id: tc.id, name: tc.function?.name, args })
+        let invalid = false
+        try { args = JSON.parse(tc.function?.arguments || '{}') } catch { invalid = true }
+        toolCalls.push({ id: tc.id, name: tc.function?.name, args, invalid: invalid || undefined })
       }
     }
     let text: string = msg.content || ''
     if (!text && toolCalls.length === 0) {
       text = msg.reasoning_content || msg.reasoning || ''
+    }
+    if (toolCalls.length > 0) this.sawNativeToolCalls = true
+    else if (text && !this.sawNativeToolCalls) {
+      const leaked = extractLeakedToolCalls(text, this.toolNames)
+      if (leaked) { toolCalls.push(...leaked.calls); text = leaked.cleaned }
     }
     const assistantMsg: any = { role: 'assistant', content: text }
     if (toolCalls.length > 0) {
@@ -137,7 +211,7 @@ export class OpenAIAdapter implements Adapter {
         messages: [{ role: 'system', content: system }, ...messages],
         tools: this.tools,
         tool_choice: 'auto',
-        max_tokens: 8192,
+        max_tokens: this.maxTokens,
         stream: true,
         stream_options: { include_usage: true },
       }),
@@ -155,8 +229,21 @@ export class OpenAIAdapter implements Adapter {
     // Did the stream end properly ([DONE] / finish_reason) or just drop?
     let finished = false
     let finishReason = ''
-    // Accumulate tool calls by index (OpenAI streams argument fragments).
-    const tcAcc = new Map<number, { id: string; name: string; args: string }>()
+    // Accumulate tool calls as the stream delivers argument fragments. Keyed
+    // by the stream `index` when present, else by call id; fragments carrying
+    // NEITHER attach to the most recent call — some gateways omit index
+    // entirely, and merging everything into slot 0 corrupted sibling calls.
+    const tcAcc: { id: string; name: string; args: string }[] = []
+    const tcKeys = new Map<string, number>()
+    const tcSlot = (tc: any): { id: string; name: string; args: string } => {
+      const key = tc.index != null ? `i:${tc.index}` : tc.id ? `id:${tc.id}` : ''
+      if (key && tcKeys.has(key)) return tcAcc[tcKeys.get(key)!]
+      if (!key && tcAcc.length > 0) return tcAcc[tcAcc.length - 1]
+      const slot = { id: '', name: '', args: '' }
+      if (key) tcKeys.set(key, tcAcc.length)
+      tcAcc.push(slot)
+      return slot
+    }
 
     await readSse(resp.body, (data) => {
       if (data === '[DONE]') { finished = true; return }
@@ -174,25 +261,29 @@ export class OpenAIAdapter implements Adapter {
       if (delta.content) { text += delta.content; handlers.onText?.(delta.content) }
       if (Array.isArray(delta.tool_calls)) {
         for (const tc of delta.tool_calls) {
-          const idx = tc.index ?? 0
-          const cur = tcAcc.get(idx) ?? { id: '', name: '', args: '' }
+          const cur = tcSlot(tc)
           if (tc.id) cur.id = tc.id
           if (tc.function?.name) cur.name = tc.function.name
           if (tc.function?.arguments) cur.args += tc.function.arguments
-          tcAcc.set(idx, cur)
         }
       }
     }, signal)
 
-    const toolCalls: ToolCall[] = [...tcAcc.entries()]
-      .sort((a, b) => a[0] - b[0])
-      .map(([, v]) => {
+    const toolCalls: ToolCall[] = tcAcc
+      .filter((v) => v.name)
+      .map((v, i) => {
         let args: Record<string, unknown> = {}
-        try { args = JSON.parse(v.args || '{}') } catch { /* leave empty */ }
-        return { id: v.id, name: v.name, args }
+        let invalid = false
+        try { args = JSON.parse(v.args || '{}') } catch { invalid = true }
+        return { id: v.id || `call-${i}-${Date.now()}`, name: v.name, args, invalid: invalid || undefined }
       })
 
     if (!text && toolCalls.length === 0 && reasoning) text = reasoning
+    if (toolCalls.length > 0) this.sawNativeToolCalls = true
+    else if (text && !this.sawNativeToolCalls) {
+      const leaked = extractLeakedToolCalls(text, this.toolNames)
+      if (leaked) { toolCalls.push(...leaked.calls); text = leaked.cleaned }
+    }
     const assistantMsg: any = { role: 'assistant', content: text }
     if (toolCalls.length > 0) {
       assistantMsg.tool_calls = toolCalls.map((tc) => ({
@@ -213,16 +304,32 @@ export class AnthropicAdapter implements Adapter {
   private baseUrl: string
   private key: string
   private tools: unknown[]
+  private toolNames: Set<string>
+  private maxTokens: number
+  private sawNativeToolCalls = false
 
-  constructor(model: string, key: string, baseUrl: string | undefined, toolSpecs: ToolSpec[]) {
+  constructor(model: string, key: string, baseUrl: string | undefined, toolSpecs: ToolSpec[], maxTokens = 8192) {
     this.model = model || 'claude-sonnet-4-6'
     this.baseUrl = (baseUrl || 'https://api.anthropic.com').replace(/\/$/, '')
     this.key = key
+    this.maxTokens = maxTokens
     this.tools = toolSpecs.map((s) => ({
       name: s.name,
       description: s.description,
       input_schema: s.input_schema,
     }))
+    // Prompt caching: breakpoint after the (static) tool specs so they're
+    // cache-read on every turn instead of re-billed at full input price.
+    if (this.tools.length > 0) {
+      (this.tools[this.tools.length - 1] as Record<string, unknown>).cache_control = { type: 'ephemeral' }
+    }
+    this.toolNames = new Set(toolSpecs.map((s) => s.name))
+  }
+
+  // The system prompt is byte-stable across a run — its own breakpoint caches
+  // it together with the tools prefix.
+  private systemBlocks(system: string): unknown {
+    return [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }]
   }
 
   async chat(messages: unknown[], system: string): Promise<ChatResult> {
@@ -235,8 +342,8 @@ export class AnthropicAdapter implements Adapter {
       },
       body: JSON.stringify({
         model: this.model,
-        max_tokens: 8192,
-        system,
+        max_tokens: this.maxTokens,
+        system: this.systemBlocks(system),
         tools: this.tools,
         messages,
       }),
@@ -252,6 +359,7 @@ export class AnthropicAdapter implements Adapter {
       if (block.type === 'text') textParts.push(block.text)
       else if (block.type === 'tool_use') toolCalls.push({ id: block.id, name: block.name, args: block.input ?? {} })
     }
+    if (toolCalls.length > 0) this.sawNativeToolCalls = true
     const usage = {
       input: json.usage?.input_tokens ?? 0,
       output: json.usage?.output_tokens ?? 0,
@@ -276,8 +384,8 @@ export class AnthropicAdapter implements Adapter {
       },
       body: JSON.stringify({
         model: this.model,
-        max_tokens: 8192,
-        system,
+        max_tokens: this.maxTokens,
+        system: this.systemBlocks(system),
         tools: this.tools,
         messages,
         stream: true,
@@ -340,14 +448,32 @@ export class AnthropicAdapter implements Adapter {
       else if (b.type === 'thinking') { cleanBlocks.push({ type: 'thinking', thinking: b.thinking }) }
       else if (b.type === 'tool_use') {
         let input: Record<string, unknown> = {}
-        try { input = JSON.parse(b._json || '{}') } catch { /* leave empty */ }
-        toolCalls.push({ id: b.id, name: b.name, args: input })
+        let invalid = false
+        try { input = JSON.parse(b._json || '{}') } catch { invalid = true }
+        toolCalls.push({ id: b.id, name: b.name, args: input, invalid: invalid || undefined })
         cleanBlocks.push({ type: 'tool_use', id: b.id, name: b.name, input })
       }
     }
 
+    let text = textParts.join('\n')
+    if (toolCalls.length > 0) this.sawNativeToolCalls = true
+    else if (text && !this.sawNativeToolCalls) {
+      const leaked = extractLeakedToolCalls(text, this.toolNames)
+      if (leaked) {
+        toolCalls.push(...leaked.calls)
+        text = leaked.cleaned
+        // Rebuild the assistant blocks so the tool_use ids we invented here
+        // match the tool_result ids we send back next turn.
+        const rebuilt: any[] = cleanBlocks.filter((blk) => blk.type === 'thinking')
+        if (text) rebuilt.push({ type: 'text', text })
+        for (const c of leaked.calls) rebuilt.push({ type: 'tool_use', id: c.id, name: c.name, input: c.args })
+        cleanBlocks.length = 0
+        cleanBlocks.push(...rebuilt)
+      }
+    }
+
     return {
-      text: textParts.join('\n'),
+      text,
       toolCalls,
       assistantMsg: { role: 'assistant', content: cleanBlocks },
       usage: { input: usageIn, output: usageOut },
@@ -370,7 +496,7 @@ export class AnthropicAdapter implements Adapter {
   }
 }
 
-export interface ProviderCfgLike { kind?: string; base_url?: string }
+export interface ProviderCfgLike { kind?: string; base_url?: string; max_output?: number }
 
 export function buildAdapter(
   providerCfg: ProviderCfgLike,
@@ -379,9 +505,13 @@ export function buildAdapter(
   toolSpecs: ToolSpec[],
 ): Adapter {
   const kind = providerCfg.kind || 'openai-compatible'
-  if (kind === 'anthropic') return new AnthropicAdapter(model, key, providerCfg.base_url, toolSpecs)
+  // Output cap per provider (agents-config.json → providers.<id>.max_output).
+  // The old hardcoded 8192 forced 'continue' round-trips that re-billed the
+  // whole prompt whenever a reply or tool payload ran long.
+  const maxTokens = providerCfg.max_output && providerCfg.max_output > 0 ? providerCfg.max_output : 8192
+  if (kind === 'anthropic') return new AnthropicAdapter(model, key, providerCfg.base_url, toolSpecs, maxTokens)
   if (kind === 'openai' || kind === 'openai-compatible') {
-    return new OpenAIAdapter(model, providerCfg.base_url, key, toolSpecs)
+    return new OpenAIAdapter(model, providerCfg.base_url, key, toolSpecs, maxTokens)
   }
   throw new Error(`unsupported provider kind: ${kind}`)
 }

@@ -4,7 +4,7 @@
 
 > **KIẾN TRÚC HIỆN TẠI (v0.4): API-ONLY + SQLite.**
 > - State động (tasks, messages/inbox, usage, logs, secrets) sống trong **`shared/state.db`** (SQLite), KHÔNG còn ở file markdown/JSON. `shared/agents-config.json` vẫn là file (config tĩnh).
-> - Agent chạy qua **API provider** (`scripts/agent_runtime.py`), không còn CLI (Claude Code/Codex/Gemini). Provider khai động trong `agents-config.json` → `providers` (kind + base_url + models). Cắm được VietAPI và mọi OpenAI-compatible/Anthropic/OpenAI/Google.
+> - Agent chạy qua **API provider** (`project/frontend/electron/agent-runtime.ts`, được Electron spawn dưới dạng `agent-runtime.js` — bản Python `scripts/agent_runtime.py` cũ đã xoá), không còn CLI (Claude Code/Codex/Gemini). Provider khai động trong `agents-config.json` → `providers` (kind + base_url + models). Cắm được VietAPI và mọi OpenAI-compatible/Anthropic/OpenAI/Google.
 > - Agent giao tiếp bằng **tools** do runtime cấp: `SendMessage`, `ListTasks`, `CreateTask`/`UpdateTask` (orchestrator only) — KHÔNG đọc/ghi file inbox/tasks.json bằng tay.
 > - Phần mô tả file-based bên dưới giữ lại cho bối cảnh lịch sử; chỗ nào nói "ghi `shared/inbox/*.md`" hay "ghi `tasks.json`" nay thay bằng tool tương ứng. Xem `REDESIGN_PLAN.md`.
 

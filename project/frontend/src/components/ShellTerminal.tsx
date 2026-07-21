@@ -6,6 +6,7 @@ import { useEffect, useRef, useState } from 'react'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import { SearchAddon } from '@xterm/addon-search'
+import { enableWebgl } from '../lib/termWebgl'
 import '@xterm/xterm/css/xterm.css'
 
 interface Props {
@@ -13,11 +14,19 @@ interface Props {
   active: boolean
 }
 
+// While hidden, buffered shell output is capped — beyond this the oldest
+// chunks are dropped (the scrollback wouldn't keep them anyway).
+const HIDDEN_BUFFER_MAX = 400_000
+
 export function ShellTerminal({ id, active }: Props) {
   const containerRef = useRef<HTMLDivElement>(null)
   const termRef = useRef<Terminal | null>(null)
   const fitRef = useRef<FitAddon | null>(null)
   const searchRef = useRef<SearchAddon | null>(null)
+  // Hidden shells stay mounted (buffers survive tab switches) but must not
+  // parse/render every byte off-screen — output buffers here until shown.
+  const activeRef = useRef(active)
+  const pendingRef = useRef<{ chunks: string[]; bytes: number }>({ chunks: [], bytes: 0 })
   // Cmd/Ctrl+F in-terminal search overlay.
   const [searchOpen, setSearchOpen] = useState(false)
   const [query, setQuery] = useState('')
@@ -68,7 +77,19 @@ export function ShellTerminal({ id, active }: Props) {
       })
     })
 
-    const offData = window.api.onShellData(id, (data) => term.write(data))
+    const offData = window.api.onShellData(id, (data) => {
+      if (!activeRef.current) {
+        const p = pendingRef.current
+        p.chunks.push(data)
+        p.bytes += data.length
+        while (p.bytes > HIDDEN_BUFFER_MAX && p.chunks.length > 1) {
+          p.bytes -= p.chunks[0].length
+          p.chunks.shift()
+        }
+        return
+      }
+      term.write(data)
+    })
     const offExit = window.api.onShellExit(id, ({ exitCode }) => {
       term.write(`\r\n\x1b[33m[shell exited: ${exitCode}]\x1b[0m\r\n`)
     })
@@ -103,7 +124,14 @@ export function ShellTerminal({ id, active }: Props) {
   }, [id])
 
   useEffect(() => {
+    activeRef.current = active
     if (active && termRef.current && fitRef.current) {
+      const p = pendingRef.current
+      if (p.chunks.length) {
+        termRef.current.write(p.chunks.join(''))
+        pendingRef.current = { chunks: [], bytes: 0 }
+      }
+      enableWebgl(termRef.current)
       requestAnimationFrame(() => {
         try { fitRef.current!.fit(); termRef.current!.focus() } catch { /* ignore */ }
       })

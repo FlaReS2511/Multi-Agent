@@ -4,7 +4,7 @@
 // their path via dataTransfer('text/orqon-path') so other panels (chat) can
 // accept file drops.
 
-import React, { useEffect, useRef, useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { Folder, FolderOpen, ChevronDown, ChevronRight } from 'lucide-react'
 import { getFileIcon } from './fileIcons'
@@ -65,11 +65,25 @@ function ancestorsOf(relPath: string): string[] {
   return out
 }
 
-export function IDEFileTree({
+export const IDEFileTree = React.memo(function IDEFileTree({
   files, selectedFile, onSelectFile, gitChanges,
   onRenameCommit, onDelete, onCreateCommit, onMove,
   createRequest, revealNonce, collapseNonce,
 }: IDEFileTreeProps) {
+  // Precompute git lookups ONCE per status change. Every row used to scan the
+  // whole gitChanges array (dirs even did a startsWith scan per row).
+  const changedFiles = useMemo(() => new Map(gitChanges.map((c) => [c.file, c.type])), [gitChanges])
+  const changedDirs = useMemo(() => {
+    const s = new Set<string>()
+    for (const c of gitChanges) {
+      let p = c.file
+      while (p.includes('/')) {
+        p = p.slice(0, p.lastIndexOf('/'))
+        s.add(p)
+      }
+    }
+    return s
+  }, [gitChanges])
   const [menu, setMenu] = useState<MenuState | null>(null)
   const [expandedDirs, setExpandedDirs] = useState<Set<string>>(new Set())
   const [editing, setEditing] = useState<Editing>(null)
@@ -186,7 +200,8 @@ export function IDEFileTree({
           depth={0}
           selectedFile={selectedFile}
           onSelectFile={onSelectFile}
-          gitChanges={gitChanges}
+          changedFiles={changedFiles}
+          changedDirs={changedDirs}
           expandedDirs={expandedDirs}
           toggleDir={toggleDir}
           editing={editing}
@@ -238,7 +253,7 @@ export function IDEFileTree({
       )}
     </div>
   )
-}
+})
 
 function MenuItem({ label, onClick, danger }: { label: string; onClick: () => void; danger?: boolean }) {
   return (
@@ -303,7 +318,9 @@ interface TreeNodeProps {
   depth: number
   selectedFile: string | null
   onSelectFile: (relPath: string) => void
-  gitChanges: { file: string; type: string }[]
+  /** Precomputed lookups (one pass per git-status change, shared by all rows). */
+  changedFiles: Map<string, string>
+  changedDirs: Set<string>
   expandedDirs: Set<string>
   toggleDir: (relPath: string) => void
   editing: Editing
@@ -316,9 +333,9 @@ interface TreeNodeProps {
   onContextMenu: (e: React.MouseEvent, node: FileNode) => void
 }
 
-function TreeNode(props: TreeNodeProps) {
+const TreeNode = React.memo(function TreeNode(props: TreeNodeProps) {
   const {
-    node, depth, selectedFile, onSelectFile, gitChanges,
+    node, depth, selectedFile, onSelectFile, changedFiles, changedDirs,
     expandedDirs, toggleDir, editing, setEditing, onRenameCommit, onCreateCommit,
     dragOverDir, setDragOverDir, onDropOn, onContextMenu,
   } = props
@@ -328,9 +345,9 @@ function TreeNode(props: TreeNodeProps) {
   const isDropTarget = node.isDir && dragOverDir === node.relPath
 
   const hasGitChanges = (n: FileNode): boolean =>
-    gitChanges.some((c) => c.file === n.relPath || c.file.startsWith(n.relPath + '/'))
+    changedDirs.has(n.relPath) || changedFiles.has(n.relPath)
 
-  const gitStatus = !node.isDir ? gitChanges.find((c) => c.file === node.relPath)?.type ?? null : null
+  const gitStatus = !node.isDir ? changedFiles.get(node.relPath) ?? null : null
   const isModified = gitStatus === 'M'
   const isAdded = gitStatus === 'A' || gitStatus === '??'
 
@@ -446,4 +463,4 @@ function TreeNode(props: TreeNodeProps) {
       )}
     </div>
   )
-}
+})

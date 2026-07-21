@@ -27,6 +27,85 @@ import * as db from './db'
 
 const MAX_TURNS = parseInt(process.env.IDE_AGENT_MAX_TURNS || '30', 10)
 
+// Cap a tool result fed back to the MODEL (the UI event is capped separately).
+// Read of a big file used to inject the whole thing; a few of those and the
+// prompt overflowed the context window, so the gateway truncated/dropped
+// mid-run and the agent just stopped.
+const MODEL_RESULT_CAP = 30_000
+
+// When the prompt nears the model's window, old tool results are shrunk to
+// this many chars (the model has already acted on them).
+const TRIM_KEEP_CHARS = 600
+
+// Shrink tool-result contents of OLDER messages in place, keeping the last
+// `keepTail` messages intact. Handles both OpenAI ('tool' role, string
+// content) and Anthropic (user message with tool_result blocks) shapes.
+function trimOldToolResults(messages: unknown[], keepTail: number): void {
+  const note = ' …[old tool output trimmed to save context]'
+  const end = Math.max(0, messages.length - keepTail)
+  for (let i = 0; i < end; i++) {
+    const m = messages[i] as any
+    if (!m) continue
+    if (m.role === 'tool' && typeof m.content === 'string' && m.content.length > TRIM_KEEP_CHARS + note.length) {
+      m.content = m.content.slice(0, TRIM_KEEP_CHARS) + note
+    } else if (m.role === 'user' && Array.isArray(m.content)) {
+      for (const b of m.content) {
+        if (b && b.type === 'tool_result' && typeof b.content === 'string' && b.content.length > TRIM_KEEP_CHARS + note.length) {
+          b.content = b.content.slice(0, TRIM_KEEP_CHARS) + note
+        }
+      }
+    }
+  }
+}
+
+// Coalesce token/reasoning deltas into one renderer event per ~25ms — one
+// webContents.send per SSE token flooded IPC (and the renderer) at 30-100
+// messages a second for the main run AND every sub-agent. Non-text events
+// flush the buffer first so ordering (text before its tool card) is kept.
+function coalesceEmit(raw: (e: IdeAgentEvent) => void): (e: IdeAgentEvent) => void {
+  let buf: { type: 'reasoning' | 'token'; delta: string; turn: number } | null = null
+  let timer: ReturnType<typeof setTimeout> | null = null
+  const flush = () => {
+    if (timer) { clearTimeout(timer); timer = null }
+    if (buf) { const b = buf; buf = null; raw(b) }
+  }
+  return (e: IdeAgentEvent) => {
+    if (e.type === 'token' || e.type === 'reasoning') {
+      if (buf && buf.type === e.type && buf.turn === e.turn) {
+        buf.delta += e.delta
+      } else {
+        flush()
+        buf = { type: e.type, delta: e.delta, turn: e.turn }
+      }
+      if (!timer) timer = setTimeout(flush, 25)
+      return
+    }
+    flush()
+    raw(e)
+  }
+}
+
+// "I'll do X:" and then silence — the model narrated an action instead of
+// calling the tool and ended its turn. These patterns (EN + VI) detect an
+// announced-but-unexecuted action at the END of a text-only reply so the loop
+// can nudge the model to actually execute instead of stopping the run.
+// TAIL = the rest of the LAST sentence only: no !?, newline, or sentence-ending
+// period — but a period glued to a non-space (ChatPanel.tsx, v1.2) is allowed.
+// Note \b is ASCII-only, so Vietnamese words starting with đ/ê/… need the
+// explicit (^|separator) boundary instead.
+const INTENT_TAIL = String.raw`(?:[^.!?\n]|\.(?=\S)){0,160}[.!…]?\s*$`
+const INTENT_TAIL_RES: RegExp[] = [
+  /[:：]\s*$/,
+  new RegExp(String.raw`\b(let me (?!know\b)|i['’]?ll |i will |i['’]?m going to |proceeding to )` + INTENT_TAIL, 'i'),
+  new RegExp(String.raw`(^|[\s(,;—–-])(tôi|mình|ta|chúng ta)\s+sẽ\s` + INTENT_TAIL, 'i'),
+  new RegExp(String.raw`(^|[\s(,;—–-])để\s+(tôi|mình)\s` + INTENT_TAIL, 'i'),
+  new RegExp(String.raw`(^|[\s(,;—–.-])(tiến hành|bắt đầu)\s+\S+` + INTENT_TAIL, 'i'),
+]
+function looksLikeAnnouncedAction(text: string): boolean {
+  const tail = text.slice(-260)
+  return INTENT_TAIL_RES.some((re) => re.test(tail))
+}
+
 // File-mutating tools whose success should reload the editor/file-tree.
 const FILE_CHANGED_TOOLS = new Set(['Write', 'Edit', 'MultiEdit', 'Move', 'Delete', 'NotebookEdit', 'DownloadFile'])
 
@@ -138,6 +217,27 @@ const ORCH_TOOL_SPECS: ToolSpec[] = [
 ]
 const ORCH_TOOL_NAMES = new Set(ORCH_TOOL_SPECS.map((s) => s.name))
 
+// SpawnAgent: delegate a sub-task to a CHILD instance of this same IDE agent
+// (full toolset — files, bash, browser). The child runs to completion in the
+// background and its summary is returned as the tool result. Always available
+// to the top-level chat agent; withheld from sub-agents themselves (depth cap).
+const SPAWN_AGENT_SPEC: ToolSpec = {
+  name: 'SpawnAgent',
+  description:
+    'Delegate a self-contained sub-task to a child agent that runs in the background with the FULL toolset ' +
+    '(read/write files, run commands, browse the web). It works autonomously and returns a summary of what it ' +
+    'did when finished. Use this to parallelize or offload a chunky, well-scoped piece of work — NOT for small ' +
+    'things you can just do yourself. Give it a clear, complete task description; it does not see this conversation.',
+  input_schema: {
+    type: 'object',
+    properties: {
+      task: { type: 'string', description: 'the complete, self-contained sub-task for the child agent' },
+      label: { type: 'string', description: 'a short label shown in the UI (e.g. "migrate auth")' },
+    },
+    required: ['task'],
+  },
+}
+
 // Control tool: let the agent bail out cleanly instead of looping to MAX_TURNS
 // on an impossible task. Always available.
 const REPORT_BLOCKED_SPEC: ToolSpec = {
@@ -169,16 +269,24 @@ const PRESENT_PLAN_SPEC: ToolSpec = {
   },
 }
 
+interface ToolSetOpts {
+  allowBash: boolean
+  orchestrationEnabled: boolean
+  isSubAgent?: boolean  // withhold editor round-trip + SpawnAgent + orch tools
+  canSpawn?: boolean    // top-level agent with a spawnSubAgent bridge available
+}
+
 // The FULL tool set for a run (used for plan-mode read-only filtering).
-function toolSpecsFor(opts: { allowBash: boolean; orchestrationEnabled: boolean }): ToolSpec[] {
+function toolSpecsFor(opts: ToolSetOpts): ToolSpec[] {
   const specs: ToolSpec[] = [
     ...FILE_TOOL_SPECS.filter((s) => opts.allowBash || s.name !== 'Bash'),
-    ...EDITOR_TOOL_SPECS,
+    ...(opts.isSubAgent ? [] : EDITOR_TOOL_SPECS),
     ...EXTRA_TOOL_SPECS,
     ...BROWSER_TOOL_SPECS,
     REPORT_BLOCKED_SPEC,
   ]
-  if (opts.orchestrationEnabled) specs.push(...ORCH_TOOL_SPECS)
+  if (opts.orchestrationEnabled && !opts.isSubAgent) specs.push(...ORCH_TOOL_SPECS)
+  if (opts.canSpawn && !opts.isSubAgent) specs.push(SPAWN_AGENT_SPEC)
   return specs
 }
 
@@ -224,14 +332,17 @@ const LOAD_GROUP_SPEC: ToolSpec = {
 const TODO_SPEC = EXTRA_BY_NAME.get('TodoWrite') // common + tiny → keep in core
 
 // Core tools sent every turn: file + editor + todo + control + LoadToolGroup.
-function coreSpecsFor(opts: { allowBash: boolean; orchestrationEnabled: boolean }): ToolSpec[] {
+// Sub-agents drop the editor round-trip (they don't drive the user's one
+// Monaco) and SpawnAgent (depth cap); they Write to disk directly.
+function coreSpecsFor(opts: ToolSetOpts): ToolSpec[] {
   const specs: ToolSpec[] = [
     ...FILE_TOOL_SPECS.filter((s) => opts.allowBash || s.name !== 'Bash'),
-    ...EDITOR_TOOL_SPECS,
+    ...(opts.isSubAgent ? [] : EDITOR_TOOL_SPECS),
   ]
   if (TODO_SPEC) specs.push(TODO_SPEC)
   specs.push(REPORT_BLOCKED_SPEC, LOAD_GROUP_SPEC)
-  if (opts.orchestrationEnabled) specs.push(...ORCH_TOOL_SPECS)
+  if (opts.orchestrationEnabled && !opts.isSubAgent) specs.push(...ORCH_TOOL_SPECS)
+  if (opts.canSpawn && !opts.isSubAgent) specs.push(SPAWN_AGENT_SPEC)
   return specs
 }
 
@@ -251,6 +362,10 @@ export interface IdeAgentParams {
   planMode?: boolean
   // Research mode: read-only deep investigation (web + code) → cited answer.
   researchMode?: boolean
+  // >0 when this run IS a spawned sub-agent (of the chat agent). Sub-agents
+  // get the full toolset minus editor round-trip and minus SpawnAgent (depth
+  // cap prevents fork-bombs).
+  subAgentDepth?: number
 }
 
 // Orchestration tools run in main (need db + coordinator), so they're routed
@@ -258,6 +373,9 @@ export interface IdeAgentParams {
 export interface OrchestrationBridge {
   createTask(input: { title: string; owner: string; description?: string; priority?: string }): Promise<string>
   createGroup(input: { task_id: string; worker_role: string }): Promise<string>
+  // Run a child IDE-agent to completion and return its final summary. Provided
+  // only for the top-level chat agent (sub-agents don't get SpawnAgent).
+  spawnSubAgent?(input: { task: string; label?: string }): Promise<string>
 }
 
 // A change awaiting the user's verdict in review mode.
@@ -302,6 +420,9 @@ export type IdeAgentEvent =
   | { type: 'plan'; plan: string; turns: number }
   | { type: 'done'; text: string; turns: number }
   | { type: 'error'; error: string }
+  // A child agent was spawned this turn: the renderer renders a nested card and
+  // subscribes to ai-agent-event:<childRunId> for its live transcript.
+  | { type: 'subagent_started'; childRunId: string; label: string; task: string }
 
 interface ProviderCfg extends ProviderCfgLike {
   models?: string[]
@@ -331,15 +452,24 @@ function estimateCostUsd(tokensIn: number, tokensOut: number, rates: [number, nu
   return (tokensIn * inRate + tokensOut * outRate) / 1_000_000
 }
 
-function buildSystemPrompt(params: IdeAgentParams, workspaceRoot: string): string {
+function buildSystemPrompt(params: IdeAgentParams, workspaceRoot: string, opts?: { canSpawn?: boolean }): string {
+  const isSubAgent = Boolean(params.subAgentDepth && params.subAgentDepth > 0)
+  const editorLine = isSubAgent
+    ? '' // sub-agents don't drive the user's editor; they write to disk directly
+    : 'You also have editor tools to work with what the user sees: OpenFile (show a file ' +
+      'in the editor, optionally at a line), GetOpenEditor (get the currently viewed file ' +
+      'and selection), and ShowDiff (preview a proposed change without writing it). '
   let s =
-    'You are an expert AI coding agent embedded in an IDE. You have tools ' +
+    (isSubAgent
+      ? 'You are a delegated sub-agent working autonomously on ONE self-contained sub-task handed to you ' +
+        'by the lead agent (given as the first user message). You do NOT see the main conversation. Complete ' +
+        'the task end to end, then reply with a SHORT summary of what you did and any result the lead needs. '
+      : 'You are an expert AI coding agent embedded in an IDE. ') +
+    'You have tools ' +
     'to read and modify the user\'s workspace directly: Read, Write, Edit, MultiEdit, ' +
     'Grep, Glob, ListDir, Move, Delete. ' +
-    'You also have editor tools to work with what the user sees: OpenFile (show a file ' +
-    'in the editor, optionally at a line), GetOpenEditor (get the currently viewed file ' +
-    'and selection), and ShowDiff (preview a proposed change without writing it), plus ' +
-    'TodoWrite to track a plan. ' +
+    editorLine +
+    'You have TodoWrite to track a plan. ' +
     'Extra tool groups are NOT loaded by default (to save context): git (status/diff/commit/' +
     'push/branch/checkout/config/account), github (PRs & issues), web (WebFetch, WebSearch), ' +
     'memory (remember/recall notes), background (long-running commands), and browser (drive a ' +
@@ -357,7 +487,14 @@ function buildSystemPrompt(params: IdeAgentParams, workspaceRoot: string): strin
     'Sensitive actions (git mutations, changing the identity, switching accounts, logging ' +
     'in, background commands) ask the user for confirmation automatically — just call the ' +
     'tool and the user will approve or decline. ' +
-    'Open the relevant file with OpenFile so the user can follow along. ' +
+    (isSubAgent ? '' : 'Open the relevant file with OpenFile so the user can follow along. ') +
+    (opts?.canSpawn
+      ? 'For large or parallelizable work, you can delegate a well-scoped sub-task to a child agent with ' +
+        'SpawnAgent(task, label) — it runs autonomously with the full toolset and returns a summary. Do NOT ' +
+        'delegate trivial things you can just do yourself. To run several sub-agents AT THE SAME TIME, emit ' +
+        'multiple SpawnAgent tool calls IN ONE turn (they execute in parallel); if the user asks for N agents, ' +
+        'make N SpawnAgent calls in that single turn. Give each a narrow, specific task — never "the whole workspace". '
+      : '') +
     'Work autonomously: inspect the code with Read/Grep/Glob before changing it, make ' +
     'the smallest correct edit, and prefer Edit over Write for existing files. ' +
     'Stay on-task: only explore the workspace when the task actually requires it — if the ' +
@@ -425,13 +562,16 @@ export async function runIdeAgent(
   sharedDir: string,
   params: IdeAgentParams,
   decrypt: (b64: string) => string,
-  emit: (e: IdeAgentEvent) => void,
+  emitRaw: (e: IdeAgentEvent) => void,
   signal: AbortSignal,
   requestReview?: (change: PendingChange) => Promise<ReviewDecision>,
   editorBridge?: (op: EditorRequest['op'], args: Record<string, unknown>) => Promise<EditorResponse>,
   orchestrationBridge?: OrchestrationBridge,
   requestAction?: (action: PendingAction) => Promise<boolean>,
 ): Promise<void> {
+  // Every terminal path below ends with a non-token event (done/error/
+  // blocked/plan), which flushes any buffered text first.
+  const emit = coalesceEmit(emitRaw)
   try {
     const providers = loadProviders(sharedDir)
     const pc = providers[params.provider]
@@ -452,6 +592,11 @@ export async function runIdeAgent(
 
     const allowBash = Boolean(params.allowBash)
     const orchestrationEnabled = Boolean(params.orchestrationEnabled && orchestrationBridge)
+    const isSubAgent = Boolean(params.subAgentDepth && params.subAgentDepth > 0)
+    // Top-level chat agent can delegate to child agents; sub-agents cannot
+    // (depth cap). Gated on the same orchestration opt-in.
+    const canSpawn = orchestrationEnabled && !isSubAgent && Boolean(orchestrationBridge?.spawnSubAgent)
+    const toolOpts: ToolSetOpts = { allowBash, orchestrationEnabled, isSubAgent, canSpawn }
     const contextWindow = contextWindowFor(model, pc)
     const planMode = Boolean(params.planMode)
     const researchMode = Boolean(params.researchMode) && !planMode
@@ -459,16 +604,16 @@ export async function runIdeAgent(
     // sends only the core set + LoadToolGroup; extra groups load on demand.
     let activeSpecs: ToolSpec[]
     if (planMode) {
-      activeSpecs = toolSpecsFor({ allowBash, orchestrationEnabled }).filter((s) => PLAN_READONLY_TOOLS.has(s.name))
+      activeSpecs = toolSpecsFor(toolOpts).filter((s) => PLAN_READONLY_TOOLS.has(s.name))
       activeSpecs.push(PRESENT_PLAN_SPEC)
     } else if (researchMode) {
-      activeSpecs = toolSpecsFor({ allowBash, orchestrationEnabled }).filter((s) => RESEARCH_READONLY_TOOLS.has(s.name))
+      activeSpecs = toolSpecsFor(toolOpts).filter((s) => RESEARCH_READONLY_TOOLS.has(s.name))
     } else {
-      activeSpecs = coreSpecsFor({ allowBash, orchestrationEnabled })
+      activeSpecs = coreSpecsFor(toolOpts)
     }
     let adapter = buildAdapter(pc, key, model, activeSpecs)
     const loadedGroups = new Set<string>()
-    const system = buildSystemPrompt(params, workspaceRoot)
+    const system = buildSystemPrompt(params, workspaceRoot, { canSpawn })
     // Seed the conversation with the prior chat turns (user + assistant text).
     const messages: unknown[] = params.messages.map((m) => ({ role: m.role, content: m.content }))
 
@@ -476,6 +621,7 @@ export async function runIdeAgent(
     let turns = 0
     let anyActivity = false // any tool call ran this run
     let lengthContinues = 0 // auto-continuations after hitting the output cap
+    let intentNudges = 0    // "you said you'd do it — call the tool" nudges
     let continuing = false  // this turn continues a capped reply
     let browserApproved = false // approve-once: driving the browser beyond localhost
 
@@ -521,11 +667,6 @@ export async function runIdeAgent(
         `[agent] turn=${turns + 1} finish=${res.finishReason || '-'} dropped=${!!res.dropped} ` +
         `tools=${toolCalls.length} textLen=${text.length} in=${usage.input} out=${usage.output}`,
       )
-      // Upstream closed the stream without a finish marker after partial
-      // output — flag it visibly instead of passing the cut-off reply as done.
-      if (res.dropped && streamedThisTurn && toolCalls.length === 0) {
-        emit({ type: 'token', delta: '\n\n⚠ [stream dropped — reply may be truncated]', turn })
-      }
       turns++
 
       // Record cost under a virtual role so it shows in the dashboard.
@@ -542,6 +683,10 @@ export async function runIdeAgent(
       // Report context fill: prompt tokens this turn = current context size.
       if (usage.input > 0) {
         emit({ type: 'context', used: usage.input, window: contextWindow, turn })
+        // Emergency brake: prompt near the window → trim harder (keep only
+        // the last 4 messages intact) so the next call doesn't overflow —
+        // overflow made gateways truncate/drop tool calls mid-run.
+        if (usage.input > contextWindow * 0.8) trimOldToolResults(messages, 4)
       }
 
       if (text) finalText = continuing ? finalText + text : text
@@ -551,10 +696,13 @@ export async function runIdeAgent(
         // and ask the model to continue seamlessly (up to 2 continuations).
         // Some gateways silently cap output and report finish=stop anyway —
         // treat a "stop" that ends mid-sentence as capped too (heuristic).
+        // A stream that DROPPED after partial output is the same situation
+        // (gateway died mid-reply) — continue instead of ending the run.
         const t = text.trimEnd()
         const looksTruncated =
           res.finishReason === 'stop' && t.length > 150 && /[\p{L}\p{N},(–—-]$/u.test(t) && !t.endsWith('```')
         const capped = res.finishReason === 'length' || res.finishReason === 'max_tokens' || looksTruncated
+          || (res.dropped && streamedThisTurn)
         if (capped && lengthContinues < 2 && !signal.aborted) {
           lengthContinues++
           continuing = true
@@ -565,7 +713,22 @@ export async function runIdeAgent(
           })
           continue
         }
-        if (capped) emit({ type: 'token', delta: '\n\n⚠ [reply hit the output limit — say "continue" to resume]', turn })
+        if (capped) emit({ type: 'token', delta: '\n\n⚠ [reply was cut off — say "continue" to resume]', turn })
+        // The model ANNOUNCED an action ("I'll now fix X:") but called no tool
+        // and ended its turn — without a nudge the run would just stop there.
+        // Push it to execute; bounded so a chatty model can't loop forever.
+        if (!capped && t && looksLikeAnnouncedAction(t) && intentNudges < 2 && !signal.aborted) {
+          intentNudges++
+          messages.push(assistantMsg)
+          messages.push({
+            role: 'user',
+            content:
+              'You announced an action but did not call any tool — the turn ended with words only. ' +
+              'CALL the tool(s) directly now to actually do it; do not re-describe the action. ' +
+              'If the task is already fully complete, reply with only the final summary.',
+          })
+          continue
+        }
         // Still empty after retries, nothing streamed, no tools ever ran →
         // surface it instead of silently ending the run with no reply at all.
         if (!finalText && !streamedThisTurn && !anyActivity) {
@@ -578,6 +741,10 @@ export async function runIdeAgent(
 
       const reviewOn = Boolean(params.reviewMode && requestReview)
       const results: string[] = []
+      // SpawnAgent runs children CONCURRENTLY: each call reserves its result
+      // slot and kicks off immediately, so two SpawnAgent calls in one turn run
+      // in parallel instead of one-after-another. Filled after the loop.
+      const pendingSpawns: { index: number; callId: string; promise: Promise<string> }[] = []
 
       // Ask the user to approve a sensitive action (shared by the extra-tools
       // gate and the outside-workspace gate below).
@@ -594,6 +761,16 @@ export async function runIdeAgent(
         if (signal.aborted) { emit({ type: 'error', error: 'cancelled' }); return }
         const callId = call.id || `${call.name}-${Date.now()}`
         emit({ type: 'tool_call', callId, name: call.name, args: call.args })
+
+        // The call's argument JSON arrived truncated/malformed (output cap or
+        // dropped stream) — don't execute it with empty args; tell the model
+        // so it re-issues the call instead of the run silently misfiring.
+        if (call.invalid) {
+          const r = 'error: this tool call\'s arguments arrived truncated/malformed (the reply was likely cut off) — re-issue the call; if the arguments were large, send a smaller version'
+          results.push(r)
+          emit({ type: 'tool_result', callId, name: call.name, result: r, isError: true })
+          continue
+        }
 
         // Control tool: bail out of the run cleanly.
         if (call.name === 'ReportBlocked') {
@@ -700,6 +877,30 @@ export async function runIdeAgent(
           }
         }
 
+        // SpawnAgent: kick the child off WITHOUT awaiting so sibling spawns in
+        // the same turn run in parallel. Reserve this call's result slot now;
+        // the summary lands after the loop. Errors resolve synchronously.
+        if (call.name === 'SpawnAgent') {
+          const a = call.args as { task?: string; label?: string }
+          if (!canSpawn || !orchestrationBridge?.spawnSubAgent) {
+            const denied = 'error: SpawnAgent is unavailable — enable orchestration in Backend Settings'
+            results.push(denied)
+            emit({ type: 'tool_result', callId, name: call.name, result: denied, isError: true })
+          } else if (!a.task?.trim()) {
+            const denied = 'error: task is required — describe the complete self-contained sub-task'
+            results.push(denied)
+            emit({ type: 'tool_result', callId, name: call.name, result: denied, isError: true })
+          } else {
+            anyActivity = true
+            const index = results.length
+            results.push('') // placeholder; filled once the child finishes
+            const promise = orchestrationBridge.spawnSubAgent({ task: a.task, label: a.label })
+              .catch((e: any) => `error: ${e?.message || e}`)
+            pendingSpawns.push({ index, callId, promise })
+          }
+          continue
+        }
+
         let result: string
         let isError = false
         const isMutation = call.name === 'Write' || call.name === 'Edit'
@@ -789,7 +990,7 @@ export async function runIdeAgent(
           }
         } else {
           try {
-            const r = runFileTool(workspaceRoot, call.name, call.args)
+            const r = await runFileTool(workspaceRoot, call.name, call.args)
             result = r == null ? `error: unknown tool ${call.name}` : r
             if (r == null || r.startsWith('error:')) isError = true
           } catch (e: any) {
@@ -805,12 +1006,31 @@ export async function runIdeAgent(
           }
         }
 
-        results.push(result)
+        // Cap what goes back to the model — a single huge result (full-file
+        // Read, big command output) could blow the context for the whole run.
+        results.push(result.length > MODEL_RESULT_CAP
+          ? result.slice(0, MODEL_RESULT_CAP) + '\n…[output truncated — re-run with a narrower scope (offset/limit, tighter pattern) for more]'
+          : result)
         emit({ type: 'tool_result', callId, name: call.name, result: result.slice(0, 2000), isError })
+      }
+
+      // Wait for any concurrently-spawned children, fill their result slots,
+      // and emit their (suppressed-in-UI) tool_results now that they're done.
+      if (pendingSpawns.length > 0) {
+        await Promise.all(pendingSpawns.map(async ({ index, callId, promise }) => {
+          const r = await promise
+          results[index] = r.length > MODEL_RESULT_CAP ? r.slice(0, MODEL_RESULT_CAP) + '\n…[summary truncated]' : r
+          emit({ type: 'tool_result', callId, name: 'SpawnAgent', result: r.slice(0, 2000), isError: r.startsWith('error:') })
+        }))
       }
 
       messages.push(assistantMsg)
       for (const m of adapter.toolResultsMessages(toolCalls, results)) messages.push(m)
+      // Proactively shrink tool results older than the last ~4 turns — the
+      // model already acted on them, yet they were re-sent at full size every
+      // turn until the 80% emergency brake. The trim is deterministic, so the
+      // already-trimmed prefix stays byte-stable for provider prompt caches.
+      trimOldToolResults(messages, 8)
     }
 
     emit({ type: 'done', text: finalText, turns })

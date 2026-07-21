@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
+import { enableWebgl } from '../lib/termWebgl'
 import '@xterm/xterm/css/xterm.css'
 
 interface Props {
@@ -8,12 +9,20 @@ interface Props {
   active: boolean
 }
 
+// While hidden, buffered PTY output is capped — beyond this the oldest chunks
+// are dropped (the scrollback wouldn't keep them anyway).
+const HIDDEN_BUFFER_MAX = 400_000
+
 export function AgentTerminal({ agent, active }: Props) {
   const containerRef = useRef<HTMLDivElement>(null)
   const termRef = useRef<Terminal | null>(null)
   const fitRef = useRef<FitAddon | null>(null)
   const [alive, setAlive] = useState<boolean | null>(null)
   const [starting, setStarting] = useState(false)
+  // Hidden terminals don't parse/render output — chunks buffer here and flush
+  // in one write when the terminal is shown again.
+  const activeRef = useRef(active)
+  const pendingRef = useRef<{ chunks: string[]; bytes: number }>({ chunks: [], bytes: 0 })
 
   // Poll alive state so external spawns (inbox event, pre-warm) flip the UI
   // from placeholder to terminal without a manual refresh.
@@ -68,9 +77,11 @@ export function AgentTerminal({ agent, active }: Props) {
     const fit = new FitAddon()
     term.loadAddon(fit)
     term.open(containerRef.current)
+    if (activeRef.current) enableWebgl(term)
 
     termRef.current = term
     fitRef.current = fit
+    pendingRef.current = { chunks: [], bytes: 0 }
 
     requestAnimationFrame(() => {
       fit.fit()
@@ -83,6 +94,17 @@ export function AgentTerminal({ agent, active }: Props) {
     })
 
     const offData = window.api.onPtyData(agent, (data) => {
+      // Hidden → buffer instead of parsing/rendering every byte off-screen.
+      if (!activeRef.current) {
+        const p = pendingRef.current
+        p.chunks.push(data)
+        p.bytes += data.length
+        while (p.bytes > HIDDEN_BUFFER_MAX && p.chunks.length > 1) {
+          p.bytes -= p.chunks[0].length
+          p.chunks.shift()
+        }
+        return
+      }
       term.write(data)
     })
     const offExit = window.api.onPtyExit(agent, ({ exitCode }) => {
@@ -121,9 +143,17 @@ export function AgentTerminal({ agent, active }: Props) {
     }
   }, [agent, alive])
 
-  // When this terminal becomes active, refit & focus
+  // When this terminal becomes active: flush buffered output, upgrade to the
+  // GPU renderer, refit & focus.
   useEffect(() => {
+    activeRef.current = active
     if (active && termRef.current && fitRef.current) {
+      const p = pendingRef.current
+      if (p.chunks.length) {
+        termRef.current.write(p.chunks.join(''))
+        pendingRef.current = { chunks: [], bytes: 0 }
+      }
+      enableWebgl(termRef.current)
       requestAnimationFrame(() => {
         try {
           fitRef.current!.fit()

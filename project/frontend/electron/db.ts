@@ -5,8 +5,8 @@
 // encrypted provider secrets. The static `shared/agents-config.json` stays a
 // file (hand-editable, version-controlled).
 //
-// WAL mode lets the Electron process and the Python agent_runtime.py read/write
-// concurrently. Both open the same shared/state.db.
+// WAL mode lets the Electron main process and the agent-runtime child
+// processes read/write concurrently. All open the same shared/state.db.
 
 import Database from 'better-sqlite3'
 import path from 'node:path'
@@ -60,11 +60,26 @@ export function initDb(sharedDir: string): Database.Database {
   const dbPath = path.join(sharedDir, 'state.db')
   db = new Database(dbPath)
   db.pragma('journal_mode = WAL')
+  // The standard WAL pairing: durable enough (fsync on checkpoint, not on
+  // every single-row autocommit) and removes a per-insert fsync stall.
+  db.pragma('synchronous = NORMAL')
   db.pragma('busy_timeout = 5000')
   db.pragma('foreign_keys = ON')
   createSchema(db)
   ensureMeta(db)
+  pruneOldMessages(db)
   return db
+}
+
+// Processed messages are never read again; without pruning the table grows
+// forever under the 1.5s inbox polling. One sweep per app start is enough.
+function pruneOldMessages(d: Database.Database): void {
+  try {
+    const cutoff = new Date(Date.now() - 30 * 24 * 3600 * 1000)
+    const pad = (n: number) => String(n).padStart(2, '0')
+    const stamp = `${cutoff.getFullYear()}-${pad(cutoff.getMonth() + 1)}-${pad(cutoff.getDate())} 00:00`
+    d.prepare(`DELETE FROM messages WHERE status = 'processed' AND ts < ?`).run(stamp)
+  } catch { /* best-effort */ }
 }
 
 export function getDb(): Database.Database {
@@ -197,6 +212,9 @@ function createSchema(d: Database.Database): void {
   } catch {
     // column already exists — ignore
   }
+  // After the column exists: the coordinator SUMs usage by group every second
+  // for each live group — without this index that was a full-table scan.
+  d.exec(`CREATE INDEX IF NOT EXISTS idx_usage_group ON usage(group_id)`)
   // Migration: peak context (max prompt tokens seen in a session) + its window,
   // so the Groups panel can show how full each group's context got.
   try { d.exec(`ALTER TABLE groups ADD COLUMN peak_context INTEGER NOT NULL DEFAULT 0`) } catch { /* exists */ }
@@ -378,6 +396,15 @@ export function unreadCount(role: string): number {
   return r.n
 }
 
+// All unread counts in one grouped query — the inbox watcher used to issue a
+// DISTINCT scan plus one count query per role, every 1.5 seconds.
+export function unreadCountsByRole(): Map<string, number> {
+  const rows = getDb()
+    .prepare(`SELECT to_role, count(*) AS n FROM messages WHERE status = 'unread' GROUP BY to_role`)
+    .all() as { to_role: string; n: number }[]
+  return new Map(rows.map((r) => [r.to_role, r.n]))
+}
+
 export function markProcessed(id: number, processedAt: string): void {
   getDb()
     .prepare(`UPDATE messages SET status = 'processed', processed_at = ? WHERE id = ?`)
@@ -426,13 +453,22 @@ export function addUsage(u: AddUsageInput): void {
       task_id: u.task_id ?? null,
       group_id: u.group_id ?? null,
     })
+  // Maintain the group's spend incrementally so readers (Groups panel,
+  // Discord /vibe) can trust groups.spent_usd without rescanning usage;
+  // recomputeGroupSpend stays as the reconciling authority.
+  if (u.group_id && u.cost_usd) {
+    getDb()
+      .prepare(`UPDATE groups SET spent_usd = spent_usd + ? WHERE id = ?`)
+      .run(u.cost_usd, u.group_id)
+  }
 }
 
-// Usage rows whose ts starts with the given YYYY-MM-DD prefix.
+// Usage rows for the given YYYY-MM-DD day. Range predicate (not LIKE) so
+// idx_usage_ts is actually used instead of scanning the append-only table.
 export function usageForDay(dayPrefix: string): UsageRow[] {
   return getDb()
-    .prepare(`SELECT * FROM usage WHERE ts LIKE ? ORDER BY id`)
-    .all(dayPrefix + '%') as UsageRow[]
+    .prepare(`SELECT * FROM usage WHERE ts >= ? AND ts < ? ORDER BY id`)
+    .all(dayPrefix + ' 00:00', dayPrefix + ' 24:00') as UsageRow[]
 }
 
 // ── secrets (replaces .secrets.json) ─────────────────────────────
@@ -471,13 +507,6 @@ export function recentLogs(role: string, limit: number): string[] {
     .prepare(`SELECT ts, line FROM logs WHERE role = ? ORDER BY id DESC LIMIT ?`)
     .all(role, limit) as { ts: string; line: string }[]
   return rows.reverse().map((r) => `[${r.ts}] ${r.line}`)
-}
-
-export function allLogs(role: string): string[] {
-  const rows = getDb()
-    .prepare(`SELECT ts, line FROM logs WHERE role = ? ORDER BY id`)
-    .all(role) as { ts: string; line: string }[]
-  return rows.map((r) => `[${r.ts}] ${r.line}`)
 }
 
 // ── high-level task helpers (shared by main process + agent runtime) ─────
@@ -712,9 +741,16 @@ export function recomputeGroupSpend(id: string): number {
     .prepare(`SELECT COALESCE(SUM(cost_usd), 0) AS s FROM usage WHERE group_id = ?`)
     .get(id) as { s: number }
   const spent = r.s || 0
-  getDb()
-    .prepare(`UPDATE groups SET spent_usd = ?, updated_at = ? WHERE id = ?`)
-    .run(spent, nowStampLocal(), id)
+  // Skip the write when nothing changed — the coordinator recomputes every
+  // second per live group, and idle ticks used to write anyway.
+  const cur = getDb().prepare(`SELECT spent_usd FROM groups WHERE id = ?`).get(id) as
+    | { spent_usd: number }
+    | undefined
+  if (!cur || Math.abs(cur.spent_usd - spent) > 1e-9) {
+    getDb()
+      .prepare(`UPDATE groups SET spent_usd = ?, updated_at = ? WHERE id = ?`)
+      .run(spent, nowStampLocal(), id)
+  }
   return spent
 }
 
@@ -913,6 +949,12 @@ export function createAgentSession(workspace: string, title: string, items = '[]
 
 // Persist the transcript (and optionally a refreshed title) for a session.
 export function updateAgentSession(id: number, items: string, title?: string): void {
+  // Skip the write when nothing changed — the transcript blob can be large
+  // and rewriting it identically still costs a full-page fsync cycle.
+  const cur = getDb().prepare(`SELECT items, title FROM agent_sessions WHERE id = ?`).get(id) as
+    | { items: string; title: string }
+    | undefined
+  if (cur && cur.items === items && (title === undefined || cur.title === title)) return
   const ts = nowStampLocal()
   if (title !== undefined) {
     getDb()

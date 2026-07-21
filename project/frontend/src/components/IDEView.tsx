@@ -1,5 +1,6 @@
-import React, { useEffect, useState, useCallback, useRef, useMemo } from 'react'
+import React, { useEffect, useState, useCallback, useRef, useMemo, lazy, Suspense } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
+import '../lib/monacoSetup' // local Monaco + workers (no CDN) — before <Editor>
 import Editor, { DiffEditor } from '@monaco-editor/react'
 import {
   FolderTree,
@@ -30,11 +31,8 @@ import { AgentTerminal } from './AgentTerminal'
 import { ShellTerminal } from './ShellTerminal'
 import { InlineAIPrompt } from './InlineAIPrompt'
 import { InlineAICard } from './InlineAICard'
-import { SearchPanel } from './SearchPanel'
-import { GitPanel } from './GitPanel'
 import { CommandPalette, Command } from './CommandPalette'
 import { ChatPanel } from './ChatPanel'
-import { GroupsPanel } from './GroupsPanel'
 import { DiffReviewCard } from './DiffReviewCard'
 import { ConfirmDialog, ConfirmDialogSpec } from './ConfirmDialog'
 import { StatusBar } from './StatusBar'
@@ -44,6 +42,14 @@ import { toast } from '../lib/toast'
 import { computeLineDiff } from '../lib/lineDiff'
 import { useInlineAIEdit } from './useInlineAIEdit'
 import { activeAgents, AgentsConfig, colorFor, ModelOption, isResidentRole, PendingChange } from '../lib/api'
+
+// Sidebar panels that aren't part of the first paint load as their own
+// chunks — the explorer is the default view; git/search/groups/agents come
+// in on demand.
+const SearchPanel = lazy(() => import('./SearchPanel').then((m) => ({ default: m.SearchPanel })))
+const GitPanel = lazy(() => import('./GitPanel').then((m) => ({ default: m.GitPanel })))
+const GroupsPanel = lazy(() => import('./GroupsPanel').then((m) => ({ default: m.GroupsPanel })))
+const AgentsLivePanel = lazy(() => import('./AgentsLivePanel').then((m) => ({ default: m.AgentsLivePanel })))
 
 // Sentinel tab id for the embedded agent browser (not a file on disk).
 const BROWSER_TAB = 'orqon://browser'
@@ -58,6 +64,7 @@ interface FileNode {
 interface GitChange {
   file: string
   type: string
+  staged?: boolean
 }
 
 function detectLanguage(filename: string): string {
@@ -150,10 +157,10 @@ export function IDEView() {
   const [files, setFiles] = useState<FileNode[]>([])
   const [gitChanges, setGitChanges] = useState<GitChange[]>([])
   const [loadingWorkspace, setLoadingWorkspace] = useState(false)
-  const [branchName, setBranchName] = useState('')
+  const [gitBranch, setGitBranch] = useState<{ current: string; branches: string[] }>({ current: '', branches: [] })
 
-  // Status-bar signals
-  const [cursorPos, setCursorPos] = useState<{ line: number; col: number } | null>(null)
+  // Status-bar signals (cursor position lives inside StatusBar itself — a
+  // caret move must not re-render the whole IDE)
   const [agentBusy, setAgentBusy] = useState(false)
   const [chatCtxUsage, setChatCtxUsage] = useState<{ used: number; window: number } | null>(null)
   // Chat badge: an agent run finished while the chat panel was closed.
@@ -169,10 +176,25 @@ export function IDEView() {
   // Shared confirm dialog (dirty-close, deletes, discards).
   const [dialog, setDialog] = useState<ConfirmDialogSpec | null>(null)
 
-  // File Contents State
-  const [fileContents, setFileContents] = useState<Record<string, string>>({})
-  const [originalContents, setOriginalContents] = useState<Record<string, string>>({})
+  // File Contents — live buffers live OUTSIDE React state so a keystroke never
+  // re-renders the whole IDE (Monaco runs uncontrolled via path+defaultValue,
+  // one model per open file). Consumers that must re-render when a buffer is
+  // REPLACED from outside the editor (open / live-reload / discard / agent
+  // write) key off `bufferEpoch`.
+  const contentsRef = useRef(new Map<string, string>())
+  const originalsRef = useRef(new Map<string, string>())
+  const [, setBufferEpoch] = useState(0)
+  const bumpBuffers = useCallback(() => setBufferEpoch((n) => n + 1), [])
   const [dirtyFiles, setDirtyFiles] = useState<Record<string, boolean>>({})
+  // Ref mirrors so stable callbacks can read live state without depending on it.
+  const dirtyRef = useRef(dirtyFiles)
+  useEffect(() => { dirtyRef.current = dirtyFiles }, [dirtyFiles])
+  const openTabsRef = useRef<string[]>([])
+  useEffect(() => { openTabsRef.current = openTabs }, [openTabs])
+  const activeTabRef = useRef<string | null>(null)
+  useEffect(() => { activeTabRef.current = activeTab }, [activeTab])
+  const gitChangesRef = useRef<GitChange[]>([])
+  useEffect(() => { gitChangesRef.current = gitChanges }, [gitChanges])
 
   // Editor View Configuration
   const [diffMode, setDiffMode] = useState(false)
@@ -249,6 +271,31 @@ export function IDEView() {
   const gitGutterRef = useRef<any>(null)
   const [availableModels, setAvailableModels] = useState<ModelOption[]>([])
 
+  // Replace a buffer from OUTSIDE the editor (live-reload, agent write,
+  // discard, restore). Updates the ref AND the Monaco model if one exists for
+  // that path (the Editor `path` prop keys models by relPath).
+  const setBufferText = useCallback((rel: string, text: string) => {
+    contentsRef.current.set(rel, text)
+    const mon = monacoRef.current
+    if (mon) {
+      try {
+        const model = mon.editor.getModel(mon.Uri.parse(rel))
+        if (model && model.getValue() !== text) model.setValue(text)
+      } catch { /* model not created yet — defaultValue reads the ref */ }
+    }
+    bumpBuffers()
+  }, [bumpBuffers])
+
+  // Drop the Monaco model for a path (tab close / rename / workspace switch)
+  // so models don't accumulate and a reopen re-reads from disk. Deferred a
+  // tick: the mounted <Editor> may still be attached to this model right now —
+  // React swaps its `path` on the commit that follows the state update.
+  const disposeModel = useCallback((rel: string) => {
+    setTimeout(() => {
+      try { monacoRef.current?.editor.getModel(monacoRef.current.Uri.parse(rel))?.dispose() } catch { /* ignore */ }
+    }, 0)
+  }, [])
+
   // Keep the editor sized in lockstep with the side-panel width animation, and
   // fade the minimap out/in instead of hard-toggling it. The minimap is a
   // Monaco-managed canvas, so we animate its DOM node's opacity directly, then
@@ -320,8 +367,8 @@ export function IDEView() {
   // Snapshot of the current editor context for the chat panel (called fresh
   // at send time so the model always sees the latest file + selection).
   const getChatContext = useCallback(() => {
-    if (!activeTab) return null
-    const content = fileContents[activeTab] ?? ''
+    if (!activeTab || activeTab === BROWSER_TAB) return null
+    const content = contentsRef.current.get(activeTab) ?? ''
     let selection: string | undefined
     const editor = editorRef.current
     if (editor) {
@@ -336,26 +383,34 @@ export function IDEView() {
       content,
       selection,
     }
-  }, [activeTab, fileContents])
+  }, [activeTab])
+
+  // Git status/branch fetch shared by the 2s poll, refreshWorkspace and the
+  // GitPanel. Compare-before-set: an unchanged poll causes ZERO re-renders.
+  const refreshGitInfo = useCallback(async () => {
+    try {
+      const [changes, b] = await Promise.all([
+        window.api.workspaceGitStatus(),
+        window.api.workspaceGitBranch().catch(() => ({ current: '', branches: [] as string[] })),
+      ])
+      setGitChanges((prev) => (JSON.stringify(prev) === JSON.stringify(changes) ? prev : changes))
+      setGitBranch((prev) => (JSON.stringify(prev) === JSON.stringify(b) ? prev : b))
+    } catch { /* not a repo */ }
+  }, [])
 
   // Scan workspace files
   const refreshWorkspace = useCallback(async () => {
     setLoadingWorkspace(true)
     try {
       const allFiles = await window.api.workspaceListFiles()
-      setFiles(allFiles)
-      const changes = await window.api.workspaceGitStatus()
-      setChangesList(changes)
+      setFiles((prev) => (JSON.stringify(prev) === JSON.stringify(allFiles) ? prev : allFiles))
+      await refreshGitInfo()
     } catch (err) {
       console.error('Failed to load workspace files:', err)
     } finally {
       setLoadingWorkspace(false)
     }
-  }, [])
-
-  const setChangesList = (changes: GitChange[]) => {
-    setGitChanges(changes)
-  }
+  }, [refreshGitInfo])
 
   // Load workspace root info. Returns the root path (session-restore key).
   const loadWorkspaceInfo = useCallback(async (): Promise<string> => {
@@ -392,43 +447,89 @@ export function IDEView() {
       if (typeof s.chatOpen === 'boolean') setChatOpen(s.chatOpen)
       if (s.bottomTab) setBottomTab(s.bottomTab)
       if (typeof s.isBottomOpen === 'boolean') setIsBottomOpen(s.isBottomOpen)
-      // Reopen tabs that still exist on disk.
-      const tabs: string[] = []
-      for (const t of s.openTabs ?? []) {
+      // Reopen tabs that still exist on disk — all in parallel (this used to
+      // load tabs one by one, each with its own git subprocess, before paint).
+      const entries = await Promise.all((s.openTabs ?? []).map(async (t) => {
         try {
           const disk = await window.api.workspaceReadFile(t)
-          if (!disk.ok) continue
-          tabs.push(t)
-          setFileContents((p) => ({ ...p, [t]: disk.content }))
-          const head = await window.api.workspaceGitShowHead(t)
-          setOriginalContents((p) => ({ ...p, [t]: head.ok ? head.content : '' }))
-        } catch { /* skip */ }
+          if (!disk.ok) return null
+          const head = await window.api.workspaceGitShowHead(t).catch(() => ({ ok: false, content: '' }))
+          return { t, content: disk.content, head: head.ok ? head.content : '' }
+        } catch { return null }
+      }))
+      const tabs: string[] = []
+      for (const e of entries) {
+        if (!e) continue
+        tabs.push(e.t)
+        contentsRef.current.set(e.t, e.content)
+        originalsRef.current.set(e.t, e.head)
       }
+      bumpBuffers()
       if (tabs.length) {
         setOpenTabs(tabs)
         setActiveTab(s.activeTab && tabs.includes(s.activeTab) ? s.activeTab : tabs[tabs.length - 1])
       }
     } catch { /* corrupted session — start clean */ }
+  }, [bumpBuffers])
+
+  // Gate a destructive transition (workspace switch, app quit) on unsaved
+  // buffers: if any tab is dirty, ask Save All / Discard / Cancel; otherwise
+  // proceed straight away. Self-contained (writes via the IPC directly) so it
+  // doesn't depend on later-declared save helpers.
+  const confirmUnsaved = useCallback((proceed: () => void) => {
+    const dirty = Object.keys(dirtyRef.current).filter((t) => dirtyRef.current[t])
+    if (dirty.length === 0) { proceed(); return }
+    setDialog({
+      title: `Save ${dirty.length} unsaved file${dirty.length > 1 ? 's' : ''}?`,
+      message: dirty.join('\n'),
+      buttons: [
+        {
+          label: 'Save All', kind: 'primary',
+          onClick: async () => {
+            setDialog(null)
+            for (const rel of dirty) {
+              try { await window.api.workspaceWriteFile(rel, contentsRef.current.get(rel) ?? '') } catch { /* keep going */ }
+            }
+            proceed()
+          },
+        },
+        { label: 'Discard', kind: 'danger', onClick: () => { setDialog(null); proceed() } },
+        { label: 'Cancel', onClick: () => setDialog(null) },
+      ],
+    })
   }, [])
 
   // Switch to a different workspace folder, then reset editor state and
-  // restore that workspace's own session.
+  // restore that workspace's own session. Guards unsaved buffers first —
+  // switching used to clear every dirty buffer with no warning.
   const switchWorkspace = useCallback(async (dir?: string) => {
     const res = dir
       ? await window.api.workspaceSetRoot(dir)
       : await window.api.workspaceOpenDialog()
     if (!res.ok) return
-    setShowWorkspaceMenu(false)
-    setOpenTabs([])
-    setActiveTab(null)
-    setFileContents({})
-    setOriginalContents({})
-    setDirtyFiles({})
-    closedTabsRef.current = []
-    const root = await loadWorkspaceInfo()
-    await refreshWorkspace()
-    if (root) await restoreSession(root)
-  }, [loadWorkspaceInfo, restoreSession])
+    confirmUnsaved(async () => {
+      setShowWorkspaceMenu(false)
+      setOpenTabs([])
+      setActiveTab(null)
+      for (const rel of Array.from(contentsRef.current.keys())) disposeModel(rel)
+      contentsRef.current.clear()
+      originalsRef.current.clear()
+      bumpBuffers()
+      setDirtyFiles({})
+      closedTabsRef.current = []
+      const root = await loadWorkspaceInfo()
+      await refreshWorkspace()
+      if (root) await restoreSession(root)
+    })
+  }, [confirmUnsaved, loadWorkspaceInfo, restoreSession, refreshWorkspace, disposeModel, bumpBuffers])
+
+  // Quit guard: main intercepts the window close and asks here. Confirm the
+  // unsaved buffers, then tell main it's safe to close.
+  useEffect(() => {
+    return window.api.onAppCloseRequest(() => {
+      confirmUnsaved(() => window.api.appCloseConfirm())
+    })
+  }, [confirmUnsaved])
 
   // Load agents config to get the list of active agents
   useEffect(() => {
@@ -468,30 +569,28 @@ export function IDEView() {
   // full agentsList so a resident agent's terminal stays reachable.
   const residentAgents = agentsList.filter(isResidentRole)
 
-  // Periodically refresh Git status, current branch and live logs
+  // Periodically refresh Git status/branch (+ agent logs only while a surface
+  // that shows them is visible). Skips entirely while the window is hidden;
+  // compare-before-set keeps an unchanged poll completely render-free.
+  const logsVisible = (isBottomOpen && bottomTab === 'logs') || (isSidebarOpen && activeSidebar === 'agents')
   useEffect(() => {
     const tick = async () => {
-      // Refresh git changes + branch (status bar)
-      const changes = await window.api.workspaceGitStatus()
-      setChangesList(changes)
-      try {
-        const b = await window.api.workspaceGitBranch()
-        setBranchName(b.current || '')
-      } catch { /* not a repo */ }
-
-      // Refresh logs
-      const allLogs = await window.api.getLogs()
-      const logMap: Record<string, string[]> = {}
-      for (const entry of allLogs) {
-        logMap[entry.agent] = entry.lines
+      if (document.hidden) return
+      await refreshGitInfo()
+      if (logsVisible) {
+        const allLogs = await window.api.getLogs()
+        const logMap: Record<string, string[]> = {}
+        for (const entry of allLogs) {
+          logMap[entry.agent] = entry.lines
+        }
+        setAgentLogs((prev) => (JSON.stringify(prev) === JSON.stringify(logMap) ? prev : logMap))
       }
-      setAgentLogs(logMap)
-    };
+    }
 
     tick()
     const i = setInterval(tick, 2000)
     return () => clearInterval(i)
-  }, [])
+  }, [refreshGitInfo, logsVisible])
 
   // Toast orchestration group outcomes (passed/failed/killed).
   useEffect(() => {
@@ -503,27 +602,28 @@ export function IDEView() {
     })
   }, [])
 
-  // Live-reload logic when AI modifies files on disk
+  // Live-reload logic when AI modifies files on disk. Depends only on the
+  // active tab — the old deps on fileContents/dirtyFiles rebuilt this interval
+  // on every keystroke; live values are read from refs instead.
   useEffect(() => {
-    if (!activeTab) return
+    if (!activeTab || activeTab === BROWSER_TAB) return
+    const rel = activeTab
 
     const checkFileOnDisk = async () => {
+      if (document.hidden) return
       try {
-        const diskFile = await window.api.workspaceReadFile(activeTab)
+        const diskFile = await window.api.workspaceReadFile(rel)
         if (!diskFile.ok) return
 
-        // If file content on disk has changed
-        if (diskFile.content !== fileContents[activeTab]) {
-          // If the file is NOT dirty (no unsaved edits by the user in this session),
-          // reload the content live! This allows seeing AI writing changes live!
-          if (!dirtyFiles[activeTab]) {
-            setFileContents((prev) => ({ ...prev, [activeTab]: diskFile.content }))
-            
-            // Also re-fetch original HEAD content in case the AI committed it or we need a fresh baseline
-            const originalFile = await window.api.workspaceGitShowHead(activeTab)
-            if (originalFile.ok) {
-              setOriginalContents((prev) => ({ ...prev, [activeTab]: originalFile.content }))
-            }
+        // If the disk content changed and the user has no unsaved edits,
+        // reload live — this is how agent writes appear as they happen.
+        if (diskFile.content !== contentsRef.current.get(rel) && !dirtyRef.current[rel]) {
+          setBufferText(rel, diskFile.content)
+          // Re-fetch the HEAD baseline in case the agent committed.
+          const originalFile = await window.api.workspaceGitShowHead(rel)
+          if (originalFile.ok) {
+            originalsRef.current.set(rel, originalFile.content)
+            bumpBuffers()
           }
         }
       } catch (err) {
@@ -533,22 +633,31 @@ export function IDEView() {
 
     const timer = setInterval(checkFileOnDisk, 2000)
     return () => clearInterval(timer)
-  }, [activeTab, fileContents, dirtyFiles])
+  }, [activeTab, setBufferText, bumpBuffers])
 
   // ── Git gutter: mark added/modified/deleted lines vs HEAD ──────────
-  // Recomputed (debounced) from the same before/after pair the DiffEditor
-  // uses, via the dependency-free LCS differ. Rendered as thin colored bars
-  // in Monaco's linesDecorations lane; deletions show a small red triangle.
+  // Driven by Monaco's own content-change event (debounced) instead of React
+  // state — the old version re-ran on every keystroke via its fileContents
+  // dep. computeLineDiff trims the common prefix/suffix, so the LCS cost is
+  // proportional to the edited region, not the file.
   useEffect(() => {
     const ed = editorRef.current
     const mon = monacoRef.current
-    if (!ed || !mon || !activeTab || diffMode) {
+    if (!ed || !mon || !activeTab || activeTab === BROWSER_TAB || diffMode) {
       try { gitGutterRef.current?.clear() } catch { /* ignore */ }
       return
     }
-    const before = originalContents[activeTab]
-    const after = fileContents[activeTab]
-    const timer = setTimeout(() => {
+    const rel = activeTab
+    let timer: ReturnType<typeof setTimeout> | null = null
+    const last = { before: '', after: '', painted: false }
+
+    const recompute = () => {
+      const before = originalsRef.current.get(rel)
+      const after = contentsRef.current.get(rel)
+      if (last.painted && before === last.before && after === last.after) return
+      last.before = before ?? ''
+      last.after = after ?? ''
+      last.painted = true
       try { gitGutterRef.current?.clear() } catch { /* ignore */ }
       if (before == null || after == null || before === after) return
       const rows = computeLineDiff(before, after)
@@ -584,9 +693,19 @@ export function IDEView() {
         }
       }
       if (decos.length) gitGutterRef.current = ed.createDecorationsCollection(decos)
-    }, 400)
-    return () => clearTimeout(timer)
-  }, [activeTab, fileContents, originalContents, diffMode, editorReady])
+    }
+
+    const schedule = () => {
+      if (timer) clearTimeout(timer)
+      timer = setTimeout(recompute, 400)
+    }
+    schedule() // initial paint for this tab
+    const sub = ed.onDidChangeModelContent(schedule)
+    return () => {
+      if (timer) clearTimeout(timer)
+      try { sub.dispose() } catch { /* ignore */ }
+    }
+  }, [activeTab, diffMode, editorReady])
 
   // Discard a file's uncommitted changes (Git panel) after confirmation.
   const handleDiscardFile = useCallback((file: string) => {
@@ -604,7 +723,7 @@ export function IDEView() {
               // Reload the buffer if it's open.
               const disk = await window.api.workspaceReadFile(file)
               if (disk.ok) {
-                setFileContents((p) => ({ ...p, [file]: disk.content }))
+                setBufferText(file, disk.content)
                 setDirtyFiles((p) => ({ ...p, [file]: false }))
               } else {
                 // Untracked file was deleted by the restore.
@@ -622,44 +741,33 @@ export function IDEView() {
     })
   }, [refreshWorkspace])
 
-  // Handle open a file
-  const openFile = async (relPath: string) => {
-    // If not already in tabs, add it
-    if (!openTabs.includes(relPath)) {
-      setOpenTabs((prev) => [...prev, relPath])
-      
-      // Load file content
-      const diskFile = await window.api.workspaceReadFile(relPath)
-      const originalFile = await window.api.workspaceGitShowHead(relPath)
-
-      if (diskFile.ok) {
-        setFileContents((prev) => ({ ...prev, [relPath]: diskFile.content }))
-      } else {
-        setFileContents((prev) => ({ ...prev, [relPath]: `Failed to load file: ${diskFile.content}` }))
-      }
-
-      if (originalFile.ok) {
-        setOriginalContents((prev) => ({ ...prev, [relPath]: originalFile.content }))
-      } else {
-        setOriginalContents((prev) => ({ ...prev, [relPath]: '' }))
-      }
+  // Handle open a file. Stable identity (reads live state from refs) so the
+  // memoized tree/palette/panels that receive it don't re-render for nothing.
+  const openFile = useCallback(async (relPath: string) => {
+    // If not already in tabs, load content + HEAD baseline (in parallel), then add it
+    const firstOpen = !openTabsRef.current.includes(relPath)
+    if (firstOpen) {
+      const [diskFile, originalFile] = await Promise.all([
+        window.api.workspaceReadFile(relPath),
+        window.api.workspaceGitShowHead(relPath).catch(() => ({ ok: false, content: '' })),
+      ])
+      contentsRef.current.set(relPath, diskFile.ok ? diskFile.content : `Failed to load file: ${diskFile.content}`)
+      originalsRef.current.set(relPath, originalFile.ok ? originalFile.content : '')
+      bumpBuffers()
+      setOpenTabs((prev) => (prev.includes(relPath) ? prev : [...prev, relPath]))
+      // Suggest diff view for git-modified files — but only on the FIRST
+      // open. Re-clicking a tab used to force diff mode back on and override
+      // the user's explicit view choice.
+      setDiffMode(gitChangesRef.current.some((c) => c.file === relPath))
     }
 
     setActiveTab(relPath)
-    
-    // Automatically enable diff mode if the file is modified in git (added/modified)
-    const isModified = gitChanges.some((c) => c.file === relPath)
-    if (isModified) {
-      setDiffMode(true)
-    } else {
-      setDiffMode(false)
-    }
-  }
+  }, [bumpBuffers])
 
   // Open a file and jump the editor to a specific line/column (search results).
   const openFileAtLine = useCallback(async (relPath: string, line: number, column: number) => {
-    setDiffMode(false)
     await openFile(relPath)
+    setDiffMode(false)
     // Give Monaco a tick to mount/switch models before revealing.
     setTimeout(() => {
       const editor = editorRef.current
@@ -668,21 +776,17 @@ export function IDEView() {
       editor.setPosition({ lineNumber: line, column: Math.max(1, column) })
       editor.focus()
     }, 120)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [openTabs, gitChanges])
+  }, [openFile])
 
   // Called when the IDE agent writes/edits a file. Re-read it from disk if it's
   // open so the editor reflects the agent's change, and refresh tree + git.
   const onAgentFileChanged = useCallback(async (relPath: string) => {
-    const disk = await window.api.workspaceReadFile(relPath)
-    if (disk.ok) {
-      setFileContents((prev) =>
-        relPath in prev ? { ...prev, [relPath]: disk.content } : prev,
-      )
+    if (contentsRef.current.has(relPath)) {
+      const disk = await window.api.workspaceReadFile(relPath)
+      if (disk.ok) setBufferText(relPath, disk.content)
     }
     refreshWorkspace()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+  }, [setBufferText, refreshWorkspace])
 
   // ── Agent review mode: pending change awaiting the user's verdict ─────
   const [pendingChange, setPendingChange] = useState<PendingChange | null>(null)
@@ -694,15 +798,17 @@ export function IDEView() {
     setPendingChange(change)
     if (change.isNew) {
       setOpenTabs((prev) => (prev.includes(change.path) ? prev : [...prev, change.path]))
-      setFileContents((prev) => (change.path in prev ? prev : { ...prev, [change.path]: change.before }))
-      setOriginalContents((prev) => (change.path in prev ? prev : { ...prev, [change.path]: '' }))
+      if (!contentsRef.current.has(change.path)) {
+        contentsRef.current.set(change.path, change.before)
+        originalsRef.current.set(change.path, '')
+        bumpBuffers()
+      }
       setActiveTab(change.path)
       setDiffMode(false)
     } else {
       openFile(change.path)
     }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [openTabs, gitChanges])
+  }, [openFile, bumpBuffers])
 
   const resolvePending = useCallback((decision: 'accept' | 'reject') => {
     const change = pendingChange
@@ -798,8 +904,22 @@ export function IDEView() {
     } catch (e) {
       return { ok: false, result: `error: ${(e as Error).message || e}` }
     }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [getChatContext, openTabs, gitChanges])
+  }, [getChatContext, openFile, clearReveal])
+
+  // Stable ChatPanel callbacks (the panel is React.memo'd — inline closures
+  // here would defeat it and re-render the heaviest child on every render).
+  const chatOpenRef = useRef(chatOpen)
+  useEffect(() => { chatOpenRef.current = chatOpen }, [chatOpen])
+  const onSubAgentStarted = useCallback(() => { setActiveSidebar('agents'); setIsSidebarOpen(true) }, [])
+  const onChatAttentionNeeded = useCallback(() => { if (!chatOpenRef.current) setChatUnread(true) }, [])
+  const onChatRunFinished = useCallback((info: { kind: 'done' | 'error' | 'blocked' | 'plan' }) => {
+    if (chatOpenRef.current) return
+    setChatUnread(true)
+    if (info.kind === 'done') toast('Agent finished', 'success')
+    else if (info.kind === 'plan') toast('Plan ready for review', 'info')
+    else if (info.kind === 'blocked') toast('Agent blocked — see chat', 'error')
+    else toast('Agent run failed — see chat', 'error')
+  }, [])
 
   // Flatten the file tree into relative paths for quick-open.
   const flatFiles = useMemo(() => {
@@ -868,7 +988,14 @@ export function IDEView() {
     if (activeTab === relPath) {
       setActiveTab(nextTabs.length > 0 ? nextTabs[nextTabs.length - 1] : null)
     }
-    if (relPath !== BROWSER_TAB) closedTabsRef.current = [...closedTabsRef.current.filter((t) => t !== relPath), relPath].slice(-10)
+    if (relPath !== BROWSER_TAB) {
+      closedTabsRef.current = [...closedTabsRef.current.filter((t) => t !== relPath), relPath].slice(-10)
+      // Drop the buffer + its Monaco model so a later reopen re-reads from disk
+      // cleanly and closed-tab models don't pile up in memory.
+      contentsRef.current.delete(relPath)
+      originalsRef.current.delete(relPath)
+      disposeModel(relPath)
+    }
     // Drop the dirty flag so a later reopen re-reads from disk cleanly.
     setDirtyFiles((prev) => {
       const next = { ...prev }
@@ -907,20 +1034,41 @@ export function IDEView() {
     if (relPath) openFile(relPath)
   }
 
-  // Handle file edit inside Editor
+  // Handle file edit inside Editor. Only the FIRST keystroke flips the dirty
+  // flag — after that the updater returns the same object and React bails, so
+  // typing causes zero re-renders of the IDE tree.
   const handleEditorChange = (value: string | undefined) => {
     if (!activeTab || value === undefined) return
-    setFileContents((prev) => ({ ...prev, [activeTab]: value }))
-    setDirtyFiles((prev) => ({ ...prev, [activeTab]: true }))
+    contentsRef.current.set(activeTab, value)
+    setDirtyFiles((prev) => (prev[activeTab] ? prev : { ...prev, [activeTab]: true }))
   }
+
+  // Diff view: the modified pane is editable, but nothing used to capture what
+  // the user typed there — Cmd+S no-oped and toggling back to Normal silently
+  // discarded the edits. Route its changes into the same buffer + dirty flag.
+  const handleDiffEditorMount = useCallback((editor: any) => {
+    const mod = editor.getModifiedEditor()
+    mod.onDidChangeModelContent(() => {
+      const rel = activeTabRef.current
+      if (!rel || rel === BROWSER_TAB) return
+      const value = mod.getValue()
+      // Prop-driven model swaps (tab switch) also fire this event with an
+      // unchanged value — only user edits may mark the buffer dirty.
+      if (value === contentsRef.current.get(rel)) return
+      contentsRef.current.set(rel, value)
+      setDirtyFiles((prev) => (prev[rel] ? prev : { ...prev, [rel]: true }))
+    })
+  }, [])
 
   // Save one file (any tab, not just the active one).
   const saveFile = async (relPath: string): Promise<boolean> => {
-    const content = fileContents[relPath] ?? ''
+    const content = contentsRef.current.get(relPath) ?? ''
     const res = await window.api.workspaceWriteFile(relPath, content)
     if (res.ok) {
       setDirtyFiles((prev) => ({ ...prev, [relPath]: false }))
-      refreshWorkspace()
+      // A save never changes the file TREE — only refresh git status. (The
+      // full recursive workspace rescan here was pure waste on every Cmd+S.)
+      refreshGitInfo()
       return true
     }
     toast(`Save failed: ${res.error}`, 'error')
@@ -976,11 +1124,18 @@ export function IDEView() {
       t === relPath ? toRel : t.startsWith(relPath + '/') ? toRel + t.slice(relPath.length) : t
     setOpenTabs((tabs) => tabs.map(remap))
     setActiveTab((t) => (t ? remap(t) : t))
-    setFileContents((prev) => Object.fromEntries(Object.entries(prev).map(([k, v]) => [remap(k), v])))
-    setOriginalContents((prev) => Object.fromEntries(Object.entries(prev).map(([k, v]) => [remap(k), v])))
+    const remapBuffers = (m: Map<string, string>) => {
+      for (const [k, v] of Array.from(m.entries())) {
+        const nk = remap(k)
+        if (nk !== k) { m.delete(k); m.set(nk, v); disposeModel(k) }
+      }
+    }
+    remapBuffers(contentsRef.current)
+    remapBuffers(originalsRef.current)
+    bumpBuffers()
     setDirtyFiles((prev) => Object.fromEntries(Object.entries(prev).map(([k, v]) => [remap(k), v])))
     await refreshWorkspace()
-  }, [refreshWorkspace])
+  }, [refreshWorkspace, disposeModel, bumpBuffers])
 
   const handleRenameCommit = useCallback(async (relPath: string, newName: string) => {
     const parts = relPath.split('/')
@@ -1056,7 +1211,7 @@ export function IDEView() {
     }
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [activeTab, fileContents, dirtyFiles, openTabs, ui.zoom])
+  }, [activeTab, dirtyFiles, openTabs, ui.zoom])
 
   // Commands for the palette. Intentionally NOT memoized: the actions close
   // over live editor state (activeTab, dirtyFiles, …) and a memo made "File:
@@ -1082,10 +1237,7 @@ export function IDEView() {
     editorRef.current = editor
     monacoRef.current = monaco
     setEditorReady((n) => n + 1)
-    // Status bar: track the caret position.
-    editor.onDidChangeCursorPosition((e: any) => {
-      setCursorPos({ line: e.position.lineNumber, col: e.position.column })
-    })
+    // (Caret tracking lives in StatusBar — a caret move re-renders only it.)
     // Set custom HSL dark theme values
     monaco.editor.defineTheme('vscode-dark-harmony', {
       base: 'vs-dark',
@@ -1331,6 +1483,7 @@ export function IDEView() {
             animate={animationsOn ? 'show' : false}
             className={`flex-1 overflow-y-auto scrollbar-thin ${activeSidebar === 'search' || activeSidebar === 'git' ? '' : 'p-2'}`}
           >
+            <Suspense fallback={null}>
             {activeSidebar === 'explorer' && (
               <IDEFileTree
                 files={files}
@@ -1352,11 +1505,19 @@ export function IDEView() {
             )}
 
             {activeSidebar === 'git' && (
-              <GitPanel onOpenFile={openFile} onChanged={refreshWorkspace} onDiscard={handleDiscardFile} />
+              <GitPanel
+                status={gitChanges}
+                branch={gitBranch}
+                onOpenFile={openFile}
+                onChanged={refreshWorkspace}
+                onDiscard={handleDiscardFile}
+              />
             )}
 
             {activeSidebar === 'agents' && (
               <div className="flex flex-col gap-3 p-1">
+                {/* Live child agents the chat agent delegated to (SpawnAgent). */}
+                <AgentsLivePanel />
                 {residentAgents.map((agent) => (
                   <div
                     key={agent}
@@ -1395,6 +1556,7 @@ export function IDEView() {
             {activeSidebar === 'groups' && (
               <GroupsPanel windup={animationsOn} />
             )}
+            </Suspense>
           </motion.div>
             </motion.div>
           </motion.aside>
@@ -1563,10 +1725,16 @@ export function IDEView() {
                   <DiffEditor
                     height="100%"
                     language={detectLanguage(activeTab)}
-                    original={originalContents[activeTab] || ''}
-                    modified={fileContents[activeTab] || ''}
+                    original={originalsRef.current.get(activeTab) || ''}
+                    modified={contentsRef.current.get(activeTab) || ''}
+                    onMount={handleDiffEditorMount}
                     theme="vscode-dark-harmony"
                     options={{
+                      // Monaco sizes itself via its own ResizeObserver. The
+                      // locally-bundled loader initializes synchronously, so
+                      // without this the editor could be created inside a
+                      // still-zero-sized container and stay 5×5px.
+                      automaticLayout: true,
                       renderSideBySide,
                       originalEditable: false,
                       readOnly: false,
@@ -1583,12 +1751,20 @@ export function IDEView() {
                 <div className="flex-1 w-full overflow-hidden relative">
                   <Editor
                     height="100%"
+                    // Uncontrolled: `path` keys one model per open file (its
+                    // undo stack survives tab switches) and defaultValue seeds
+                    // it from the live buffer. No `value` prop — a controlled
+                    // Monaco re-diffed the whole document every render.
+                    path={activeTab}
                     language={detectLanguage(activeTab)}
-                    value={fileContents[activeTab] || ''}
+                    defaultValue={contentsRef.current.get(activeTab) || ''}
                     onChange={handleEditorChange}
                     onMount={handleEditorDidMount}
                     theme="vscode-dark-harmony"
                     options={{
+                      // See the DiffEditor note — required with the local
+                      // (synchronous) Monaco loader.
+                      automaticLayout: true,
                       fontSize: ui.editorFontSize,
                       lineHeight: 1.5,
                       fontFamily: 'ui-monospace, SF Mono, JetBrains Mono, Consolas, monospace',
@@ -1618,24 +1794,30 @@ export function IDEView() {
                         onReject={inlineAI.reject}
                       />
                     )}
-                    {pendingChange && pendingChange.path === activeTab && (
-                      <DiffReviewCard
-                        change={pendingChange}
-                        onAccept={() => resolvePending('accept')}
-                        onReject={() => resolvePending('reject')}
-                      />
-                    )}
-                    {!pendingChange && previewDiff && previewDiff.path === activeTab && (
-                      <DiffReviewCard
-                        change={previewDiff}
-                        readOnly
-                        onAccept={() => setPreviewDiff(null)}
-                        onReject={() => setPreviewDiff(null)}
-                      />
-                    )}
                   </AnimatePresence>
                 </div>
               )}
+              {/* Agent review / preview cards float over the editor — kept
+                  OUTSIDE the diff/normal branch so an active diff view (or a
+                  tab switch) can't hide the approve/decline card while the
+                  agent stays blocked waiting on it. */}
+              <AnimatePresence>
+                {pendingChange && pendingChange.path === activeTab && (
+                  <DiffReviewCard
+                    change={pendingChange}
+                    onAccept={() => resolvePending('accept')}
+                    onReject={() => resolvePending('reject')}
+                  />
+                )}
+                {!pendingChange && previewDiff && previewDiff.path === activeTab && (
+                  <DiffReviewCard
+                    change={previewDiff}
+                    readOnly
+                    onAccept={() => setPreviewDiff(null)}
+                    onReject={() => setPreviewDiff(null)}
+                  />
+                )}
+              </AnimatePresence>
             </div>
           ) : !activeTab ? (
             <div className="relative flex-1 flex flex-col items-center justify-center text-zinc-500 select-none bg-zinc-950 overflow-hidden">
@@ -1884,14 +2066,9 @@ export function IDEView() {
             workspaceRoot={workspaceRootPath}
             onRunStateChange={setAgentBusy}
             onContextUsage={setChatCtxUsage}
-            onRunFinished={(info) => {
-              if (chatOpen) return
-              setChatUnread(true)
-              if (info.kind === 'done') toast('Agent finished', 'success')
-              else if (info.kind === 'plan') toast('Plan ready for review', 'info')
-              else if (info.kind === 'blocked') toast('Agent blocked — see chat', 'error')
-              else toast('Agent run failed — see chat', 'error')
-            }}
+            onSubAgentStarted={onSubAgentStarted}
+            onAttentionNeeded={onChatAttentionNeeded}
+            onRunFinished={onChatRunFinished}
           />
         </div>
       </motion.aside>
@@ -1899,11 +2076,13 @@ export function IDEView() {
 
       {/* Status bar spans the full window width below all panels. */}
       <StatusBar
-        branch={branchName}
+        branch={gitBranch.current}
         dirtyCount={dirtyCount}
         workspaceName={workspaceName}
-        cursor={activeTab ? cursorPos : null}
-        language={activeTab ? detectLanguage(activeTab) : ''}
+        editorRef={editorRef}
+        editorEpoch={editorReady}
+        editorActive={Boolean(activeTab && activeTab !== BROWSER_TAB)}
+        language={activeTab && activeTab !== BROWSER_TAB ? detectLanguage(activeTab) : ''}
         agentBusy={agentBusy}
         ctxUsage={chatCtxUsage}
       />

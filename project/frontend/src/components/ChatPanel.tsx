@@ -5,7 +5,7 @@
 // the currently open file (+ selection) as context so the model can reason
 // about the code the user is looking at.
 
-import { useEffect, useRef, useState, ReactNode } from 'react'
+import { memo, useEffect, useRef, useState, ReactNode } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
@@ -15,6 +15,7 @@ import {
   TerminalSquare, ListPlus, Boxes, Undo2, AlertTriangle,
   GitBranch, GitCommitHorizontal, GitPullRequestArrow, UserCog, Globe, ListChecks, FolderTree, Trash, FileInput,
   History, Plus, Archive, Telescope, Copy, Check, ArrowDown, Pencil, AtSign,
+  ChevronRight, Loader2,
 } from 'lucide-react'
 import { ModelOption, IdeAgentEvent, PendingChange, PendingAction, AgentTodo, AgentSessionMeta } from '../lib/api'
 import { useUiSettings } from '../lib/uiSettings'
@@ -52,10 +53,19 @@ interface ToolEntry {
   running: boolean
 }
 
+// A delegated child agent, rendered as a nested live card in the transcript.
+interface SubAgentEntry {
+  kind: 'subagent'
+  childRunId: string
+  label: string
+  task: string
+}
+
 type AgentItem =
   | { kind: 'text'; id?: string; role: 'user' | 'assistant'; content?: string; chunks?: string[] }
   | { kind: 'reasoning'; id: string; chunks?: string[]; content?: string }
   | ToolEntry
+  | SubAgentEntry
 
 // Revealed text of an item, whether it stores whole content or streamed chunks.
 function itemText(it: AgentItem): string {
@@ -68,6 +78,10 @@ function itemText(it: AgentItem): string {
 
 // Per-tool result budget when folding tool activity into cross-turn history.
 const TOOL_RESULT_BUDGET = 800
+
+// Transcript items rendered by default; older ones sit behind "Show earlier"
+// so a long session doesn't keep hundreds of markdown blocks in the DOM.
+const RENDER_CAP = 150
 
 // Some models imitate the internal tool-log format (they see prior tool
 // activity in history and start pasting "[used Tool] → result" and element
@@ -175,10 +189,34 @@ function buildHistory(items: AgentItem[]): Msg[] {
 // restores identically without the typewriter machinery. Drops the `running`
 // flag from tool entries (a restored tool is always finished).
 function serializeItems(items: AgentItem[]): AgentItem[] {
+  return items
+    // Sub-agent cards are live views of a finished child run; drop them on
+    // persist (the SpawnAgent tool entry keeps the summary for history).
+    .filter((it) => it.kind !== 'subagent')
+    .map((it) => {
+      if (it.kind === 'text') return { kind: 'text', role: it.role, content: itemText(it) }
+      if (it.kind === 'reasoning') return { kind: 'reasoning', id: it.id, content: itemText(it) }
+      // Tool results longer than the history budget are never read back
+      // (buildHistory truncates, the UI shows 1000 chars) — don't store them.
+      const t = it as ToolEntry
+      return {
+        ...t,
+        running: false,
+        result: t.result && t.result.length > 1000 ? t.result.slice(0, 1000) + ' …(truncated)' : t.result,
+      }
+    })
+}
+
+// Collapse finished streamed items (chunks[]) into plain `content` so old
+// messages render as ONE static markdown block — no more per-render
+// chunks.join + span soup once a reply is done.
+function flattenFinished(items: AgentItem[]): AgentItem[] {
   return items.map((it) => {
-    if (it.kind === 'text') return { kind: 'text', role: it.role, content: itemText(it) }
-    if (it.kind === 'reasoning') return { kind: 'reasoning', id: it.id, content: itemText(it) }
-    return { ...it, running: false }
+    if ((it.kind === 'text' || it.kind === 'reasoning') && it.chunks) {
+      if (it.kind === 'text') return { kind: 'text' as const, id: it.id, role: it.role, content: it.chunks.join('') }
+      return { kind: 'reasoning' as const, id: it.id, content: it.chunks.join('') }
+    }
+    return it
   })
 }
 
@@ -231,6 +269,12 @@ interface Props {
   // Current workspace root — the panel reloads its session when this changes
   // (it stays mounted across workspace switches).
   workspaceRoot?: string
+  // Fired when the agent spawns a child agent (so the host can surface the
+  // live sub-agents sidebar panel).
+  onSubAgentStarted?: () => void
+  // Fired when the agent needs the user (approval/review) while they aren't
+  // looking, so the host can raise the chat badge.
+  onAttentionNeeded?: () => void
 }
 
 // Wind-up choreography: the frame slides open first (handled by the parent),
@@ -246,7 +290,11 @@ const itemVariants = {
   show: { opacity: 1, y: 0, transition: { duration: 0.28, ease: 'easeOut' } },
 }
 
-export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, onChangeResolved, onEditorRequest, windup = true, visible = true, onRunStateChange, onContextUsage, onRunFinished, files = [], workspaceRoot = '' }: Props) {
+// Memoized: the host keeps every prop referentially stable, so IDE-side state
+// changes (typing, git polls, caret moves) no longer re-render the chat tree.
+export const ChatPanel = memo(ChatPanelImpl)
+
+function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onChangeResolved, onEditorRequest, windup = true, visible = true, onRunStateChange, onContextUsage, onRunFinished, files = [], workspaceRoot = '', onSubAgentStarted, onAttentionNeeded }: Props) {
   const { chatFontSize } = useUiSettings()
   const [mode, setMode] = useState<'ask' | 'agent'>('ask')
   // Plan mode is a toggle WITHIN agent mode (via /plan): runs read-only and
@@ -262,6 +310,10 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
   // Plan text stashed while a git-dirty warning is shown before running it.
   const pendingPlanRef = useRef<string | null>(null)
   const [reviewMode, setReviewMode] = useState(false)
+  // Once the user clicks "Run anyway" on the dirty-tree warning, don't nag
+  // again this session — the agent's own edits keep the tree dirty, so the
+  // warning otherwise fired before every single message.
+  const dirtyWarnAckedRef = useRef(false)
   const [planWave, setPlanWave] = useState(false) // one-shot activation sweep
   // Files the current agent run has written (for the "Undo run" affordance).
   const runFilesRef = useRef<Set<string>>(new Set())
@@ -342,8 +394,19 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
     window.api.ideAgentConfigGet().then((c) => setReviewMode(c.reviewMode)).catch(() => {})
   }, [])
 
-  // Keep refs in sync so async persistence reads the latest values.
-  useEffect(() => { agentItemsRef.current = agentItems }, [agentItems])
+  // Keep refs in sync so async persistence reads the latest values. When a
+  // run-end handler requested persistence, do it HERE — after the final array
+  // committed — instead of inside the setState updater (updaters must stay
+  // pure; StrictMode double-invokes them).
+  const pendingPersistRef = useRef(false)
+  useEffect(() => {
+    agentItemsRef.current = agentItems
+    if (pendingPersistRef.current) {
+      pendingPersistRef.current = false
+      void persistSession(agentItems)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agentItems])
   useEffect(() => { sessionIdRef.current = sessionId }, [sessionId])
 
   // Restore the most recent session for the CURRENT workspace — on first load
@@ -391,8 +454,14 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
   }
   useEffect(() => { if (showSessions) refreshSessions() }, [showSessions])
 
+  // Session ids the user has manually renamed — their title must NOT be
+  // overwritten by the auto-derived one on the next persist (that silently
+  // reverted every rename of an active session).
+  const renamedSessionsRef = useRef<Set<number>>(new Set())
+
   // Persist the current transcript. Creates a session row on first save, then
-  // updates it in place. Titles are derived from the opening user message.
+  // updates it in place. Title is derived from the opening user message unless
+  // the user gave the session a custom name.
   const persistSession = async (items: AgentItem[]) => {
     const serialized = JSON.stringify(serializeItems(items))
     const title = deriveTitle(items)
@@ -401,7 +470,8 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
         const res = await window.api.agentSessionCreate(title, serialized)
         if (res.ok && res.id != null) { setSessionId(res.id); sessionIdRef.current = res.id }
       } else {
-        await window.api.agentSessionUpdate(sessionIdRef.current, serialized, title)
+        const keepTitle = renamedSessionsRef.current.has(sessionIdRef.current)
+        await window.api.agentSessionUpdate(sessionIdRef.current, serialized, keepTitle ? undefined : title)
       }
     } catch { /* best-effort persistence */ }
   }
@@ -415,6 +485,7 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
     sessionIdRef.current = null
     setTodos([])
     setShowSessions(false)
+    setShowAllItems(false)
   }
 
   // Load a saved session into the panel.
@@ -431,13 +502,18 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
       setMode('agent')
     } catch { /* ignore */ }
     setShowSessions(false)
+    setShowAllItems(false)
   }
 
   const deleteSession = async (id: number) => {
     try { await window.api.agentSessionDelete(id) } catch { /* ignore */ }
+    renamedSessionsRef.current.delete(id)
     if (sessionIdRef.current === id) newSession()
     refreshSessions()
   }
+  // Two-step delete: the trash icon arms this; a second click confirms. Avoids
+  // one-misclick permanent loss of a transcript.
+  const [confirmDeleteSession, setConfirmDeleteSession] = useState<number | null>(null)
 
   // Inline session rename (pencil in the History dropdown).
   const [renamingSession, setRenamingSession] = useState<number | null>(null)
@@ -447,6 +523,7 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
     const title = renameValue.trim()
     setRenamingSession(null)
     if (id == null || !title) return
+    renamedSessionsRef.current.add(id) // don't let auto-title overwrite it
     try { await window.api.agentSessionRename(id, title) } catch { /* ignore */ }
     refreshSessions()
   }
@@ -519,9 +596,14 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
     return () => window.clearTimeout(t)
   }, [planMode])
 
+  // Two-step confirm for Undo run — it reverts every file the run wrote to
+  // its last committed state, which can't itself be undone.
+  const [confirmUndo, setConfirmUndo] = useState(false)
+
   // Revert every file the last run wrote (git checkout tracked, delete new).
   const undoLastRun = async () => {
     if (undoing || lastRunFiles.length === 0) return
+    setConfirmUndo(false)
     setUndoing(true)
     try {
       const res = await window.api.workspaceGitRestoreFiles(lastRunFiles)
@@ -571,27 +653,49 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
     const requestId = `chat-${Date.now()}`
     reqIdRef.current = requestId
 
-    const offChunk = window.api.onAiChatChunk(requestId, (delta) => {
+    // Coalesce streamed deltas: main emits one IPC event per SSE token, and a
+    // setState per token re-rendered (and re-parsed) the growing reply 30-100
+    // times a second. Buffer in a ref and flush once per animation frame.
+    const buf = { text: '', raf: null as number | null }
+    const flush = () => {
+      buf.raf = null
+      const chunk = buf.text
+      buf.text = ''
+      if (!chunk) return
       setMessages((prev) => {
         const copy = [...prev]
         const last = copy[copy.length - 1]
         if (last && last.role === 'assistant') {
-          copy[copy.length - 1] = { ...last, content: last.content + delta }
+          copy[copy.length - 1] = { ...last, content: last.content + chunk }
         }
         return copy
       })
+    }
+    const offChunk = window.api.onAiChatChunk(requestId, (delta) => {
+      buf.text += delta
+      if (buf.raf == null) buf.raf = requestAnimationFrame(flush)
     })
     const offDone = window.api.onAiChatDone(requestId, (info) => {
       offChunk()
       offDone()
+      if (buf.raf != null) cancelAnimationFrame(buf.raf)
+      flush() // drain whatever arrived after the last frame
       reqIdRef.current = null
       setStreaming(false)
       if (!info.ok && info.error) {
         setMessages((prev) => {
           const copy = [...prev]
           const last = copy[copy.length - 1]
-          if (last && last.role === 'assistant' && !last.content) {
-            copy[copy.length - 1] = { ...last, content: `⚠ ${info.error}` }
+          if (last && last.role === 'assistant') {
+            // If text already streamed, a mid-stream error used to be dropped —
+            // a truncated answer then looked complete. Append the error so the
+            // user knows the reply was cut off.
+            copy[copy.length - 1] = {
+              ...last,
+              content: last.content
+                ? `${last.content}\n\n⚠ Response interrupted: ${info.error}`
+                : `⚠ ${info.error}`,
+            }
           }
           return copy
         })
@@ -663,6 +767,16 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
 
   useEffect(() => () => { if (rafRef.current != null) cancelAnimationFrame(rafRef.current) }, [])
 
+  // Fire an OS notification when the agent needs attention but the user isn't
+  // looking (window unfocused, or the chat panel is closed). Also flags the
+  // host so it can show the chat badge.
+  const notifyAttention = (msg: string) => {
+    if (!document.hasFocus() || !visible) {
+      try { window.api.osNotify?.('Orqon — agent needs you', msg) } catch { /* ignore */ }
+      onAttentionNeeded?.()
+    }
+  }
+
   // Agent mode: run the tool-calling loop, rendering tool activity inline.
   const sendAgent = (opts?: { text?: string; planMode?: boolean; researchMode?: boolean }) => {
     const text = (opts?.text ?? input).trim()
@@ -722,12 +836,19 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
         ensureReveal()
         return
       }
-      if (e.type === 'pending_change') { onPendingChange?.(e.change); return }
+      if (e.type === 'pending_change') { onPendingChange?.(e.change); notifyAttention('Agent is waiting for you to review a change'); return }
       if (e.type === 'change_resolved') { onChangeResolved?.(e.changeId); return }
-      if (e.type === 'pending_action') { setPendingAction(e.action); return }
+      if (e.type === 'pending_action') { setPendingAction(e.action); notifyAttention(`Agent needs approval: ${e.action.title}`); return }
       if (e.type === 'action_resolved') { setPendingAction(null); return }
       if (e.type === 'todos') { setTodos(e.todos); return }
       if (e.type === 'context') { setCtxUsage({ used: e.used, window: e.window }); return }
+      if (e.type === 'subagent_started') {
+        // A child agent was delegated: render a nested live card. The plain
+        // SpawnAgent tool entry is kept for history but hidden from view.
+        onSubAgentStarted?.()
+        setAgentItems((prev) => [...prev, { kind: 'subagent', childRunId: e.childRunId, label: e.label, task: e.task }])
+        return
+      }
       setAgentItems((prev) => {
         const copy = [...prev]
         if (e.type === 'tool_call') {
@@ -744,6 +865,12 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
       if (e.type === 'file_changed') { runFilesRef.current.add(e.path); onFileChanged?.(e.path) }
       if (e.type === 'done' || e.type === 'error' || e.type === 'blocked' || e.type === 'plan') {
         onRunFinishedRef.current?.({ kind: e.type })
+        if (!document.hasFocus()) {
+          const label = e.type === 'plan' ? 'Plan ready for review'
+            : e.type === 'blocked' ? 'Agent is blocked — needs you'
+            : e.type === 'error' ? 'Agent run failed' : 'Agent finished'
+          try { window.api.osNotify?.('Orqon', label) } catch { /* ignore */ }
+        }
         off()
         offEditor()
         reqIdRef.current = null
@@ -774,6 +901,7 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
             shownRef.current.set(tid, target.length)
           }
         }
+        pendingPersistRef.current = true // persisted by the ref-sync effect after commit
         setAgentItems((prev) => {
           const copy = prev.map((it) => {
             if ((it.kind === 'text' || it.kind === 'reasoning') && it.id && tails.has(it.id)) {
@@ -784,10 +912,9 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
           if (e.type === 'error') copy.push({ kind: 'text', role: 'assistant', content: `⚠ ${e.error}` })
           if (e.type === 'blocked') copy.push({ kind: 'text', role: 'assistant', content: `⛔ Blocked: ${e.reason}` })
           if (e.type === 'plan') copy.push({ kind: 'text', role: 'assistant', content: `📋 **Plan**\n\n${e.plan}` })
-          // Persist the finished transcript so memory survives a restart.
-          agentItemsRef.current = copy
-          void persistSession(copy)
-          return copy
+          // Snap chunks → content: finished replies render as ONE static
+          // markdown block instead of a growing span list from here on.
+          return flattenFinished(copy)
         })
       }
     })
@@ -830,8 +957,9 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
 
   const stop = () => {
     if (pendingAction) { resolveAction(false) }
+    const wasAgent = mode !== 'ask'
     if (reqIdRef.current) {
-      if (mode !== 'ask') window.api.aiAgentCancel(reqIdRef.current)
+      if (wasAgent) window.api.aiAgentCancel(reqIdRef.current)
       else window.api.aiChatCancel(reqIdRef.current)
     }
     if (rafRef.current != null) { cancelAnimationFrame(rafRef.current); rafRef.current = null }
@@ -846,12 +974,23 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
         shownRef.current.set(tid, target.length)
       }
     }
-    setAgentItems((prev) => prev.map((it) => {
-      if ((it.kind === 'text' || it.kind === 'reasoning') && it.id && tails.has(it.id)) {
-        return { ...it, chunks: [...(it.chunks ?? []), tails.get(it.id) as string] }
-      }
-      return it
-    }))
+    // Surface an Undo affordance for files the (now-stopped) run already wrote
+    // — stopping used to lose it. Mark the turn for persistence so the partial
+    // transcript survives, and note it was stopped (not a failure).
+    if (wasAgent && runFilesRef.current.size > 0) {
+      setLastRunFiles(Array.from(runFilesRef.current))
+    }
+    pendingPersistRef.current = wasAgent
+    setAgentItems((prev) => {
+      const snapped = flattenFinished(prev.map((it) => {
+        if ((it.kind === 'text' || it.kind === 'reasoning') && it.id && tails.has(it.id)) {
+          return { ...it, chunks: [...(it.chunks ?? []), tails.get(it.id) as string] }
+        }
+        return it
+      }))
+      if (wasAgent) snapped.push({ kind: 'text', role: 'assistant', content: '⏹ Stopped.' })
+      return snapped
+    })
     setStreaming(false)
   }
 
@@ -865,6 +1004,7 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
     setSessionId(null)
     sessionIdRef.current = null
     setTodos([])
+    setShowAllItems(false)
   }
 
   // ── Slash-command popup (agent mode) ──────────────────────────
@@ -948,8 +1088,9 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
     // Plan mode: read-only investigation → a plan to approve. No dirty check.
     if (planMode) { sendAgent({ planMode: true }); return }
     // Agent: auto-apply on a dirty tree is risky (no clean git baseline to undo
-    // to). Warn once; review mode is safe (each change is gated) so skip.
-    if (!reviewMode && input.trim() && !streaming) {
+    // to). Warn ONCE per session — after the user accepts, the agent's own
+    // edits keep the tree dirty, so re-warning would gate every message.
+    if (!reviewMode && !dirtyWarnAckedRef.current && input.trim() && !streaming) {
       try {
         const d = await window.api.workspaceGitDirtyCount()
         if (d.ok && d.count > 0) { setDirtyWarn({ count: d.count }); return }
@@ -962,9 +1103,23 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
   // stashed (approve → dirty), run that; otherwise a normal agent run.
   const confirmDirtyRun = () => {
     setDirtyWarn(null)
+    dirtyWarnAckedRef.current = true // don't nag again this session
     if (pendingPlanRef.current) { const p = pendingPlanRef.current; pendingPlanRef.current = null; runPlan(p) }
     else sendAgent()
   }
+
+  // "Run in Review mode" from the dirty warning: flip review on (each change
+  // is then gated, so a dirty tree is safe) and run.
+  const runDirtyInReview = () => {
+    setDirtyWarn(null)
+    if (!reviewMode) toggleReview()
+    if (pendingPlanRef.current) { const p = pendingPlanRef.current; pendingPlanRef.current = null; runPlan(p) }
+    else sendAgent()
+  }
+
+  // Cancel the dirty warning — also drop any stashed approved plan so a later
+  // "Run anyway" runs the NEXT message, not the stale plan.
+  const cancelDirtyWarn = () => { setDirtyWarn(null); pendingPlanRef.current = null }
 
   // Approve or decline a sensitive git/login/background action.
   const resolveAction = (approved: boolean) => {
@@ -976,9 +1131,15 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
   const ctxPreview = useFileContext ? getContext() : null
 
   // The most recent reasoning item — docked above the composer, not inline.
-  const latestReasoning = [...agentItems].reverse().find((it) => it.kind === 'reasoning') as
-    | Extract<AgentItem, { kind: 'reasoning' }>
-    | undefined
+  let latestReasoning: Extract<AgentItem, { kind: 'reasoning' }> | undefined
+  for (let i = agentItems.length - 1; i >= 0; i--) {
+    const it = agentItems[i]
+    if (it.kind === 'reasoning') { latestReasoning = it; break }
+  }
+
+  // Long transcripts: render only the newest RENDER_CAP items unless expanded.
+  const [showAllItems, setShowAllItems] = useState(false)
+  const hiddenCount = !showAllItems && agentItems.length > RENDER_CAP ? agentItems.length - RENDER_CAP : 0
 
   return (
     <motion.div
@@ -1054,7 +1215,7 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
                   <History size={14} />
                 </button>
                 {showSessions && (
-                  <div className="absolute right-0 top-6 z-20 w-64 max-h-72 overflow-y-auto scrollbar-thin rounded-lg border border-zinc-800 bg-zinc-900 shadow-xl py-1">
+                  <div className="absolute right-0 top-6 z-20 w-64 max-h-72 overflow-y-auto scrollbar-thin rounded-lg border border-zinc-800 bg-zinc-900 shadow-xl py-1" onMouseLeave={() => setConfirmDeleteSession(null)}>
                     {sessions.length === 0 ? (
                       <div className="px-3 py-2 text-[11px] text-zinc-600">No saved sessions</div>
                     ) : (
@@ -1077,7 +1238,7 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
                                 else if (e.key === 'Escape') { e.preventDefault(); setRenamingSession(null) }
                                 e.stopPropagation()
                               }}
-                              onBlur={() => setRenamingSession(null)}
+                              onBlur={() => commitRename()}
                               className="flex-1 min-w-0 px-1 py-0.5 bg-zinc-950 border border-blue-500/60 rounded text-[11px] text-zinc-100 focus:outline-none"
                             />
                           ) : (
@@ -1091,13 +1252,23 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
                           >
                             <Pencil size={11} />
                           </button>
-                          <button
-                            onClick={(e) => { e.stopPropagation(); deleteSession(s.id) }}
-                            title="Delete session"
-                            className="opacity-0 group-hover:opacity-100 text-zinc-600 hover:text-rose-400 flex-shrink-0"
-                          >
-                            <Trash size={11} />
-                          </button>
+                          {confirmDeleteSession === s.id ? (
+                            <button
+                              onClick={(e) => { e.stopPropagation(); setConfirmDeleteSession(null); deleteSession(s.id) }}
+                              title="Click again to confirm delete"
+                              className="text-[9px] font-semibold px-1 rounded bg-rose-600 text-white flex-shrink-0"
+                            >
+                              Delete?
+                            </button>
+                          ) : (
+                            <button
+                              onClick={(e) => { e.stopPropagation(); setConfirmDeleteSession(s.id) }}
+                              title="Delete session"
+                              className="opacity-0 group-hover:opacity-100 text-zinc-600 hover:text-rose-400 flex-shrink-0"
+                            >
+                              <Trash size={11} />
+                            </button>
+                          )}
                         </div>
                       ))
                     )}
@@ -1154,17 +1325,30 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
                 read and edit files in your workspace directly.
               </div>
             )}
-            {agentItems.map((it, i) =>
-              it.kind === 'text' ? (
+            {hiddenCount > 0 && (
+              <button
+                onClick={() => setShowAllItems(true)}
+                className="w-full py-1.5 rounded border border-zinc-800 bg-zinc-900/40 text-[11px] text-zinc-400 hover:text-zinc-200 hover:border-zinc-700"
+              >
+                Show {hiddenCount} earlier items…
+              </button>
+            )}
+            {agentItems.map((it, i) => {
+              if (i < hiddenCount) return null
+              return it.kind === 'text' ? (
                 <RiseIn key={i}>
                   {it.chunks
                     ? <GlowMessage role={it.role} chunks={it.chunks} />
                     : <MessageBubble role={it.role} content={it.content ?? ''} streaming={false} />}
                 </RiseIn>
+              ) : it.kind === 'subagent' ? (
+                <RiseIn key={i}><SubAgentCard entry={it} /></RiseIn>
               ) : it.kind === 'tool' ? (
-                <RiseIn key={i}><ToolActivity entry={it} /></RiseIn>
-              ) : null,
-            )}
+                // The SpawnAgent tool entry is kept in state for cross-turn
+                // history but shown as the richer nested SubAgentCard instead.
+                it.name === 'SpawnAgent' ? null : <RiseIn key={i}><ToolActivity entry={it} /></RiseIn>
+              ) : null
+            })}
             {streaming && (
               <div className="flex items-center gap-1.5 text-[11px] text-zinc-500 px-1">
                 <span className="size-1.5 rounded-full bg-blue-400 animate-pulse" />
@@ -1184,7 +1368,7 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
 
       {/* Thinking dock — reasoning lives here, not in the chat flow */}
       {mode !== 'ask' && latestReasoning && (
-        <ThinkingDock chunks={latestReasoning.chunks ?? []} active={streaming} />
+        <ThinkingDock text={itemText(latestReasoning)} active={streaming} />
       )}
 
       {/* Sensitive action confirmation (git mutate / account switch / login) */}
@@ -1294,8 +1478,15 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
           <div className="flex-1 text-[11px] text-zinc-300 leading-relaxed">
             You have {dirtyWarn.count} uncommitted change{dirtyWarn.count > 1 ? 's' : ''}. The agent applies
             edits directly — undoing a run reverts files to their last committed state, which would also drop
-            your current changes. Commit first, or turn on Review mode.
-            <div className="flex items-center gap-2 mt-1.5">
+            your current changes. Review mode gates each change instead.
+            <div className="flex items-center gap-2 mt-1.5 flex-wrap">
+              <button
+                onClick={runDirtyInReview}
+                title="Turn on Review mode and run — you approve each change before it applies"
+                className="text-[11px] font-medium px-2 py-0.5 rounded bg-emerald-600 hover:bg-emerald-500 text-white flex items-center gap-1"
+              >
+                <ShieldCheck size={11} /> Run in Review mode
+              </button>
               <button
                 onClick={confirmDirtyRun}
                 className="text-[11px] font-medium px-2 py-0.5 rounded bg-amber-600 hover:bg-amber-500 text-white"
@@ -1303,7 +1494,7 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
                 Run anyway
               </button>
               <button
-                onClick={() => setDirtyWarn(null)}
+                onClick={cancelDirtyWarn}
                 className="text-[11px] px-2 py-0.5 rounded border border-zinc-700 text-zinc-400 hover:text-zinc-200"
               >
                 Cancel
@@ -1316,21 +1507,27 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
       {/* Undo-run bar: revert everything the last agent run wrote */}
       {mode === 'agent' && !streaming && lastRunFiles.length > 0 && (
         <div className="flex items-center gap-2 px-3 py-2 border-t border-zinc-800 bg-zinc-900/40 flex-shrink-0">
-          <span className="text-[11px] text-zinc-400 flex-1">
-            Agent changed {lastRunFiles.length} file{lastRunFiles.length > 1 ? 's' : ''}
+          <span className="text-[11px] text-zinc-400 flex-1" title={lastRunFiles.join('\n')}>
+            {confirmUndo
+              ? `Revert ${lastRunFiles.length} file${lastRunFiles.length > 1 ? 's' : ''} to last commit? This can't be undone.`
+              : `Agent changed ${lastRunFiles.length} file${lastRunFiles.length > 1 ? 's' : ''}`}
           </span>
           <button
-            onClick={() => setLastRunFiles([])}
+            onClick={() => { setConfirmUndo(false); setLastRunFiles([]) }}
             className="text-[10px] text-zinc-500 hover:text-zinc-300 px-1.5 py-0.5"
           >
-            Dismiss
+            {confirmUndo ? 'Keep' : 'Dismiss'}
           </button>
           <button
-            onClick={undoLastRun}
+            onClick={() => (confirmUndo ? undoLastRun() : setConfirmUndo(true))}
             disabled={undoing}
-            className="flex items-center gap-1 text-[11px] font-medium px-2 py-0.5 rounded border border-amber-500/40 bg-amber-500/10 text-amber-300 hover:bg-amber-500/20 disabled:opacity-60"
+            className={`flex items-center gap-1 text-[11px] font-medium px-2 py-0.5 rounded border disabled:opacity-60 ${
+              confirmUndo
+                ? 'border-rose-500/50 bg-rose-600 text-white hover:bg-rose-500'
+                : 'border-amber-500/40 bg-amber-500/10 text-amber-300 hover:bg-amber-500/20'
+            }`}
           >
-            <Undo2 size={11} /> {undoing ? 'Undoing…' : 'Undo run'}
+            <Undo2 size={11} /> {undoing ? 'Undoing…' : confirmUndo ? 'Revert' : 'Undo run'}
           </button>
         </div>
       )}
@@ -1481,7 +1678,7 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
           enter and DIMS OUT on exit (the wrapper animates opacity; the inner
           rim/breathe keep their own CSS animation). Clipped, no pointer. */}
       <AnimatePresence>
-        {mode === 'agent' && (planMode || researchMode) && (
+        {mode === 'agent' && (planMode || researchMode) && visible && (
           <motion.div
             key={planMode ? 'plan-glow' : 'research-glow'}
             className="absolute inset-0 z-30 pointer-events-none"
@@ -1490,7 +1687,11 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
             exit={{ opacity: 0 }}
             transition={{ duration: 0.6, ease: 'easeInOut' }}
           >
-            <div className={planMode ? 'plan-glow' : 'research-glow'} aria-hidden="true" />
+            <div className={planMode ? 'plan-glow' : 'research-glow'} aria-hidden="true">
+              {/* Static conic gradient rotated on the compositor; the rim mask
+                  lives on .glow-rim (see index.css). */}
+              <div className="glow-rim"><div className="glow-spin" /></div>
+            </div>
           </motion.div>
         )}
       </AnimatePresence>
@@ -1513,7 +1714,7 @@ export function ChatPanel({ models, getContext, onFileChanged, onPendingChange, 
   )
 }
 
-function MessageBubble({ role, content, streaming }: { role: 'user' | 'assistant'; content: string; streaming: boolean }) {
+const MessageBubble = memo(function MessageBubble({ role, content, streaming }: { role: 'user' | 'assistant'; content: string; streaming: boolean }) {
   const isUser = role === 'user'
   const contentRef = useRef<HTMLDivElement>(null)
   return (
@@ -1527,7 +1728,14 @@ function MessageBubble({ role, content, streaming }: { role: 'user' | 'assistant
       >
         <div ref={contentRef}>
           {content
-            ? (isUser ? <div className="whitespace-pre-wrap break-words">{content}</div> : <MessageContent text={content} />)
+            ? (isUser
+                // While streaming, render plain text — re-parsing the whole
+                // growing reply as markdown per frame was O(n²). One markdown
+                // parse happens when the stream finishes.
+                ? <div className="whitespace-pre-wrap break-words">{content}</div>
+                : streaming
+                  ? <div className="whitespace-pre-wrap break-words">{content}</div>
+                  : <MessageContent text={content} />)
             : streaming ? (
               <span className="inline-flex gap-1 items-center text-zinc-500">
                 <span className="size-1.5 rounded-full bg-zinc-500 animate-pulse" />
@@ -1540,7 +1748,7 @@ function MessageBubble({ role, content, streaming }: { role: 'user' | 'assistant
       </div>
     </div>
   )
-}
+})
 
 // Copy-to-clipboard button. `getText` returns the RENDERED text (innerText of
 // the message), so the clipboard gets the readable version — no markdown syntax.
@@ -1587,7 +1795,7 @@ function PreBlock(props: React.HTMLAttributes<HTMLPreElement>) {
 // Full markdown renderer (GFM: tables, lists, code, links, headings, hr…).
 // Styling lives in `.md-body` in index.css; wide tables/code scroll inside the
 // bubble so nothing overflows.
-function MessageContent({ text }: { text: string }) {
+const MessageContent = memo(function MessageContent({ text }: { text: string }) {
   // Scrub any tool-log echo the model leaked into its prose (see stripToolEcho).
   const clean = stripToolEcho(text)
   return (
@@ -1603,65 +1811,35 @@ function MessageContent({ text }: { text: string }) {
       </ReactMarkdown>
     </div>
   )
-}
+})
 
-// Render streamed chunks with a dark→bright glow reveal. Only the last few
-// chunks are animated <span>s; everything older is collapsed into ONE static
-// text node. This keeps the DOM tiny (a handful of spans, not hundreds) so the
-// animation never bogs down on long outputs.
-const GLOW_TAIL = 12
-function GlowChunks({ chunks }: { chunks: string[] }) {
-  if (chunks.length <= GLOW_TAIL) {
-    return (
-      <>
-        {chunks.map((c, i) => <span key={i} className="stream-chunk">{c}</span>)}
-      </>
-    )
-  }
-  const splitAt = chunks.length - GLOW_TAIL
-  const head = chunks.slice(0, splitAt).join('')
-  const tail = chunks.slice(splitAt)
-  return (
-    <>
-      <span>{head}</span>
-      {tail.map((c, i) => <span key={splitAt + i} className="stream-chunk">{c}</span>)}
-    </>
-  )
-}
-
-// Assistant text (agent mode). User prompts stay plain; assistant text renders
-// as markdown (updates live as chunks stream in).
-function GlowMessage({ role, chunks }: { role: 'user' | 'assistant'; chunks: string[] }) {
+// A message that is STILL STREAMING (items keep `chunks` only while live —
+// they're flattened to `content` when the run ends). Streams as plain text:
+// re-parsing the growing reply as markdown on every reveal tick was O(n²).
+// The finished message renders once through MessageBubble's markdown path.
+const GlowMessage = memo(function GlowMessage({ role, chunks }: { role: 'user' | 'assistant'; chunks: string[] }) {
   const isUser = role === 'user'
   const text = chunks.join('')
-  const contentRef = useRef<HTMLDivElement>(null)
   return (
     <div className={isUser ? 'flex justify-end' : 'flex justify-start'}>
       <div
-        className={`group relative select-text max-w-[92%] min-w-0 overflow-hidden break-words rounded-lg px-3 py-2 text-xs leading-relaxed ${
+        className={`group relative select-text max-w-[92%] min-w-0 overflow-hidden break-words whitespace-pre-wrap rounded-lg px-3 py-2 text-xs leading-relaxed ${
           isUser
-            ? 'bg-blue-600/20 border border-blue-500/30 text-zinc-100 whitespace-pre-wrap'
+            ? 'bg-blue-600/20 border border-blue-500/30 text-zinc-100'
             : 'bg-zinc-900 border border-zinc-800 text-zinc-200'
         }`}
       >
-        <div ref={contentRef}>{isUser ? text : <MessageContent text={text} />}</div>
-        {!isUser && text.trim() && <CopyButton getText={() => contentRef.current?.innerText || text} />}
+        {text}
       </div>
     </div>
   )
-}
+})
 
-// Fade + rise-in wrapper for transcript items appearing one by one.
+// Fade + rise-in wrapper for transcript items appearing one by one. A plain
+// CSS animation (runs once on mount) — the previous framer-motion wrapper put
+// hundreds of live motion components in long transcripts.
 function RiseIn({ children }: { children: ReactNode }) {
-  return (
-    <motion.div
-      initial={{ opacity: 0, y: 10 }}
-      animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.32, ease: [0.22, 1, 0.36, 1] }}
-    >
-      {children}
-    </motion.div>
-  )
+  return <div className="rise-in">{children}</div>
 }
 
 // Renders text as per-word spans whose dark-dip animation is staggered by word
@@ -1696,7 +1874,7 @@ function ContextMeter({ used, window }: { used: number; window: number }) {
 // The model's reasoning ("thinking"), docked above the composer so it doesn't
 // clutter the chat. Collapsed by default: shows the last couple of lines auto-
 // scrolling like a ticker. Expand for the full, scrollable chain.
-function ThinkingDock({ chunks, active }: { chunks: string[]; active: boolean }) {
+function ThinkingDock({ text, active }: { text: string; active: boolean }) {
   const [expanded, setExpanded] = useState(false)
   // "settled" = text has fully streamed in but the model is still thinking
   // (no new chunk for a beat). Drives the loading shimmer sweep.
@@ -1706,17 +1884,16 @@ function ThinkingDock({ chunks, active }: { chunks: string[]; active: boolean })
   // Keep the collapsed ticker pinned to the newest text as it streams.
   useEffect(() => {
     if (!expanded) tickerRef.current?.scrollTo({ top: tickerRef.current.scrollHeight })
-  }, [chunks, expanded])
+  }, [text, expanded])
 
   // Whenever new reasoning text arrives, reset "settled"; if nothing new comes
   // for 700ms while still active, mark settled so the shimmer kicks in.
-  const total = chunks.length
   useEffect(() => {
     setSettled(false)
     if (!active) return
     const t = setTimeout(() => setSettled(true), 700)
     return () => clearTimeout(t)
-  }, [total, active])
+  }, [text.length, active])
   const shimmer = active && settled
 
   return (
@@ -1741,7 +1918,10 @@ function ThinkingDock({ chunks, active }: { chunks: string[]; active: boolean })
         } ${expanded ? 'max-h-60' : 'max-h-10'}`}
         style={expanded ? undefined : { maskImage: 'linear-gradient(to bottom, transparent, black 40%)' }}
       >
-        {shimmer ? <ShimmerText text={chunks.join('')} /> : <GlowChunks chunks={chunks} />}
+        {/* Shimmer only on the small collapsed ticker — animating
+            background-clip:text across the FULL expanded reasoning repainted
+            a large text block every frame. */}
+        {shimmer && !expanded ? <ShimmerText text={text} /> : <span>{text}</span>}
       </div>
     </motion.div>
   )
@@ -1749,7 +1929,85 @@ function ThinkingDock({ chunks, active }: { chunks: string[]; active: boolean })
 
 // Inline card for one tool call. Collapsed by default: a single summary line
 // (icon + name + target). Expand to see the tool's output.
-function ToolActivity({ entry }: { entry: ToolEntry }) {
+// A delegated child agent, rendered as a nested collapsible card that
+// subscribes to the child's own run channel and streams its live activity.
+const SubAgentCard = memo(function SubAgentCard({ entry }: { entry: SubAgentEntry }) {
+  const [open, setOpen] = useState(false)
+  const [tools, setTools] = useState<ToolEntry[]>([])
+  const [text, setText] = useState('')
+  const [status, setStatus] = useState<'running' | 'done' | 'error' | 'blocked'>('running')
+
+  useEffect(() => {
+    // Coalesce the child's token stream into one setState per frame — a
+    // setState per IPC token re-rendered this card 30+ times a second.
+    const buf = { text: '', raf: null as number | null }
+    const flush = () => {
+      buf.raf = null
+      const chunk = buf.text
+      buf.text = ''
+      if (chunk) setText((t) => t + chunk)
+    }
+    const off = window.api.onAiAgentEvent(entry.childRunId, (e: IdeAgentEvent) => {
+      if (e.type === 'token') {
+        buf.text += e.delta
+        if (buf.raf == null) buf.raf = requestAnimationFrame(flush)
+        return
+      }
+      if (buf.raf != null) { cancelAnimationFrame(buf.raf); flush() }
+      if (e.type === 'tool_call') setTools((ts) => [...ts, { kind: 'tool', callId: e.callId, name: e.name, args: e.args, running: true }])
+      else if (e.type === 'tool_result') setTools((ts) => ts.map((t) => t.callId === e.callId ? { ...t, result: e.result, isError: e.isError, running: false } : t))
+      else if (e.type === 'done') { setStatus('done'); if (e.text) setText(e.text) }
+      else if (e.type === 'error') { setStatus('error'); setText((t) => t + `\n⚠ ${e.error}`) }
+      else if (e.type === 'blocked') { setStatus('blocked'); setText((t) => t + `\n⛔ ${e.reason}`) }
+    })
+    return () => {
+      if (buf.raf != null) cancelAnimationFrame(buf.raf)
+      off()
+    }
+  }, [entry.childRunId])
+
+  const dot = status === 'running'
+    ? <Loader2 size={12} className="animate-spin text-blue-400" />
+    : status === 'done' ? <Check size={12} className="text-emerald-400" />
+    : <XCircle size={12} className="text-rose-400" />
+  const runningTools = tools.filter((t) => !t.running).length
+
+  return (
+    <div className="rounded-lg border border-violet-500/30 bg-violet-500/5 text-[11px] overflow-hidden">
+      <button
+        onClick={() => setOpen((v) => !v)}
+        className="w-full flex items-center gap-1.5 px-2 py-1.5 text-left hover:bg-violet-500/10 transition-colors"
+      >
+        <ChevronRight size={12} className={`text-zinc-500 transition-transform flex-shrink-0 ${open ? 'rotate-90' : ''}`} />
+        <Boxes size={12} className="text-violet-400 flex-shrink-0" />
+        <span className="font-semibold text-violet-200 truncate">{entry.label}</span>
+        <span className="ml-auto flex items-center gap-1.5 flex-shrink-0 text-zinc-500">
+          {runningTools > 0 && <span className="font-mono text-[10px]">{runningTools} tool{runningTools > 1 ? 's' : ''}</span>}
+          {dot}
+        </span>
+      </button>
+      {open && (
+        <div className="px-2 pb-2 pt-0.5 space-y-1.5 border-t border-violet-500/20">
+          <div className="text-[10px] text-zinc-500 italic pt-1.5 whitespace-pre-wrap">{entry.task}</div>
+          {tools.map((t, i) => <ToolActivity key={i} entry={t} />)}
+          {text.trim() && (
+            <div className="rounded bg-zinc-900/60 border border-zinc-800 px-2 py-1.5">
+              {/* Plain text while streaming; parse markdown once when done. */}
+              {status === 'running'
+                ? <div className="whitespace-pre-wrap break-words text-xs text-zinc-300">{text}</div>
+                : <MessageContent text={text} />}
+            </div>
+          )}
+        </div>
+      )}
+      {!open && status !== 'running' && text.trim() && (
+        <div className="px-2.5 pb-2 -mt-0.5 text-[10px] text-zinc-400 line-clamp-2">{text.trim().slice(0, 160)}</div>
+      )}
+    </div>
+  )
+})
+
+const ToolActivity = memo(function ToolActivity({ entry }: { entry: ToolEntry }) {
   const [open, setOpen] = useState(false)
   const icon = {
     Read: <FileText size={12} />,
@@ -1830,4 +2088,4 @@ function ToolActivity({ entry }: { entry: ToolEntry }) {
       )}
     </div>
   )
-}
+})

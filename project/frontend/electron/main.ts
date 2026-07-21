@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, safeStorage, dialog, Menu } from 'electron'
+import { app, BrowserWindow, ipcMain, safeStorage, dialog, Menu, Notification } from 'electron'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 import fs from 'node:fs/promises'
@@ -87,10 +87,24 @@ const IDLE_KILL_MS = 15 * 60 * 1000
 const GC_INTERVAL_MS = 60 * 1000
 
 let mainWindow: BrowserWindow | null = null
+// Set once the renderer has confirmed it is safe to close (no unsaved
+// buffers, or the user chose Save/Discard in the quit dialog).
+let allowClose = false
 
 function createWindow() {
-  // Remove the default application menu (File/Edit/View/Window/Help) entirely.
-  Menu.setApplicationMenu(null)
+  // macOS routes Cmd+C/V/X/A through the application menu — with a null menu
+  // those shortcuts were dead app-wide (you could not even paste an API key).
+  // Keep a minimal hidden menu on darwin; Windows/Linux handle clipboard keys
+  // natively, so the menu stays removed there.
+  if (process.platform === 'darwin') {
+    Menu.setApplicationMenu(Menu.buildFromTemplate([
+      { role: 'appMenu' },
+      { role: 'editMenu' },
+      { role: 'windowMenu' },
+    ]))
+  } else {
+    Menu.setApplicationMenu(null)
+  }
 
   // Window/taskbar icon. In dev, __dirname is dist-electron; the build/ folder
   // sits next to it under project/frontend. Prefer .ico on Windows.
@@ -121,6 +135,16 @@ function createWindow() {
 
   mainWindow.on('maximize', () => mainWindow?.webContents.send('window-maximized-changed', true))
   mainWindow.on('unmaximize', () => mainWindow?.webContents.send('window-maximized-changed', false))
+
+  // Quit guard: Cmd+Q / window close used to destroy unsaved buffers with no
+  // warning. Hand the decision to the renderer (it knows the dirty files and
+  // owns the Save/Discard dialog); it replies via 'app-close-confirm'. A
+  // crashed renderer closes unconditionally so a hung page can't trap the app.
+  mainWindow.on('close', (e) => {
+    if (allowClose || !mainWindow || mainWindow.webContents.isCrashed()) return
+    e.preventDefault()
+    mainWindow.webContents.send('app-close-request')
+  })
 
   // Agent-driven embedded browser (WebContentsView over the editor area).
   initBrowserTools({
@@ -155,6 +179,20 @@ function createWindow() {
 
 // ── IPC handlers ───────────────────────────────────────────────
 
+// Renderer's verdict on the quit guard: safe to close now.
+ipcMain.on('app-close-confirm', () => {
+  allowClose = true
+  mainWindow?.close()
+})
+
+// OS-level notification (agent finished / awaits approval while the window
+// is unfocused). Electron Notification works on both macOS and Windows.
+ipcMain.on('os-notify', (_e, title: string, body: string) => {
+  try {
+    new Notification({ title: String(title).slice(0, 80), body: String(body).slice(0, 200) }).show()
+  } catch { /* notifications unsupported — never break the caller */ }
+})
+
 // Window controls (custom title bar)
 ipcMain.handle('window-minimize', () => {
   mainWindow?.minimize()
@@ -177,23 +215,6 @@ ipcMain.handle('get-tasks', async () => {
   return db.getTasks()
 })
 
-ipcMain.handle('get-inbox-summary', async () => {
-  const result: { agent: string; count: number; preview: string }[] = []
-  for (const agent of await getRoles()) {
-    const msgs = db.getUnreadFor(agent)
-    const preview = msgs.length > 0 ? msgs[0].body.slice(0, 400) : ''
-    result.push({ agent, count: msgs.length, preview })
-  }
-  return result
-})
-
-ipcMain.handle('get-inbox-content', async (_evt, agent: string) => {
-  // Render unread messages back into the legacy markdown shape so existing
-  // renderer components keep working without changes.
-  const msgs = db.getUnreadFor(agent)
-  return msgs.map(messageToMarkdown).join('\n')
-})
-
 ipcMain.handle('get-logs', async () => {
   const result: { agent: string; lines: string[] }[] = []
   for (const agent of await getRoles()) {
@@ -203,20 +224,6 @@ ipcMain.handle('get-logs', async () => {
 })
 
 ipcMain.handle('get-root', () => ROOT)
-
-// Render a DB message row back into the legacy markdown block shape, so that
-// renderer components built around the old inbox format keep working unchanged.
-function messageToMarkdown(m: db.MessageRow): string {
-  const lines = [
-    '',
-    `## [${m.ts}] FROM: ${m.from_role} | TO: ${m.to_role} | TASK: ${m.task_id || 'T-000'}`,
-  ]
-  if (m.subject) lines.push(`**Subject:** ${m.subject}`)
-  if (m.priority) lines.push(`**Priority:** ${m.priority}`)
-  if (m.deps) lines.push(`**Deps:** ${m.deps}`)
-  lines.push('', m.body, '', '---', '')
-  return lines.join('\n')
-}
 
 // ── Write handlers ──────────────────────────────────────────
 
@@ -530,15 +537,26 @@ function deriveAvailableModels(config: FullConfig): { provider: string; id: stri
   return out
 }
 
+// mtime-cached: the coordinator tick (1s) and the inbox watcher (1.5s) both
+// read the config forever — re-parse only when the file actually changed.
+// External edits are still picked up (the mtime check is a cheap stat).
+let configCache: { mtime: number; value: FullConfig } | null = null
+
 async function readConfig(): Promise<FullConfig> {
+  const file = path.join(SHARED, 'agents-config.json')
   try {
-    return JSON.parse(await fs.readFile(path.join(SHARED, 'agents-config.json'), 'utf-8'))
+    const st = await fs.stat(file)
+    if (configCache && configCache.mtime === st.mtimeMs) return configCache.value
+    const value = JSON.parse(await fs.readFile(file, 'utf-8')) as FullConfig
+    configCache = { mtime: st.mtimeMs, value }
+    return value
   } catch {
     return { agents: {}, providers: {} }
   }
 }
 
 async function writeConfig(config: FullConfig) {
+  configCache = null // next read re-parses (mtime granularity can be coarse)
   await fs.writeFile(path.join(SHARED, 'agents-config.json'), JSON.stringify(config, null, 2) + '\n')
 }
 
@@ -922,13 +940,49 @@ ipcMain.handle('group-memory', (_evt, groupId: string) => {
 interface PtySession {
   proc: import('node-pty').IPty
   agent: string
-  history: string           // recent output buffer for late-attaching renderers
+  history: string[]         // recent output chunks for late-attaching renderers
+  historyBytes: number      // running total; whole chunks trimmed from the front
   lastActivityAt: number    // millis; bumped on inbox event, proc.onData, pty-write
   spawnedAt: number         // millis; for warm-up gating + diagnostics
 }
 
 const ptySessions = new Map<string, PtySession>()
 const HISTORY_MAX = 50_000  // keep last ~50KB per session
+
+// Append a chunk to a history buffer, trimming whole chunks from the front —
+// the old string concat + slice(-50k) reallocated the full 50KB per chunk.
+function pushHistory(h: { history: string[]; historyBytes: number }, data: string): void {
+  h.history.push(data)
+  h.historyBytes += data.length
+  while (h.historyBytes > HISTORY_MAX && h.history.length > 1) {
+    h.historyBytes -= h.history[0].length
+    h.history.shift()
+  }
+}
+
+// Batch terminal output crossing IPC: one webContents.send per ~16ms per
+// channel instead of one per PTY chunk — fast producers (builds, `yes`)
+// emitted hundreds of individually-serialized messages a second.
+function makeIpcBatcher(channel: string): { push: (data: string) => void; flush: () => void } {
+  let buf = ''
+  let timer: ReturnType<typeof setTimeout> | null = null
+  const flush = () => {
+    if (timer) { clearTimeout(timer); timer = null }
+    if (!buf) return
+    const chunk = buf
+    buf = ''
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send(channel, chunk)
+    }
+  }
+  return {
+    push: (data: string) => {
+      buf += data
+      if (!timer) timer = setTimeout(flush, 16)
+    },
+    flush,
+  }
+}
 
 // In-flight spawn promises so two concurrent ensurePty() calls don't double-spawn.
 const spawnLocks = new Map<string, Promise<PtySession>>()
@@ -970,24 +1024,21 @@ async function doSpawn(agent: string): Promise<PtySession> {
 
   const now = Date.now()
   const s: PtySession = {
-    proc, agent, history: '',
+    proc, agent, history: [], historyBytes: 0,
     lastActivityAt: now,
     spawnedAt: now,
   }
   ptySessions.set(agent, s)
 
+  const batcher = makeIpcBatcher(`pty-data:${agent}`)
   proc.onData((data) => {
-    s.history += data
-    if (s.history.length > HISTORY_MAX) {
-      s.history = s.history.slice(-HISTORY_MAX)
-    }
+    pushHistory(s, data)
     s.lastActivityAt = Date.now()
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send(`pty-data:${agent}`, data)
-    }
+    batcher.push(data)
   })
 
   proc.onExit(({ exitCode, signal }) => {
+    batcher.flush() // deliver the tail before the exit marker
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send(`pty-exit:${agent}`, { exitCode, signal })
     }
@@ -1028,7 +1079,7 @@ function startIdleGc() {
 
 ipcMain.handle('pty-start', async (_evt, agent: string) => {
   const s = await ensurePty(agent)
-  return { ok: true, history: s.history }
+  return { ok: true, history: s.history.join('') }
 })
 
 // pty-attach: read-only attach. Returns existing session's history without
@@ -1037,7 +1088,7 @@ ipcMain.handle('pty-start', async (_evt, agent: string) => {
 ipcMain.handle('pty-attach', (_evt, agent: string) => {
   const s = ptySessions.get(agent)
   if (!s) return { alive: false, history: '' }
-  return { alive: true, history: s.history }
+  return { alive: true, history: s.history.join('') }
 })
 
 // ── Cost summary (aggregated from the usage table) ───────────
@@ -1192,7 +1243,8 @@ app.on('before-quit', () => {
 
 interface ShellSession {
   proc: import('node-pty').IPty
-  history: string
+  history: string[]
+  historyBytes: number
 }
 const shellSessions = new Map<string, ShellSession>()
 
@@ -1217,23 +1269,22 @@ ipcMain.handle('shell-start', (_evt, id: string) => {
       cwd: workspaceRoot,
       env: { ...process.env, TERM: 'xterm-256color' },
     })
-    s = { proc, history: '' }
+    s = { proc, history: [], historyBytes: 0 }
     shellSessions.set(id, s)
+    const batcher = makeIpcBatcher(`shell-data:${id}`)
     proc.onData((data) => {
-      s!.history += data
-      if (s!.history.length > HISTORY_MAX) s!.history = s!.history.slice(-HISTORY_MAX)
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send(`shell-data:${id}`, data)
-      }
+      pushHistory(s!, data)
+      batcher.push(data)
     })
     proc.onExit(({ exitCode }) => {
+      batcher.flush() // deliver the tail before the exit marker
       if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.webContents.send(`shell-exit:${id}`, { exitCode })
       }
       shellSessions.delete(id)
     })
   }
-  return { ok: true, history: s.history }
+  return { ok: true, history: s.history.join('') }
 })
 
 ipcMain.handle('shell-write', (_evt, id: string, data: string) => {
@@ -1280,11 +1331,13 @@ async function watchInboxes() {
     } catch {
       return
     }
-    // Include any role that already has unread messages even if not in config
-    // (e.g. clones), via the DB's recipient list.
-    const allRoles = new Set<string>([...roles, ...db.distinctRecipients()])
+    // ONE grouped query per tick (was a DISTINCT scan + a count per role).
+    // Roles with unread messages but absent from config (e.g. clones) appear
+    // in the grouped result, so they're still covered.
+    const counts = db.unreadCountsByRole()
+    const allRoles = new Set<string>([...roles, ...counts.keys()])
     for (const agent of allRoles) {
-      const count = db.unreadCount(agent)
+      const count = counts.get(agent) ?? 0
       const prev = unreadBaseline.get(agent) ?? 0
       unreadBaseline.set(agent, count)
       if (count > prev) {
@@ -1448,6 +1501,7 @@ ipcMain.handle('workspace-read-file', async (_evt, relPath: string) => {
 })
 
 ipcMain.handle('workspace-write-file', async (_evt, relPath: string, content: string) => {
+  bustGitCache()
   const absPath = resolveInWorkspace(relPath)
   if (!absPath) return { ok: false, error: 'Access denied: path is outside workspace root' }
   try {
@@ -1588,7 +1642,23 @@ function gitExec(args: string[]): Promise<{ ok: boolean; stdout: string; stderr:
   })
 }
 
-ipcMain.handle('workspace-git-status', async () => {
+// Short-TTL memo for the read-only git polls: multiple renderer consumers
+// poll status/branch every couple of seconds — they now share one spawn.
+// Mutating git handlers call bustGitCache() so the next read is fresh.
+const gitReadCache = new Map<string, { at: number; promise: Promise<unknown> }>()
+const GIT_CACHE_TTL_MS = 1200
+function gitCached<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const hit = gitReadCache.get(key)
+  if (hit && Date.now() - hit.at < GIT_CACHE_TTL_MS) return hit.promise as Promise<T>
+  const promise = fn()
+  gitReadCache.set(key, { at: Date.now(), promise })
+  return promise
+}
+function bustGitCache(): void {
+  gitReadCache.clear()
+}
+
+ipcMain.handle('workspace-git-status', async () => gitCached('status', async () => {
   const { ok, stdout } = await gitExec(['status', '--porcelain'])
   if (!ok) return []
   const lines = stdout.trim().split('\n').filter(Boolean)
@@ -1597,7 +1667,7 @@ ipcMain.handle('workspace-git-status', async () => {
     const file = line.slice(3).trim().replace(/^"|"$/g, '')
     return { file, type, staged: line[0] !== ' ' && line[0] !== '?' }
   })
-})
+}))
 
 ipcMain.handle('workspace-git-show-head', async (_evt, relPath: string) => {
   const gitPath = relPath.replace(/\\/g, '/')
@@ -1605,48 +1675,55 @@ ipcMain.handle('workspace-git-show-head', async (_evt, relPath: string) => {
   return { ok: true, content: ok ? stdout : '' }
 })
 
-ipcMain.handle('workspace-git-branch', async () => {
+ipcMain.handle('workspace-git-branch', async () => gitCached('branch', async () => {
   const cur = await gitExec(['rev-parse', '--abbrev-ref', 'HEAD'])
   const all = await gitExec(['branch', '--format=%(refname:short)'])
   return {
     current: cur.ok ? cur.stdout.trim() : '',
     branches: all.ok ? all.stdout.split('\n').map((s) => s.trim()).filter(Boolean) : [],
   }
-})
+}))
 
 ipcMain.handle('workspace-git-stage', async (_evt, file: string) => {
+  bustGitCache()
   const { ok, stderr } = await gitExec(['add', '--', file])
   return { ok, error: ok ? undefined : stderr }
 })
 
 ipcMain.handle('workspace-git-unstage', async (_evt, file: string) => {
+  bustGitCache()
   const { ok, stderr } = await gitExec(['restore', '--staged', '--', file])
   return { ok, error: ok ? undefined : stderr }
 })
 
 ipcMain.handle('workspace-git-stage-all', async () => {
+  bustGitCache()
   const { ok, stderr } = await gitExec(['add', '-A'])
   return { ok, error: ok ? undefined : stderr }
 })
 
 ipcMain.handle('workspace-git-commit', async (_evt, message: string) => {
+  bustGitCache()
   if (!message?.trim()) return { ok: false, error: 'commit message required' }
   const { ok, stdout, stderr } = await gitExec(['commit', '-m', message])
   return { ok, output: stdout, error: ok ? undefined : (stderr || stdout) }
 })
 
 ipcMain.handle('workspace-git-checkout', async (_evt, branch: string, create?: boolean) => {
+  bustGitCache()
   const args = create ? ['checkout', '-b', branch] : ['checkout', branch]
   const { ok, stderr } = await gitExec(args)
   return { ok, error: ok ? undefined : stderr }
 })
 
 ipcMain.handle('workspace-git-push', async () => {
+  bustGitCache()
   const { ok, stdout, stderr } = await gitExec(['push'])
   return { ok, output: stdout + stderr }
 })
 
 ipcMain.handle('workspace-git-pull', async () => {
+  bustGitCache()
   const { ok, stdout, stderr } = await gitExec(['pull'])
   return { ok, output: stdout + stderr }
 })
@@ -1662,6 +1739,7 @@ ipcMain.handle('workspace-git-dirty-count', async () => {
 // are checked out from HEAD; files the agent newly created (untracked) are
 // deleted. Paths are workspace-relative and validated to stay inside the root.
 ipcMain.handle('workspace-git-restore-files', async (_evt, files: string[]) => {
+  bustGitCache()
   if (!workspaceRoot) return { ok: false, error: 'no workspace open' }
   const restored: string[] = []
   const removed: string[] = []
@@ -1695,16 +1773,6 @@ ipcMain.handle('update-task', async (_evt, id: string, changes: { deps?: string[
     updated_at: nowStamp(),
   })
   return { ok: true }
-})
-
-// ── All logs (no line limit) ────────────────────────────────────
-
-ipcMain.handle('get-all-logs', async () => {
-  const result: { agent: string; lines: string[] }[] = []
-  for (const agent of await getRoles()) {
-    result.push({ agent, lines: db.allLogs(agent) })
-  }
-  return result
 })
 
 // ── PTY restart ─────────────────────────────────────────────────
@@ -1814,6 +1882,30 @@ const pendingActions = new Map<string, (approved: boolean) => void>()
 const pendingEditorReqs = new Map<string, (r: EditorResponse) => void>()
 let editorReqCounter = 0
 
+// ── sub-agent registry ───────────────────────────────────────────
+// Child IDE-agents spawned by the chat agent via SpawnAgent. The renderer
+// shows them both inline (nested card, subscribing to ai-agent-event:<childId>)
+// and in the sidebar (this list, pushed on `subagent-event`).
+interface SubAgentRec {
+  childRunId: string
+  parentRunId: string
+  label: string
+  task: string
+  status: 'running' | 'done' | 'error'
+  startedAt: number
+  endedAt: number | null
+  summary: string
+}
+const subAgents = new Map<string, SubAgentRec>()
+let subAgentCounter = 0
+const MAX_SUBAGENTS = 4
+function broadcastSubAgents(): void {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('subagent-event', [...subAgents.values()])
+  }
+}
+ipcMain.handle('subagent-list', () => ({ ok: true, subagents: [...subAgents.values()] }))
+
 // Create a task on the board (mirrors the create-task IPC, minus HTN split).
 function createBoardTask(input: { title: string; owner: string; description?: string; priority?: string }): string {
   const ts = nowStamp()
@@ -1904,11 +1996,87 @@ ipcMain.handle('ai-agent-run', async (_evt, runId: string, params: IdeAgentParam
     allowBash: Boolean(ideCfg.allowBash),
     orchestrationEnabled: Boolean(orch.enabled),
   }
+  // Delegate a sub-task to a child IDE-agent (full toolset, minus editor
+  // round-trip and minus its own SpawnAgent). Runs to completion; returns the
+  // child's final summary. Shares this run's abort signal + approval bridges so
+  // cancelling the parent cancels children and sensitive actions still prompt
+  // the user exactly once. Only offered to the TOP-LEVEL agent (depth 0).
+  const spawnSubAgent = async (input: { task: string; label?: string }): Promise<string> => {
+    if ((params.subAgentDepth ?? 0) > 0) return 'error: sub-agents cannot spawn further agents'
+    const running = [...subAgents.values()].filter((s) => s.status === 'running').length
+    if (running >= MAX_SUBAGENTS) {
+      return `error: too many sub-agents running (max ${MAX_SUBAGENTS}) — wait for one to finish`
+    }
+    // Keep the registry small: drop the oldest finished entries past a cap.
+    if (subAgents.size > 30) {
+      const finished = [...subAgents.values()].filter((s) => s.status !== 'running').sort((a, b) => (a.endedAt ?? 0) - (b.endedAt ?? 0))
+      for (const s of finished.slice(0, subAgents.size - 30)) subAgents.delete(s.childRunId)
+    }
+    const childRunId = `${runId}.sub-${++subAgentCounter}`
+    const label = (input.label || input.task).slice(0, 60)
+    const rec: SubAgentRec = {
+      childRunId, parentRunId: runId, label, task: input.task,
+      status: 'running', startedAt: Date.now(), endedAt: null, summary: '',
+    }
+    subAgents.set(childRunId, rec)
+    emit({ type: 'subagent_started', childRunId, label, task: input.task })
+    broadcastSubAgents()
+
+    let summary = ''
+    const childEmit = (e: IdeAgentEvent) => {
+      if (e.type === 'done') summary = e.text || ''
+      else if (e.type === 'blocked') summary = `blocked: ${e.reason}`
+      else if (e.type === 'error') summary = `error: ${e.error}`
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send(`ai-agent-event:${childRunId}`, e)
+        // Approval requests and file writes must ALSO reach the parent
+        // channel — that is where the approve/decline UI and the editor
+        // reload live. Without this, review mode + SpawnAgent deadlocked
+        // (the child waited forever on a pending_change no surface showed)
+        // and files a sub-agent wrote never live-reloaded in the editor.
+        if (
+          e.type === 'pending_change' || e.type === 'change_resolved' ||
+          e.type === 'pending_action' || e.type === 'action_resolved' ||
+          e.type === 'file_changed'
+        ) {
+          mainWindow.webContents.send(`ai-agent-event:${runId}`, e)
+        }
+      }
+    }
+    const childParams: IdeAgentParams = {
+      ...runParams,
+      messages: [{ role: 'user', content: input.task }],
+      openFile: undefined,
+      selection: undefined,
+      planMode: false,
+      researchMode: false,
+      subAgentDepth: (params.subAgentDepth ?? 0) + 1,
+    }
+    // Sub-agents reuse createTask/createGroup but NOT spawnSubAgent (depth cap).
+    const subBridge = {
+      createTask: orchestrationBridge.createTask,
+      createGroup: orchestrationBridge.createGroup,
+    }
+    try {
+      // editorBridge = undefined: a sub-agent must not drive the user's single
+      // editor; it writes to disk and the file_changed events reload the tab.
+      await runIdeAgent(SHARED, childParams, decryptKey, childEmit, ac.signal, requestReview, undefined, subBridge, requestAction)
+      rec.status = summary.startsWith('error:') ? 'error' : 'done'
+    } catch (e) {
+      summary = `error: ${(e as Error).message || e}`
+      rec.status = 'error'
+    }
+    rec.summary = summary
+    rec.endedAt = Date.now()
+    broadcastSubAgents()
+    return summary || '(sub-agent finished without a summary)'
+  }
   const orchestrationBridge = {
     createTask: async (input: { title: string; owner: string; description?: string; priority?: string }) =>
       createBoardTask(input),
     createGroup: async (input: { task_id: string; worker_role: string }) =>
       coordinator.createGroupForTask(input.task_id, input.worker_role),
+    spawnSubAgent,
   }
   try {
     await runIdeAgent(SHARED, runParams, decryptKey, emit, ac.signal, requestReview, editorBridge, orchestrationBridge, requestAction)
