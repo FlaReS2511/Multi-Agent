@@ -27,6 +27,58 @@ import * as db from './db'
 
 const MAX_TURNS = parseInt(process.env.IDE_AGENT_MAX_TURNS || '30', 10)
 
+// Cap a tool result fed back to the MODEL (the UI event is capped separately).
+// Read of a big file used to inject the whole thing; a few of those and the
+// prompt overflowed the context window, so the gateway truncated/dropped
+// mid-run and the agent just stopped.
+const MODEL_RESULT_CAP = 30_000
+
+// When the prompt nears the model's window, old tool results are shrunk to
+// this many chars (the model has already acted on them).
+const TRIM_KEEP_CHARS = 600
+
+// Shrink tool-result contents of OLDER messages in place, keeping the last
+// `keepTail` messages intact. Handles both OpenAI ('tool' role, string
+// content) and Anthropic (user message with tool_result blocks) shapes.
+function trimOldToolResults(messages: unknown[], keepTail: number): void {
+  const note = ' …[old tool output trimmed to save context]'
+  const end = Math.max(0, messages.length - keepTail)
+  for (let i = 0; i < end; i++) {
+    const m = messages[i] as any
+    if (!m) continue
+    if (m.role === 'tool' && typeof m.content === 'string' && m.content.length > TRIM_KEEP_CHARS + note.length) {
+      m.content = m.content.slice(0, TRIM_KEEP_CHARS) + note
+    } else if (m.role === 'user' && Array.isArray(m.content)) {
+      for (const b of m.content) {
+        if (b && b.type === 'tool_result' && typeof b.content === 'string' && b.content.length > TRIM_KEEP_CHARS + note.length) {
+          b.content = b.content.slice(0, TRIM_KEEP_CHARS) + note
+        }
+      }
+    }
+  }
+}
+
+// "I'll do X:" and then silence — the model narrated an action instead of
+// calling the tool and ended its turn. These patterns (EN + VI) detect an
+// announced-but-unexecuted action at the END of a text-only reply so the loop
+// can nudge the model to actually execute instead of stopping the run.
+// TAIL = the rest of the LAST sentence only: no !?, newline, or sentence-ending
+// period — but a period glued to a non-space (ChatPanel.tsx, v1.2) is allowed.
+// Note \b is ASCII-only, so Vietnamese words starting with đ/ê/… need the
+// explicit (^|separator) boundary instead.
+const INTENT_TAIL = String.raw`(?:[^.!?\n]|\.(?=\S)){0,160}[.!…]?\s*$`
+const INTENT_TAIL_RES: RegExp[] = [
+  /[:：]\s*$/,
+  new RegExp(String.raw`\b(let me (?!know\b)|i['’]?ll |i will |i['’]?m going to |proceeding to )` + INTENT_TAIL, 'i'),
+  new RegExp(String.raw`(^|[\s(,;—–-])(tôi|mình|ta|chúng ta)\s+sẽ\s` + INTENT_TAIL, 'i'),
+  new RegExp(String.raw`(^|[\s(,;—–-])để\s+(tôi|mình)\s` + INTENT_TAIL, 'i'),
+  new RegExp(String.raw`(^|[\s(,;—–.-])(tiến hành|bắt đầu)\s+\S+` + INTENT_TAIL, 'i'),
+]
+function looksLikeAnnouncedAction(text: string): boolean {
+  const tail = text.slice(-260)
+  return INTENT_TAIL_RES.some((re) => re.test(tail))
+}
+
 // File-mutating tools whose success should reload the editor/file-tree.
 const FILE_CHANGED_TOOLS = new Set(['Write', 'Edit', 'MultiEdit', 'Move', 'Delete', 'NotebookEdit', 'DownloadFile'])
 
@@ -539,6 +591,7 @@ export async function runIdeAgent(
     let turns = 0
     let anyActivity = false // any tool call ran this run
     let lengthContinues = 0 // auto-continuations after hitting the output cap
+    let intentNudges = 0    // "you said you'd do it — call the tool" nudges
     let continuing = false  // this turn continues a capped reply
     let browserApproved = false // approve-once: driving the browser beyond localhost
 
@@ -584,11 +637,6 @@ export async function runIdeAgent(
         `[agent] turn=${turns + 1} finish=${res.finishReason || '-'} dropped=${!!res.dropped} ` +
         `tools=${toolCalls.length} textLen=${text.length} in=${usage.input} out=${usage.output}`,
       )
-      // Upstream closed the stream without a finish marker after partial
-      // output — flag it visibly instead of passing the cut-off reply as done.
-      if (res.dropped && streamedThisTurn && toolCalls.length === 0) {
-        emit({ type: 'token', delta: '\n\n⚠ [stream dropped — reply may be truncated]', turn })
-      }
       turns++
 
       // Record cost under a virtual role so it shows in the dashboard.
@@ -605,6 +653,10 @@ export async function runIdeAgent(
       // Report context fill: prompt tokens this turn = current context size.
       if (usage.input > 0) {
         emit({ type: 'context', used: usage.input, window: contextWindow, turn })
+        // Long runs: once the prompt nears the window, shrink OLD tool results
+        // in place so the next call doesn't overflow — overflow is what made
+        // gateways truncate/drop tool calls mid-run and the agent go silent.
+        if (usage.input > contextWindow * 0.8) trimOldToolResults(messages, 8)
       }
 
       if (text) finalText = continuing ? finalText + text : text
@@ -614,10 +666,13 @@ export async function runIdeAgent(
         // and ask the model to continue seamlessly (up to 2 continuations).
         // Some gateways silently cap output and report finish=stop anyway —
         // treat a "stop" that ends mid-sentence as capped too (heuristic).
+        // A stream that DROPPED after partial output is the same situation
+        // (gateway died mid-reply) — continue instead of ending the run.
         const t = text.trimEnd()
         const looksTruncated =
           res.finishReason === 'stop' && t.length > 150 && /[\p{L}\p{N},(–—-]$/u.test(t) && !t.endsWith('```')
         const capped = res.finishReason === 'length' || res.finishReason === 'max_tokens' || looksTruncated
+          || (res.dropped && streamedThisTurn)
         if (capped && lengthContinues < 2 && !signal.aborted) {
           lengthContinues++
           continuing = true
@@ -628,7 +683,22 @@ export async function runIdeAgent(
           })
           continue
         }
-        if (capped) emit({ type: 'token', delta: '\n\n⚠ [reply hit the output limit — say "continue" to resume]', turn })
+        if (capped) emit({ type: 'token', delta: '\n\n⚠ [reply was cut off — say "continue" to resume]', turn })
+        // The model ANNOUNCED an action ("I'll now fix X:") but called no tool
+        // and ended its turn — without a nudge the run would just stop there.
+        // Push it to execute; bounded so a chatty model can't loop forever.
+        if (!capped && t && looksLikeAnnouncedAction(t) && intentNudges < 2 && !signal.aborted) {
+          intentNudges++
+          messages.push(assistantMsg)
+          messages.push({
+            role: 'user',
+            content:
+              'You announced an action but did not call any tool — the turn ended with words only. ' +
+              'CALL the tool(s) directly now to actually do it; do not re-describe the action. ' +
+              'If the task is already fully complete, reply with only the final summary.',
+          })
+          continue
+        }
         // Still empty after retries, nothing streamed, no tools ever ran →
         // surface it instead of silently ending the run with no reply at all.
         if (!finalText && !streamedThisTurn && !anyActivity) {
@@ -661,6 +731,16 @@ export async function runIdeAgent(
         if (signal.aborted) { emit({ type: 'error', error: 'cancelled' }); return }
         const callId = call.id || `${call.name}-${Date.now()}`
         emit({ type: 'tool_call', callId, name: call.name, args: call.args })
+
+        // The call's argument JSON arrived truncated/malformed (output cap or
+        // dropped stream) — don't execute it with empty args; tell the model
+        // so it re-issues the call instead of the run silently misfiring.
+        if (call.invalid) {
+          const r = 'error: this tool call\'s arguments arrived truncated/malformed (the reply was likely cut off) — re-issue the call; if the arguments were large, send a smaller version'
+          results.push(r)
+          emit({ type: 'tool_result', callId, name: call.name, result: r, isError: true })
+          continue
+        }
 
         // Control tool: bail out of the run cleanly.
         if (call.name === 'ReportBlocked') {
@@ -896,7 +976,11 @@ export async function runIdeAgent(
           }
         }
 
-        results.push(result)
+        // Cap what goes back to the model — a single huge result (full-file
+        // Read, big command output) could blow the context for the whole run.
+        results.push(result.length > MODEL_RESULT_CAP
+          ? result.slice(0, MODEL_RESULT_CAP) + '\n…[output truncated — re-run with a narrower scope (offset/limit, tighter pattern) for more]'
+          : result)
         emit({ type: 'tool_result', callId, name: call.name, result: result.slice(0, 2000), isError })
       }
 
@@ -905,7 +989,7 @@ export async function runIdeAgent(
       if (pendingSpawns.length > 0) {
         await Promise.all(pendingSpawns.map(async ({ index, callId, promise }) => {
           const r = await promise
-          results[index] = r
+          results[index] = r.length > MODEL_RESULT_CAP ? r.slice(0, MODEL_RESULT_CAP) + '\n…[summary truncated]' : r
           emit({ type: 'tool_result', callId, name: 'SpawnAgent', result: r.slice(0, 2000), isError: r.startsWith('error:') })
         }))
       }
