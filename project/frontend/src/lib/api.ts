@@ -21,12 +21,6 @@ export interface TasksFile {
   next_id: number
 }
 
-export interface InboxSummary {
-  agent: string
-  count: number
-  preview: string
-}
-
 export interface AgentLogs {
   agent: string
   lines: string[]
@@ -357,10 +351,7 @@ declare global {
   interface Window {
     api: {
       getTasks(): Promise<TasksFile>
-      getInboxSummary(): Promise<InboxSummary[]>
-      getInboxContent(agent: string): Promise<string>
       getLogs(): Promise<AgentLogs[]>
-      getAllLogs(): Promise<AgentLogs[]>
       getRoot(): Promise<string>
       createTask(input: CreateTaskInput): Promise<{ id: string; task: Task }>
       splitTask(input: SplitTaskInput): Promise<{ ok: boolean; parent_id: string; children: Task[] }>

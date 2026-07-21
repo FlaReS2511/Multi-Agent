@@ -5,8 +5,8 @@
 // encrypted provider secrets. The static `shared/agents-config.json` stays a
 // file (hand-editable, version-controlled).
 //
-// WAL mode lets the Electron process and the Python agent_runtime.py read/write
-// concurrently. Both open the same shared/state.db.
+// WAL mode lets the Electron main process and the agent-runtime child
+// processes read/write concurrently. All open the same shared/state.db.
 
 import Database from 'better-sqlite3'
 import path from 'node:path'
@@ -471,13 +471,6 @@ export function recentLogs(role: string, limit: number): string[] {
     .prepare(`SELECT ts, line FROM logs WHERE role = ? ORDER BY id DESC LIMIT ?`)
     .all(role, limit) as { ts: string; line: string }[]
   return rows.reverse().map((r) => `[${r.ts}] ${r.line}`)
-}
-
-export function allLogs(role: string): string[] {
-  const rows = getDb()
-    .prepare(`SELECT ts, line FROM logs WHERE role = ? ORDER BY id`)
-    .all(role) as { ts: string; line: string }[]
-  return rows.map((r) => `[${r.ts}] ${r.line}`)
 }
 
 // ── high-level task helpers (shared by main process + agent runtime) ─────

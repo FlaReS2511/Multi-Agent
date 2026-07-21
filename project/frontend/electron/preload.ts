@@ -2,8 +2,6 @@ import { contextBridge, ipcRenderer, webFrame } from 'electron'
 
 const api = {
   getTasks: () => ipcRenderer.invoke('get-tasks'),
-  getInboxSummary: () => ipcRenderer.invoke('get-inbox-summary'),
-  getInboxContent: (agent: string) => ipcRenderer.invoke('get-inbox-content', agent),
   getLogs: () => ipcRenderer.invoke('get-logs'),
   getRoot: () => ipcRenderer.invoke('get-root'),
   createTask: (input: {
@@ -43,7 +41,6 @@ const api = {
     ipcRenderer.invoke('set-provider-key', input),
   clearProviderKey: (provider: string) =>
     ipcRenderer.invoke('clear-provider-key', provider),
-  getAllLogs: () => ipcRenderer.invoke('get-all-logs'),
   updateTask: (id: string, changes: { deps?: string[]; priority?: 'low' | 'medium' | 'high' }) =>
     ipcRenderer.invoke('update-task', id, changes),
   listArtifactTasks: () => ipcRenderer.invoke('list-artifact-tasks'),

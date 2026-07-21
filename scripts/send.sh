@@ -3,8 +3,8 @@
 # Usage: ./scripts/send.sh <to-agent> <from-agent> <task-id> "<message body>"
 # Example: ./scripts/send.sh backend-engineer orchestrator T-001 "Create project/backend/hello.py"
 #
-# API-only: messages live in shared/state.db, not markdown files. This shells
-# out to a tiny Python snippet using scripts/db.py.
+# API-only: messages live in shared/state.db. Inserts directly via the sqlite3
+# CLI (no Python dependency).
 
 set -euo pipefail
 
@@ -19,18 +19,18 @@ TASK="$3"
 BODY="$4"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-PYTHON="${PYTHON_BIN:-python3}"
-command -v "$PYTHON" >/dev/null 2>&1 || PYTHON=python
+DB="$ROOT/shared/state.db"
+TS="$(date "+%Y-%m-%d %H:%M")"
 
-"$PYTHON" - "$ROOT" "$TO" "$FROM" "$TASK" "$BODY" <<'PY'
-import sys
-from pathlib import Path
-root, to, frm, task, body = sys.argv[1:6]
-sys.path.insert(0, str(Path(root) / "scripts"))
-from db import Db
-db = Db(Path(root) / "shared")
-mid = db.add_message(from_role=frm, to_role=to, body=body,
-                     task_id=(task or None), status="unread")
-db.close()
-print(f"sent message id={mid} to {to} (task {task})")
-PY
+command -v sqlite3 >/dev/null 2>&1 || { echo "sqlite3 CLI is required" >&2; exit 1; }
+
+# SQL-escape: double any single quotes.
+esc() { printf "%s" "$1" | sed "s/'/''/g"; }
+
+MID=$(sqlite3 "$DB" "
+  INSERT INTO messages (ts, from_role, to_role, task_id, body, status)
+  VALUES ('$(esc "$TS")', '$(esc "$FROM")', '$(esc "$TO")',
+          NULLIF('$(esc "$TASK")', ''), '$(esc "$BODY")', 'unread');
+  SELECT last_insert_rowid();")
+
+echo "sent message id=$MID to $TO (task ${TASK:-none})"

@@ -177,23 +177,6 @@ ipcMain.handle('get-tasks', async () => {
   return db.getTasks()
 })
 
-ipcMain.handle('get-inbox-summary', async () => {
-  const result: { agent: string; count: number; preview: string }[] = []
-  for (const agent of await getRoles()) {
-    const msgs = db.getUnreadFor(agent)
-    const preview = msgs.length > 0 ? msgs[0].body.slice(0, 400) : ''
-    result.push({ agent, count: msgs.length, preview })
-  }
-  return result
-})
-
-ipcMain.handle('get-inbox-content', async (_evt, agent: string) => {
-  // Render unread messages back into the legacy markdown shape so existing
-  // renderer components keep working without changes.
-  const msgs = db.getUnreadFor(agent)
-  return msgs.map(messageToMarkdown).join('\n')
-})
-
 ipcMain.handle('get-logs', async () => {
   const result: { agent: string; lines: string[] }[] = []
   for (const agent of await getRoles()) {
@@ -203,20 +186,6 @@ ipcMain.handle('get-logs', async () => {
 })
 
 ipcMain.handle('get-root', () => ROOT)
-
-// Render a DB message row back into the legacy markdown block shape, so that
-// renderer components built around the old inbox format keep working unchanged.
-function messageToMarkdown(m: db.MessageRow): string {
-  const lines = [
-    '',
-    `## [${m.ts}] FROM: ${m.from_role} | TO: ${m.to_role} | TASK: ${m.task_id || 'T-000'}`,
-  ]
-  if (m.subject) lines.push(`**Subject:** ${m.subject}`)
-  if (m.priority) lines.push(`**Priority:** ${m.priority}`)
-  if (m.deps) lines.push(`**Deps:** ${m.deps}`)
-  lines.push('', m.body, '', '---', '')
-  return lines.join('\n')
-}
 
 // ── Write handlers ──────────────────────────────────────────
 
@@ -1695,16 +1664,6 @@ ipcMain.handle('update-task', async (_evt, id: string, changes: { deps?: string[
     updated_at: nowStamp(),
   })
   return { ok: true }
-})
-
-// ── All logs (no line limit) ────────────────────────────────────
-
-ipcMain.handle('get-all-logs', async () => {
-  const result: { agent: string; lines: string[] }[] = []
-  for (const agent of await getRoles()) {
-    result.push({ agent, lines: db.allLogs(agent) })
-  }
-  return result
 })
 
 // ── PTY restart ─────────────────────────────────────────────────
