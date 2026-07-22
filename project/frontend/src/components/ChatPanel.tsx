@@ -1235,10 +1235,16 @@ function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onC
                       sessions.map((s) => (
                         <div
                           key={s.id}
-                          className={`group flex items-center gap-1.5 px-2.5 py-1.5 hover:bg-zinc-800/60 cursor-pointer ${
+                          role="button"
+                          tabIndex={renamingSession === s.id ? -1 : 0}
+                          className={`group flex items-center gap-1.5 px-2.5 py-1.5 hover:bg-zinc-800/60 cursor-pointer outline-none focus-visible:bg-zinc-800/60 focus-visible:ring-1 focus-visible:ring-blue-500/50 ${
                             s.id === sessionId ? 'bg-zinc-800/40' : ''
                           }`}
                           onClick={() => { if (renamingSession !== s.id) loadSession(s.id) }}
+                          onKeyDown={(e) => {
+                            if (renamingSession === s.id) return
+                            if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); loadSession(s.id) }
+                          }}
                         >
                           {renamingSession === s.id ? (
                             <input
@@ -1261,7 +1267,7 @@ function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onC
                           <button
                             onClick={(e) => { e.stopPropagation(); setRenamingSession(s.id); setRenameValue(s.title) }}
                             title="Rename session"
-                            className="opacity-0 group-hover:opacity-100 text-zinc-600 hover:text-zinc-200 flex-shrink-0"
+                            className="opacity-0 group-hover:opacity-100 focus-visible:opacity-100 group-focus-within:opacity-100 text-zinc-600 hover:text-zinc-200 flex-shrink-0"
                           >
                             <Pencil size={11} />
                           </button>
@@ -1277,7 +1283,7 @@ function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onC
                             <button
                               onClick={(e) => { e.stopPropagation(); setConfirmDeleteSession(s.id) }}
                               title="Delete session"
-                              className="opacity-0 group-hover:opacity-100 text-zinc-600 hover:text-rose-400 flex-shrink-0"
+                              className="opacity-0 group-hover:opacity-100 focus-visible:opacity-100 group-focus-within:opacity-100 text-zinc-600 hover:text-rose-400 flex-shrink-0"
                             >
                               <Trash size={11} />
                             </button>
@@ -1793,7 +1799,7 @@ function CopyButton({ getText }: { getText: () => string }) {
           .catch(() => {})
       }}
       title="Copy message"
-      className="absolute top-1 right-1 p-1 rounded bg-zinc-800/90 border border-zinc-700 text-zinc-400 hover:text-zinc-100 opacity-0 group-hover:opacity-100 transition-opacity"
+      className="absolute top-1 right-1 p-1 rounded bg-zinc-800/90 border border-zinc-700 text-zinc-400 hover:text-zinc-100 opacity-0 group-hover:opacity-100 focus-visible:opacity-100 group-focus-within:opacity-100 transition-opacity"
     >
       {copied ? <Check size={11} className="text-emerald-400" /> : <Copy size={11} />}
     </button>
@@ -1815,7 +1821,7 @@ function PreBlock(props: React.HTMLAttributes<HTMLPreElement>) {
             .catch(() => {})
         }}
         title="Copy code"
-        className="absolute top-1.5 right-1.5 p-1 rounded bg-zinc-800/90 border border-zinc-700 text-zinc-400 hover:text-zinc-100 opacity-0 group-hover/code:opacity-100 transition-opacity"
+        className="absolute top-1.5 right-1.5 p-1 rounded bg-zinc-800/90 border border-zinc-700 text-zinc-400 hover:text-zinc-100 opacity-0 group-hover/code:opacity-100 focus-visible:opacity-100 transition-opacity"
       >
         {copied ? <Check size={11} className="text-emerald-400" /> : <Copy size={11} />}
       </button>

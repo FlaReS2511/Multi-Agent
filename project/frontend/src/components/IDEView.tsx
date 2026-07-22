@@ -2007,7 +2007,7 @@ export function IDEView({ onOpenSettings }: { onOpenSettings?: () => void }) {
                       {shells.length > 1 && (
                         <button
                           onClick={(e) => { e.stopPropagation(); closeShell(s.id) }}
-                          className="opacity-0 group-hover/shell:opacity-100 text-zinc-600 hover:text-rose-400"
+                          className="opacity-0 group-hover/shell:opacity-100 focus-visible:opacity-100 text-zinc-600 hover:text-rose-400"
                         >
                           <X size={9} />
                         </button>
@@ -2164,7 +2164,12 @@ export function IDEView({ onOpenSettings }: { onOpenSettings?: () => void }) {
         commands={paletteCommands}
         files={flatFiles}
         onClose={() => setPaletteOpen(false)}
-        onOpenFile={openFile}
+        onOpenFile={async (f) => {
+          await openFile(f)
+          // Palette closes → focus would otherwise fall to <body>. Put it back
+          // in the editor so the user can type/navigate immediately.
+          requestAnimationFrame(() => { try { editorRef.current?.focus() } catch { /* ignore */ } })
+        }}
       />
 
       <ConfirmDialog dialog={dialog} />
