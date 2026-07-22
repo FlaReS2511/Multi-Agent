@@ -6,7 +6,24 @@
 
 ---
 
-## 🎯 IDEA đang làm: Peek Definition ("soi hàm được gọi")
+## ✅ ĐÃ LÀM: Peek Definition ("soi hàm được gọi") — hướng B
+
+**Trạng thái: implemented (branch `feat/12-ux2`, chưa commit).** Build + typecheck sạch; resolve verified (cold ~233ms, warm ~0ms, cross-file chính xác).
+
+Đã dựng:
+- `electron/ts-definitions.ts` — TS LanguageService trong main process (compiler API thật, không grep). Lazy init per-tsconfig scope, đọc file từ disk qua `ts.sys`, honors baseUrl/paths (alias). Nhận `liveContent` từ renderer để offset khớp buffer chưa lưu. Chỉ trả def **trong workspace** (own code + node_modules); lib.d.ts bị loại (sandbox chặn đọc ngoài root). `typescript` → `dependencies` + external trong bundler (main ESM `import ts from 'typescript'`).
+- IPC `resolve-definition(rel, offset, contents?)` (main.ts) + preload + `api.ts`. Reset service khi đổi workspace root.
+- `src/lib/monacoDefinition.ts` — `registerDefinitionProvider` (typescript+javascript) gọi IPC; tắt built-in TS definitions (khỏi trùng) + tắt **semantic** squiggles sai (giữ syntax). Tạo model tạm từ disk cho file chưa mở. `registerEditorOpener` bridge "Open full"/F12-cross-file → mở tab thật qua `openFileAtLine` (standalone Monaco vốn no-op).
+- Wiring: `monacoSetup.ts` gọi `registerDefinitionSupport(monaco)`; IDEView `setDefinitionOpener(openFileAtLine)`.
+- Animation "lặn từ dưới lên": `.peekview-widget` → `@keyframes peek-surface` (translateY 16px→0 + fade, 260ms), tôn trọng `prefers-reduced-motion`.
+
+Tầng tương tác (mặc định Monaco, khớp yêu cầu): **Alt+F12 / chuột phải → Peek** (nổi, scroll, edit-in-place), **F12 → Go to** (mở tab), hover giữ built-in.
+
+Còn lại (chưa làm — pha 2): edit-in-peek chưa nối vào đường save app (sửa trong peek chưa lưu ra buffer/disk); hover provider preview riêng; dispose model peek-tạm; đổi keybind nếu muốn peek là default thay vì go-to.
+
+<details><summary>Spec gốc (giữ để tham chiếu)</summary>
+
+### IDEA gốc: Peek Definition ("soi hàm được gọi")
 
 **Ý tưởng (từ user):** đọc code hay cần soi định nghĩa của hàm đang được gọi mà không mất chỗ đang đứng. Chuột phải (hoặc hover) lên lời gọi hàm → hiện **cửa sổ nổi ngay tại con trỏ** show định nghĩa hàm đó; cuộn được như editor thật; sửa trực tiếp; có nút mở full để nhảy tới file. Cửa sổ dính vào chỗ vừa bấm, **không được lẹm vào góc/viewport**.
 
@@ -37,6 +54,8 @@
 - Edge-clipping: peek native tự lo; nếu tự bọc overlay để làm animation "lặn từ dưới" thì phải tự canh không tràn (giống bài học card review trước đây).
 - TS service trên project lớn có thể chậm lần đầu → lazy init + spinner + cân nhắc utilityProcess.
 - `automaticLayout: true` đã bật cho editor chính; peek editor con của Monaco tự layout.
+
+</details>
 
 ---
 

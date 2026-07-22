@@ -1,6 +1,7 @@
 import React, { useEffect, useState, useCallback, useRef, useMemo, lazy, Suspense } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
 import '../lib/monacoSetup' // local Monaco + workers (no CDN) — before <Editor>
+import { setDefinitionOpener } from '../lib/monacoDefinition'
 import Editor, { DiffEditor } from '@monaco-editor/react'
 import {
   FolderTree,
@@ -783,6 +784,12 @@ export function IDEView({ onOpenSettings }: { onOpenSettings?: () => void }) {
       editor.focus()
     }, 120)
   }, [openFile])
+
+  // Let Peek Definition "Open full" / cross-file F12 open a real editor tab.
+  useEffect(() => {
+    setDefinitionOpener((rel, line, column) => { void openFileAtLine(rel, line, column) })
+    return () => setDefinitionOpener(null)
+  }, [openFileAtLine])
 
   // Called when the IDE agent writes/edits a file. Re-read it from disk if it's
   // open so the editor reflects the agent's change, and refresh tree + git.

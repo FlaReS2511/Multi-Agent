@@ -401,6 +401,23 @@ declare global {
       onAgentKilled(cb: (info: { agent: string; reason: string }) => void): () => void
       workspaceListFiles(): Promise<any[]>
       workspaceReadFile(relPath: string): Promise<{ ok: boolean; content: string }>
+      resolveDefinition(
+        relPath: string,
+        offset: number,
+        contents?: string,
+      ): Promise<{
+        ok: boolean
+        error?: string
+        defs: {
+          file: string
+          line: number
+          column: number
+          endLine: number
+          endColumn: number
+          name?: string
+          kind?: string
+        }[]
+      }>
       workspaceWriteFile(relPath: string, content: string): Promise<{ ok: boolean; error?: string }>
       workspaceGitStatus(): Promise<{ file: string; type: string; staged?: boolean }[]>
       workspaceGitShowHead(relPath: string): Promise<{ ok: boolean; content: string }>

@@ -11,6 +11,7 @@ import { GroupCoordinator, DEFAULT_ORCHESTRATION, OrchestrationConfig } from './
 import { normalizeDiscordConfig, type DiscordConfig } from './group-params'
 import { runIdeAgent, IdeAgentParams, IdeAgentEvent, PendingChange, ReviewDecision, EditorRequest, EditorResponse } from './ide-agent'
 import { PendingAction, killAllBackgroundJobs } from './extra-tools'
+import { resolveDefinition, resetDefinitionServices } from './ts-definitions'
 import {
   initBrowserTools, browserSetBounds, browserSetVisible, browserUserNavigate, closeBrowserView,
 } from './browser-tools'
@@ -1490,6 +1491,9 @@ function setWorkspaceRoot(dir: string): void {
   workspaceUnset = false
   db.setMeta('workspace_root', dir)
   pushRecentWorkspace(dir)
+  // The TS language service caches file lists / configs per root — drop it so
+  // Peek Definition resolves against the new workspace.
+  resetDefinitionServices()
 }
 
 // Resolve a workspace-relative path to an absolute path, guarding against
@@ -1568,6 +1572,24 @@ ipcMain.handle('workspace-read-file', async (_evt, relPath: string) => {
     return { ok: false, content: err.message }
   }
 })
+
+// Peek / Go-to Definition: resolve the symbol at a character offset via the
+// TypeScript compiler API. `contents` is the renderer's live buffer for the
+// queried file so offsets match unsaved edits. Runs off the main thread's hot
+// path lazily (service built on first query per tsconfig scope).
+ipcMain.handle(
+  'resolve-definition',
+  async (_evt, relPath: string, offset: number, contents?: string) => {
+    const absPath = resolveInWorkspace(relPath)
+    if (!absPath) return { ok: false, defs: [] }
+    try {
+      const defs = resolveDefinition(absPath, offset, workspaceRoot, contents)
+      return { ok: true, defs }
+    } catch (err: any) {
+      return { ok: false, defs: [], error: err?.message }
+    }
+  },
+)
 
 ipcMain.handle('workspace-write-file', async (_evt, relPath: string, content: string) => {
   bustGitCache()

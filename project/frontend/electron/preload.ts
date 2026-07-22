@@ -107,6 +107,8 @@ const api = {
   },
   workspaceListFiles: () => ipcRenderer.invoke('workspace-list-files'),
   workspaceReadFile: (relPath: string) => ipcRenderer.invoke('workspace-read-file', relPath),
+  resolveDefinition: (relPath: string, offset: number, contents?: string) =>
+    ipcRenderer.invoke('resolve-definition', relPath, offset, contents),
   workspaceWriteFile: (relPath: string, content: string) => ipcRenderer.invoke('workspace-write-file', relPath, content),
   workspaceGitStatus: () => ipcRenderer.invoke('workspace-git-status'),
   workspaceGitShowHead: (relPath: string) => ipcRenderer.invoke('workspace-git-show-head', relPath),
