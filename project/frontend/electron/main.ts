@@ -620,21 +620,84 @@ ipcMain.handle('set-provider', async (_evt, input: {
   name?: string
   base_url?: string
   models?: string[]
+  price_in?: number
+  price_out?: number
 }) => {
-  const { id, kind, name, base_url, models } = input
+  const { id, kind, name, base_url, models, price_in, price_out } = input
   if (!id) return { ok: false, error: 'provider id required' }
   const config = await readConfig()
   config.providers = config.providers ?? {}
-  const existing = config.providers[id] ?? { kind }
+  const existing = (config.providers[id] ?? { kind }) as unknown as Record<string, unknown>
   config.providers[id] = {
     ...existing,
     kind,
     name: name ?? existing.name,
     base_url: base_url ?? existing.base_url,
     models: models ?? existing.models ?? [],
-  }
+    // Pricing ($ per 1M tokens) — lets the cost dashboard show real numbers for
+    // custom gateways. undefined leaves the existing value untouched.
+    ...(price_in != null ? { price_in } : {}),
+    ...(price_out != null ? { price_out } : {}),
+  } as (typeof config.providers)[string]
   await writeConfig(config)
   return { ok: true }
+})
+
+// Resolve a provider's base URL + auth headers for a raw REST call (test /
+// list-models). Key comes from the passed override or the decrypted store.
+async function providerRest(id: string, apiKeyOverride?: string): Promise<
+  { ok: true; url: string; headers: Record<string, string>; kind: string } | { ok: false; error: string }
+> {
+  const config = await readConfig()
+  const pc = (config.providers ?? {})[id] as { kind?: string; base_url?: string } | undefined
+  if (!pc) return { ok: false, error: `unknown provider: ${id}` }
+  const kind = pc.kind || 'openai-compatible'
+  let key = apiKeyOverride || ''
+  if (!key) { const enc = db.getSecret(id); key = enc ? decryptKey(enc) : '' }
+  if (kind === 'anthropic') {
+    const base = (pc.base_url || 'https://api.anthropic.com').replace(/\/$/, '')
+    return { ok: true, kind, url: `${base}/v1/models`, headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01' } }
+  }
+  // openai / openai-compatible / google-openai gateways all expose /models.
+  const base = (pc.base_url || 'https://api.openai.com/v1').replace(/\/$/, '')
+  return { ok: true, kind, url: `${base}/models`, headers: { Authorization: `Bearer ${key || 'no-key'}` } }
+}
+
+// Test a provider's connection: GET its /models. Cheap, no tokens billed.
+ipcMain.handle('provider-test', async (_evt, id: string, apiKey?: string) => {
+  const r = await providerRest(id, apiKey)
+  if (!r.ok) return r
+  try {
+    const resp = await fetch(r.url, { headers: r.headers })
+    if (!resp.ok) {
+      const body = await resp.text().catch(() => '')
+      return { ok: false, error: `HTTP ${resp.status}${body ? ': ' + body.slice(0, 180) : ''}` }
+    }
+    const json: any = await resp.json().catch(() => ({}))
+    const count = Array.isArray(json.data) ? json.data.length : Array.isArray(json.models) ? json.models.length : undefined
+    return { ok: true, modelCount: count }
+  } catch (e: any) {
+    return { ok: false, error: e?.message || String(e) }
+  }
+})
+
+// Fetch the model id list the provider advertises, to populate the models field.
+ipcMain.handle('provider-fetch-models', async (_evt, id: string, apiKey?: string) => {
+  const r = await providerRest(id, apiKey)
+  if (!r.ok) return r
+  try {
+    const resp = await fetch(r.url, { headers: r.headers })
+    if (!resp.ok) {
+      const body = await resp.text().catch(() => '')
+      return { ok: false, error: `HTTP ${resp.status}${body ? ': ' + body.slice(0, 180) : ''}` }
+    }
+    const json: any = await resp.json().catch(() => ({}))
+    const rows: any[] = Array.isArray(json.data) ? json.data : Array.isArray(json.models) ? json.models : []
+    const models = rows.map((m) => (typeof m === 'string' ? m : m.id || m.name)).filter(Boolean)
+    return { ok: true, models }
+  } catch (e: any) {
+    return { ok: false, error: e?.message || String(e) }
+  }
 })
 
 ipcMain.handle('delete-provider', async (_evt, id: string) => {
@@ -1397,9 +1460,13 @@ ipcMain.handle('read-artifact-file', async (_evt, taskId: string, filename: stri
 // The workspace root is dynamic: defaults to the project ROOT, but the user can
 // open any folder. Persisted in the DB (meta.workspace_root) + a recent list.
 let workspaceRoot: string = ROOT
+// True until the user has ever picked a folder — on first launch we fall back
+// to the app's own dir, but the renderer shows an "Open a folder" welcome
+// instead of exposing the install directory's files as the workspace.
+let workspaceUnset = true
 try {
   const saved = db.getMeta('workspace_root')
-  if (saved && fsSync.existsSync(saved)) workspaceRoot = saved
+  if (saved && fsSync.existsSync(saved)) { workspaceRoot = saved; workspaceUnset = false }
 } catch { /* use ROOT */ }
 
 function getRecentWorkspaces(): string[] {
@@ -1420,6 +1487,7 @@ function pushRecentWorkspace(dir: string): void {
 
 function setWorkspaceRoot(dir: string): void {
   workspaceRoot = dir
+  workspaceUnset = false
   db.setMeta('workspace_root', dir)
   pushRecentWorkspace(dir)
 }
@@ -1460,6 +1528,7 @@ ipcMain.handle('workspace-get-root', () => ({
   root: workspaceRoot,
   name: path.basename(workspaceRoot),
   recent: getRecentWorkspaces(),
+  unset: workspaceUnset,
 }))
 
 ipcMain.handle('workspace-open-dialog', async () => {

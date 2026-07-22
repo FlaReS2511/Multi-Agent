@@ -275,6 +275,8 @@ interface Props {
   // Fired when the agent needs the user (approval/review) while they aren't
   // looking, so the host can raise the chat badge.
   onAttentionNeeded?: () => void
+  // Open Backend Settings (shown in the no-provider setup card).
+  onOpenSettings?: () => void
 }
 
 // Wind-up choreography: the frame slides open first (handled by the parent),
@@ -294,7 +296,8 @@ const itemVariants = {
 // changes (typing, git polls, caret moves) no longer re-render the chat tree.
 export const ChatPanel = memo(ChatPanelImpl)
 
-function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onChangeResolved, onEditorRequest, windup = true, visible = true, onRunStateChange, onContextUsage, onRunFinished, files = [], workspaceRoot = '', onSubAgentStarted, onAttentionNeeded }: Props) {
+function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onChangeResolved, onEditorRequest, windup = true, visible = true, onRunStateChange, onContextUsage, onRunFinished, files = [], workspaceRoot = '', onSubAgentStarted, onAttentionNeeded, onOpenSettings }: Props) {
+  const noProvider = models.length === 0
   const { chatFontSize } = useUiSettings()
   const [mode, setMode] = useState<'ask' | 'agent'>('ask')
   // Plan mode is a toggle WITHIN agent mode (via /plan): runs read-only and
@@ -1315,7 +1318,24 @@ function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onC
         onScroll={handleTranscriptScroll}
         className="flex-1 min-h-0 overflow-y-auto px-3 py-3 space-y-4"
       >
-        {mode === 'ask' ? (
+        {noProvider ? (
+          // No provider configured yet → point the user at Settings instead of
+          // an empty model dropdown and a cryptic '⚠ unknown provider' on send.
+          <div className="mt-8 mx-auto max-w-xs rounded-lg border border-blue-500/30 bg-blue-500/5 p-4 text-center">
+            <Sparkles size={18} className="text-blue-400 mx-auto mb-2" />
+            <div className="text-sm font-semibold text-zinc-200">No AI provider connected</div>
+            <div className="text-[11px] text-zinc-500 mt-1 leading-relaxed">
+              Add a provider and API key to start chatting and running the agent.
+              Works with Anthropic, OpenAI, or any OpenAI-compatible gateway.
+            </div>
+            <button
+              onClick={() => onOpenSettings?.()}
+              className="mt-3 px-3 py-1.5 text-xs font-medium rounded bg-blue-600 hover:bg-blue-500 text-white"
+            >
+              Connect a provider
+            </button>
+          </div>
+        ) : mode === 'ask' ? (
           <>
             {messages.length === 0 && (
               <div className="text-center text-zinc-600 text-xs mt-8 leading-relaxed px-4">

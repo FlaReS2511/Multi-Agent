@@ -106,7 +106,7 @@ const SIDEBAR_ITEM = {
   show: { opacity: 1, y: 0, transition: { duration: 0.26, ease: 'easeOut' } },
 }
 
-export function IDEView() {
+export function IDEView({ onOpenSettings }: { onOpenSettings?: () => void }) {
   // Sidebar State
   const [activeSidebar, setActiveSidebar] = useState<'explorer' | 'search' | 'git' | 'agents' | 'groups'>('explorer')
   const [isSidebarOpen, setIsSidebarOpen] = useState(true)
@@ -151,6 +151,9 @@ export function IDEView() {
   const [workspaceName, setWorkspaceName] = useState<string>('')
   const [workspaceRootPath, setWorkspaceRootPath] = useState<string>('')
   const [recentWorkspaces, setRecentWorkspaces] = useState<string[]>([])
+  // First launch: no folder chosen yet. Show a welcome instead of exposing the
+  // app's own install directory as the workspace.
+  const [workspaceUnset, setWorkspaceUnset] = useState(false)
   const [showWorkspaceMenu, setShowWorkspaceMenu] = useState(false)
 
   // Files & Git State
@@ -418,7 +421,8 @@ export function IDEView() {
     setWorkspaceName(info.name)
     setWorkspaceRootPath(info.root)
     setRecentWorkspaces(info.recent ?? [])
-    return info.root
+    setWorkspaceUnset(Boolean(info.unset))
+    return info.unset ? '' : info.root
   }, [])
 
   // ── Session restore (per-workspace) ─────────────────────────
@@ -541,9 +545,11 @@ export function IDEView() {
       if (root && !sessionReadyRef.current) {
         await restoreSession(root)
         sessionReadyRef.current = true
+        refreshWorkspace()
       }
+      // root === '' → first launch, no folder chosen: skip scanning the app
+      // dir; the explorer shows the welcome state instead.
     })
-    refreshWorkspace()
   }, [refreshWorkspace, loadWorkspaceInfo, restoreSession])
 
   // Persist the session (debounced) whenever layout/tabs change.
@@ -1518,19 +1524,50 @@ export function IDEView() {
           >
             <Suspense fallback={null}>
             {activeSidebar === 'explorer' && (
-              <IDEFileTree
-                files={files}
-                selectedFile={activeTab}
-                onSelectFile={openFile}
-                gitChanges={gitChanges}
-                onRenameCommit={handleRenameCommit}
-                onDelete={deletePrompt}
-                onCreateCommit={handleCreateCommit}
-                onMove={handleMove}
-                createRequest={createReq}
-                revealNonce={revealNonce}
-                collapseNonce={collapseNonce}
-              />
+              workspaceUnset ? (
+                <div className="p-3 text-center">
+                  <FolderOpen size={22} className="text-zinc-600 mx-auto mb-2" />
+                  <div className="text-xs text-zinc-300 font-medium">No folder open</div>
+                  <div className="text-[10px] text-zinc-600 mt-1 mb-3 leading-relaxed">
+                    Open a folder to browse and edit your project.
+                  </div>
+                  <button
+                    onClick={() => switchWorkspace()}
+                    className="px-3 py-1.5 text-xs font-medium rounded bg-blue-600 hover:bg-blue-500 text-white"
+                  >
+                    Open Folder…
+                  </button>
+                  {recentWorkspaces.length > 0 && (
+                    <div className="mt-4 text-left">
+                      <div className="text-[9px] uppercase tracking-wider text-zinc-600 px-1 mb-1">Recent</div>
+                      {recentWorkspaces.map((d) => (
+                        <button
+                          key={d}
+                          onClick={() => switchWorkspace(d)}
+                          className="w-full text-left px-2 py-1 text-[11px] text-zinc-400 hover:bg-zinc-800/60 hover:text-zinc-200 rounded truncate"
+                          title={d}
+                        >
+                          {d.split(/[\\/]/).pop()}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <IDEFileTree
+                  files={files}
+                  selectedFile={activeTab}
+                  onSelectFile={openFile}
+                  gitChanges={gitChanges}
+                  onRenameCommit={handleRenameCommit}
+                  onDelete={deletePrompt}
+                  onCreateCommit={handleCreateCommit}
+                  onMove={handleMove}
+                  createRequest={createReq}
+                  revealNonce={revealNonce}
+                  collapseNonce={collapseNonce}
+                />
+              )
             )}
 
             {activeSidebar === 'search' && (
@@ -2102,6 +2139,7 @@ export function IDEView() {
             onSubAgentStarted={onSubAgentStarted}
             onAttentionNeeded={onChatAttentionNeeded}
             onRunFinished={onChatRunFinished}
+            onOpenSettings={onOpenSettings}
           />
         </div>
       </motion.aside>

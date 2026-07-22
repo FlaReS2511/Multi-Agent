@@ -110,6 +110,8 @@ export interface SetProviderInput {
   name?: string
   base_url?: string
   models?: string[]
+  price_in?: number
+  price_out?: number
 }
 
 export interface SetProviderKeyInput {
@@ -361,6 +363,8 @@ declare global {
       getBackendSettings(): Promise<BackendSettings>
       setAgentBackend(input: SetAgentBackendInput): Promise<{ ok: boolean }>
       setProvider(input: SetProviderInput): Promise<{ ok: boolean; error?: string }>
+      providerTest(id: string, apiKey?: string): Promise<{ ok: boolean; error?: string; modelCount?: number }>
+      providerFetchModels(id: string, apiKey?: string): Promise<{ ok: boolean; error?: string; models?: string[] }>
       deleteProvider(id: string): Promise<{ ok: boolean }>
       setProviderKey(input: SetProviderKeyInput): Promise<{ ok: boolean; error?: string }>
       clearProviderKey(provider: SecretProvider): Promise<{ ok: boolean }>
@@ -400,7 +404,7 @@ declare global {
       workspaceWriteFile(relPath: string, content: string): Promise<{ ok: boolean; error?: string }>
       workspaceGitStatus(): Promise<{ file: string; type: string; staged?: boolean }[]>
       workspaceGitShowHead(relPath: string): Promise<{ ok: boolean; content: string }>
-      workspaceGetRoot(): Promise<{ root: string; name: string; recent: string[] }>
+      workspaceGetRoot(): Promise<{ root: string; name: string; recent: string[]; unset?: boolean }>
       workspaceOpenDialog(): Promise<{ ok: boolean; root?: string; name?: string }>
       workspaceSetRoot(dir: string): Promise<{ ok: boolean; root?: string; name?: string; error?: string }>
       workspaceCreateFile(relPath: string): Promise<{ ok: boolean; error?: string }>
