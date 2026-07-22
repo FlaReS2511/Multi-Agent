@@ -1197,6 +1197,36 @@ export function IDEView() {
       } else if (mod && e.shiftKey && (e.key === 'F' || e.key === 'f')) {
         e.preventDefault()
         setActiveSidebar('search'); setIsSidebarOpen(true)
+      } else if (mod && !e.altKey && (e.key === 'b' || e.key === 'B')) {
+        // Cmd+B — toggle the sidebar
+        e.preventDefault()
+        setIsSidebarOpen((v) => !v)
+      } else if (mod && !e.altKey && (e.key === 'j' || e.key === 'J')) {
+        // Cmd+J — toggle the bottom dock
+        e.preventDefault()
+        setIsBottomOpen((v) => !v)
+      } else if (mod && !e.altKey && (e.key === 'l' || e.key === 'L')) {
+        // Cmd+L — toggle the AI chat (and focus its composer on open)
+        e.preventDefault()
+        setChatOpen((v) => !v); setChatUnread(false)
+      } else if (e.ctrlKey && e.key === 'Tab') {
+        // Ctrl+Tab / Ctrl+Shift+Tab — cycle editor tabs
+        e.preventDefault()
+        if (openTabs.length > 1 && activeTab) {
+          const i = openTabs.indexOf(activeTab)
+          const n = openTabs.length
+          const next = openTabs[(i + (e.shiftKey ? -1 : 1) + n) % n]
+          if (next === BROWSER_TAB) setActiveTab(next); else openFile(next)
+        }
+      } else if (mod && e.shiftKey && (e.key === ']' || e.key === '[')) {
+        // Cmd+Shift+] / [ — next / previous tab (VS Code)
+        e.preventDefault()
+        if (openTabs.length > 1 && activeTab) {
+          const i = openTabs.indexOf(activeTab)
+          const n = openTabs.length
+          const next = openTabs[(i + (e.key === ']' ? 1 : -1) + n) % n]
+          if (next === BROWSER_TAB) setActiveTab(next); else openFile(next)
+        }
       } else if (mod && (e.key === '=' || e.key === '+')) {
         // Cmd+= — zoom in
         e.preventDefault()
@@ -1211,7 +1241,7 @@ export function IDEView() {
     }
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [activeTab, dirtyFiles, openTabs, ui.zoom])
+  }, [activeTab, dirtyFiles, openTabs, ui.zoom, openFile])
 
   // Commands for the palette. Intentionally NOT memoized: the actions close
   // over live editor state (activeTab, dirtyFiles, …) and a memo made "File:
@@ -1227,6 +1257,9 @@ export function IDEView() {
     { id: 'search', label: 'Search: Find in Files', hint: 'Ctrl+Shift+F', run: () => { setActiveSidebar('search'); setIsSidebarOpen(true) } },
     { id: 'git', label: 'View: Source Control', run: () => { setActiveSidebar('git'); setIsSidebarOpen(true) } },
     { id: 'explorer', label: 'View: Explorer', run: () => { setActiveSidebar('explorer'); setIsSidebarOpen(true) } },
+    { id: 'togglechat', label: 'View: Toggle AI Chat', hint: 'Ctrl+L', run: () => { setChatOpen((v) => !v); setChatUnread(false) } },
+    { id: 'togglesidebar', label: 'View: Toggle Sidebar', hint: 'Ctrl+B', run: () => setIsSidebarOpen((v) => !v) },
+    { id: 'toggledock', label: 'View: Toggle Bottom Dock', hint: 'Ctrl+J', run: () => setIsBottomOpen((v) => !v) },
     { id: 'refresh', label: 'Workspace: Refresh', run: () => refreshWorkspace() },
     { id: 'quickopen', label: 'Go to File…', hint: 'Ctrl+P', run: () => { setPaletteMode('files'); setPaletteOpen(true) } },
   ]

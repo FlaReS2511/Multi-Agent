@@ -354,6 +354,16 @@ function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onC
   const [model, setModel] = useState('')
   const reqIdRef = useRef<string | null>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
+  const composerRef = useRef<HTMLTextAreaElement>(null)
+  // Focus the composer whenever the panel becomes visible (Cmd+L / clicking
+  // the chat button opens it) so the user can type immediately.
+  const wasVisibleRef = useRef(visible)
+  useEffect(() => {
+    if (visible && !wasVisibleRef.current) {
+      requestAnimationFrame(() => composerRef.current?.focus())
+    }
+    wasVisibleRef.current = visible
+  }, [visible])
   // Typewriter: target[id] = full text received; displayed length is advanced
   // toward it by a steady rAF loop so streamed tokens reveal smoothly.
   const targetRef = useRef<Map<string, string>>(new Map())
@@ -1595,6 +1605,7 @@ function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onC
             </div>
           )}
           <textarea
+            ref={composerRef}
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onDragOver={(e) => { if (e.dataTransfer.types.includes('text/orqon-path')) e.preventDefault() }}
