@@ -15,7 +15,7 @@ import {
   TerminalSquare, ListPlus, Boxes, Undo2, AlertTriangle,
   GitBranch, GitCommitHorizontal, GitPullRequestArrow, UserCog, Globe, ListChecks, FolderTree, Trash, FileInput,
   History, Plus, Archive, Telescope, Copy, Check, ArrowDown, Pencil, AtSign,
-  ChevronRight, Loader2,
+  ChevronRight, Loader2, X,
 } from 'lucide-react'
 import { ModelOption, IdeAgentEvent, PendingChange, PendingAction, AgentTodo, AgentSessionMeta } from '../lib/api'
 import { useUiSettings } from '../lib/uiSettings'
@@ -288,6 +288,10 @@ const containerVariants = {
   },
 }
 const itemVariants = {
+  // A paragraph the user clicked in the live DocxViewer — attached to the next
+  // agent message so it edits exactly that paragraph. Cleared after send.
+  docxTarget?: { path: string; index: number; text: string } | null
+  onDocxTargetUsed?: () => void
   hidden: { opacity: 0, y: 8 },
   show: { opacity: 1, y: 0, transition: { duration: 0.28, ease: 'easeOut' } },
 }
@@ -296,7 +300,7 @@ const itemVariants = {
 // changes (typing, git polls, caret moves) no longer re-render the chat tree.
 export const ChatPanel = memo(ChatPanelImpl)
 
-function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onChangeResolved, onEditorRequest, windup = true, visible = true, onRunStateChange, onContextUsage, onRunFinished, files = [], workspaceRoot = '', onSubAgentStarted, onAttentionNeeded, onOpenSettings }: Props) {
+function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onChangeResolved, onEditorRequest, windup = true, visible = true, onRunStateChange, onContextUsage, onRunFinished, files = [], workspaceRoot = '', onSubAgentStarted, onAttentionNeeded, onOpenSettings, docxTarget, onDocxTargetUsed }: Props) {
   const noProvider = models.length === 0
   const { chatFontSize } = useUiSettings()
   const [mode, setMode] = useState<'ask' | 'agent'>('ask')
@@ -800,7 +804,7 @@ function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onC
     const ctx = useFileContext ? getContext() : null
     // Preserve tool activity from earlier turns so the agent remembers what it
     // already read/searched instead of re-scanning the folder every turn.
-    const history: Msg[] = [...buildHistory(agentItems), { role: 'user', content: text }]
+    const history: Msg[] = [...buildHistory(agentItems), { role: 'user', content: text + docxNote }]
 
     setAgentItems((prev) => [...prev, { kind: 'text', role: 'user', content: text }])
     setInput('')
@@ -812,11 +816,18 @@ function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onC
     shownRef.current.clear()
     runFilesRef.current = new Set()
     setLastRunFiles([])
+    // Click-to-target: if the user clicked a paragraph in the live DocxViewer,
+    // tell the model to apply the request to THAT paragraph. Sent to the model
+    // only — the visible user bubble stays clean.
+    const docxNote = docxTarget
+      ? `\n\n[The user is pointing at paragraph ¶${docxTarget.index} of "${docxTarget.path}": ${JSON.stringify(docxTarget.text.slice(0, 200))}. Apply this request to THAT paragraph; confirm its index with DocxOutline if unsure.]`
+      : ''
     setCtxUsage(null)
     setPendingAction(null)
     setTodos([])
 
     // Editor round-trip: main asks us to drive the editor; delegate to IDEView.
+    if (docxTarget) onDocxTargetUsed?.()
     const offEditor = window.api.onAiAgentEditorReq(runId, async (req) => {
       let resp = { requestId: req.requestId, ok: false, result: 'error: editor not available' }
       if (onEditorRequest) {
@@ -1662,6 +1673,26 @@ function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onC
             placeholder={mode === 'agent'
               ? (researchMode
                   ? 'Ask a research question… (deep read-only web + code · /research to exit)'
+          {docxTarget && (
+            <div className="mb-1.5 flex items-center gap-1.5 text-[11px]">
+              <span
+                className="inline-flex items-center gap-1 max-w-full rounded-md bg-blue-600/20 border border-blue-500/40 text-blue-200 px-2 py-0.5"
+                title={docxTarget.text}
+              >
+                <span className="font-mono">¶{docxTarget.index}</span>
+                <span className="truncate max-w-[220px] text-blue-300/80">{docxTarget.text || '(empty paragraph)'}</span>
+                <button
+                  type="button"
+                  onClick={() => onDocxTargetUsed?.()}
+                  className="ml-0.5 text-blue-300/70 hover:text-white"
+                  title="Detach paragraph"
+                >
+                  <X size={11} />
+                </button>
+              </span>
+              <span className="text-zinc-600">target for next message</span>
+            </div>
+          )}
                   : planMode
                     ? 'Describe the task to plan… (read-only, then a plan to approve · /plan to exit)'
                     : 'Describe a change… (Enter to run · / for commands)')
@@ -1766,12 +1797,12 @@ const MessageBubble = memo(function MessageBubble({ role, content, streaming }: 
         <div ref={contentRef}>
           {content
             ? (isUser
-                // While streaming, render plain text — re-parsing the whole
-                // growing reply as markdown per frame was O(n²). One markdown
-                // parse happens when the stream finishes.
+                // User text isn't markdown-rendered.
                 ? <div className="whitespace-pre-wrap break-words">{content}</div>
                 : streaming
-                  ? <div className="whitespace-pre-wrap break-words">{content}</div>
+                  // Progressive: committed blocks format as they complete, the
+                  // growing tail stays raw (no O(n²) whole-reply reparse).
+                  ? <StreamingMarkdown text={content} />
                   : <MessageContent text={content} />)
             : streaming ? (
               <span className="inline-flex gap-1 items-center text-zinc-500">
@@ -1783,6 +1814,91 @@ const MessageBubble = memo(function MessageBubble({ role, content, streaming }: 
         {streaming && content && <span className="inline-block w-1.5 h-3.5 ml-0.5 align-middle bg-blue-400 animate-pulse" />}
         {!isUser && !streaming && content.trim() && <CopyButton getText={() => contentRef.current?.innerText || content} />}
       </div>
+// ── Progressive streaming markdown ──────────────────────────────────────────
+// While a reply streams we used to show raw text and markdown-parse ONCE at the
+// end — re-parsing the whole growing reply every tick was O(n²) in React
+// reconciliation (the real cost, not the parse). Instead: peel off the
+// fully-formed leading blocks and markdown-render each one MEMOIZED by its own
+// string (committed blocks never re-parse or re-reconcile), while the still-
+// growing tail renders raw. Amortized O(n): each tick touches only the tail
+// plus at most one newly-committed block.
+
+// Split `text` into leading blocks that are safe to render+memoize, and the
+// still-growing `tail` (rendered raw). A boundary is a blank-line run OUTSIDE a
+// code fence whose following block is NOT a list/blockquote/table/indented
+// continuation — committing mid-list would restart <ol> numbering or split a
+// loose list; an open ``` fence keeps everything raw until it closes.
+function splitStableBlocks(text: string): { blocks: string[]; tail: string } {
+  const lines = text.split('\n')
+  const blocks: string[] = []
+  let cur: string[] = []
+  let inFence = false
+  let fenceCh = ''
+  const isBlank = (l: string) => l.trim() === ''
+  // A table row (`|…`) is NOT treated as a continuation: a blank line always
+  // ends a GFM table, so a `|` line after a blank starts a fresh block and the
+  // preceding paragraph is safe to commit.
+  const isContinuation = (l: string) =>
+    /^\s*([-*+]|\d+[.)])\s/.test(l) || // list item
+    /^\s*>/.test(l) ||                 // blockquote
+    /^(\t| {2,})\S/.test(l)            // indented code / lazy continuation
+  let i = 0
+  while (i < lines.length) {
+    const line = lines[i]
+    const fence = line.match(/^\s*(```+|~~~+)/)
+    if (fence) {
+      if (!inFence) { inFence = true; fenceCh = fence[1][0] }
+      else if (line.trim().startsWith(fenceCh)) { inFence = false }
+      cur.push(line); i++; continue
+    }
+    if (isBlank(line) && !inFence) {
+      let j = i
+      while (j < lines.length && isBlank(lines[j])) j++
+      if (j >= lines.length) break // trailing blank(s): keep prior text as tail (a list item may still stream in)
+      if (isContinuation(lines[j])) {
+        for (let k = i; k < j; k++) cur.push(lines[k]) // keep blank inside a loose list / continuation
+        i = j
+      } else {
+        if (cur.length) { blocks.push(cur.join('\n')); cur = [] } // safe boundary → commit block
+        i = j
+      }
+      continue
+    }
+    cur.push(line); i++
+  }
+  return { blocks, tail: cur.join('\n') }
+}
+
+// One committed block, markdown-rendered and memoized by its exact string so an
+// unchanged block is skipped entirely on later reveal ticks.
+const StreamBlock = memo(function StreamBlock({ text }: { text: string }) {
+  return (
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm]}
+      components={{
+        a: ({ node: _n, ...p }) => <a {...p} target="_blank" rel="noreferrer" />,
+        pre: ({ node: _n, ...p }) => <PreBlock {...p} />,
+      }}
+    >
+      {text}
+    </ReactMarkdown>
+  )
+})
+
+// Assistant reply that is STILL streaming: committed blocks format progressively
+// (memoized), the growing tail stays raw. One `.md-body` wraps everything so
+// react-markdown's fragment output collapses margins between blocks exactly like
+// the finished single-parse render.
+const StreamingMarkdown = memo(function StreamingMarkdown({ text }: { text: string }) {
+  const { blocks, tail } = splitStableBlocks(stripToolEcho(text))
+  return (
+    <div className="md-body">
+      {blocks.map((b, i) => <StreamBlock key={i} text={b} />)}
+      {tail && <div className="whitespace-pre-wrap break-words">{tail}</div>}
+    </div>
+  )
+})
+
     </div>
   )
 })
@@ -1860,13 +1976,13 @@ const GlowMessage = memo(function GlowMessage({ role, chunks }: { role: 'user' |
   return (
     <div className={isUser ? 'flex justify-end' : 'flex justify-start'}>
       <div
-        className={`group relative select-text max-w-[92%] min-w-0 overflow-hidden break-words whitespace-pre-wrap rounded-lg px-3 py-2 text-xs leading-relaxed ${
+        className={`group relative select-text max-w-[92%] min-w-0 overflow-hidden break-words rounded-lg px-3 py-2 text-xs leading-relaxed ${
           isUser
-            ? 'bg-blue-600/20 border border-blue-500/30 text-zinc-100'
+            ? 'whitespace-pre-wrap bg-blue-600/20 border border-blue-500/30 text-zinc-100'
             : 'bg-zinc-900 border border-zinc-800 text-zinc-200'
         }`}
       >
-        {text}
+        {isUser ? text : <StreamingMarkdown text={text} />}
       </div>
     </div>
   )

@@ -3,10 +3,11 @@ import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 import electron from 'vite-plugin-electron/simple'
 
-// `typescript` powers main-process Peek/Go-to Definition (electron/ts-definitions.ts).
-// It's a large lib with dynamic requires — resolve it from node_modules at
-// runtime instead of bundling it into main.js.
-const nativeExternal = ['node-pty', 'better-sqlite3', 'exceljs', 'typescript']
+// `typescript` powers main-process Peek/Go-to Definition (electron/ts-definitions.ts);
+// `jszip` + `@xmldom/xmldom` power the main-process .docx editor (electron/docx-tools.ts).
+// These are large libs — resolve them from node_modules at runtime instead of
+// bundling them into main.js (keeps the main entry lean; they load lazily).
+const nativeExternal = ['node-pty', 'better-sqlite3', 'exceljs', 'typescript', 'jszip', '@xmldom/xmldom']
 // discord.js is a large Node library with dynamic requires (ws, zlib bindings).
 // Keep it external for the bot child-process build so Rollup doesn't try to
 // bundle it; it's resolved from node_modules at runtime like the native deps.

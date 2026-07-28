@@ -28,6 +28,8 @@ export function BackendSettingsModal({ open, onClose }: Props) {
   const [orch, setOrch] = useState<OrchestrationConfig | null>(null)
   const [reviewMode, setReviewMode] = useState(false)
   const [allowBash, setAllowBash] = useState(false)
+  const [allowSubagents, setAllowSubagents] = useState(true)
+  const [preferSubagents, setPreferSubagents] = useState(false)
   const [discord, setDiscord] = useState<DiscordConfig | null>(null)
   const [discordHasToken, setDiscordHasToken] = useState(false)
 
@@ -39,6 +41,8 @@ export function BackendSettingsModal({ open, onClose }: Props) {
     const cfg = await window.api.ideAgentConfigGet()
     setReviewMode(cfg.reviewMode)
     setAllowBash(cfg.allowBash)
+    setAllowSubagents(cfg.allowSubagents)
+    setPreferSubagents(cfg.preferSubagents)
   }, [])
 
   const toggleReview = async () => {
@@ -51,6 +55,21 @@ export function BackendSettingsModal({ open, onClose }: Props) {
     const next = !allowBash
     setAllowBash(next)
     await window.api.ideAgentConfigSet({ allowBash: next }).catch(() => {})
+  }
+
+  const toggleAllowSubagents = async () => {
+    const next = !allowSubagents
+    setAllowSubagents(next)
+    // Turning delegation off also clears the "prefer" bias so it can't linger.
+    const patch = next ? { allowSubagents: true } : { allowSubagents: false, preferSubagents: false }
+    if (!next) setPreferSubagents(false)
+    await window.api.ideAgentConfigSet(patch).catch(() => {})
+  }
+
+  const togglePreferSubagents = async () => {
+    const next = !preferSubagents
+    setPreferSubagents(next)
+    await window.api.ideAgentConfigSet({ preferSubagents: next }).catch(() => {})
   }
 
   useEffect(() => { if (open) refresh() }, [open, refresh])
@@ -301,6 +320,62 @@ export function BackendSettingsModal({ open, onClose }: Props) {
               <span
                 className={`size-4 rounded-full bg-white shadow-sm transition-transform will-change-transform ${
                   allowBash ? 'translate-x-5' : 'translate-x-0'
+                }`}
+              />
+            </button>
+          </label>
+
+          <label className="flex items-center justify-between gap-4 cursor-pointer group mt-4">
+            <div>
+              <div className="text-xs text-zinc-200 font-medium">Allow agent to spawn sub-agents</div>
+              <div className="text-[11px] text-zinc-500 mt-0.5">
+                Lets the chat agent delegate a well-scoped sub-task to a child agent (SpawnAgent) that runs
+                autonomously and reports back — several can run in parallel. On by default.
+              </div>
+            </div>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={allowSubagents}
+              onClick={toggleAllowSubagents}
+              className={`relative w-10 h-5 rounded-full flex-shrink-0 p-0.5 flex items-center transition-colors ${
+                allowSubagents ? 'bg-emerald-600' : 'bg-zinc-700'
+              }`}
+            >
+              <span
+                className={`size-4 rounded-full bg-white shadow-sm transition-transform will-change-transform ${
+                  allowSubagents ? 'translate-x-5' : 'translate-x-0'
+                }`}
+              />
+            </button>
+          </label>
+
+          {/* Only meaningful when delegation is allowed — nested + dimmed when off. */}
+          <label
+            className={`flex items-center justify-between gap-4 mt-3 ml-4 pl-3 border-l border-zinc-800 ${
+              allowSubagents ? 'cursor-pointer group' : 'opacity-40 cursor-not-allowed'
+            }`}
+          >
+            <div>
+              <div className="text-xs text-zinc-200 font-medium">Prefer sub-agents when possible</div>
+              <div className="text-[11px] text-zinc-500 mt-0.5">
+                Bias the agent toward parallelizing work into sub-agents rather than doing it all itself.
+                Off = delegate only for large/parallel tasks. It still handles trivial edits directly.
+              </div>
+            </div>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={preferSubagents}
+              disabled={!allowSubagents}
+              onClick={togglePreferSubagents}
+              className={`relative w-10 h-5 rounded-full flex-shrink-0 p-0.5 flex items-center transition-colors ${
+                preferSubagents && allowSubagents ? 'bg-emerald-600' : 'bg-zinc-700'
+              }`}
+            >
+              <span
+                className={`size-4 rounded-full bg-white shadow-sm transition-transform will-change-transform ${
+                  preferSubagents && allowSubagents ? 'translate-x-5' : 'translate-x-0'
                 }`}
               />
             </button>

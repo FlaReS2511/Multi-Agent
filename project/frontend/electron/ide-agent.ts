@@ -21,6 +21,7 @@ import {
   EXTRA_TOOL_SPECS, EXTRA_TOOL_NAMES, runExtraTool, PendingAction,
 } from './extra-tools'
 import { BROWSER_TOOL_SPECS, BROWSER_TOOL_NAMES, runBrowserTool, browserGateInfo } from './browser-tools'
+import { DOCX_TOOL_SPECS, DOCX_TOOL_NAMES, DOCX_MUTATORS, runDocxTool } from './docx-tools'
 import { buildAdapter, ProviderCfgLike } from './adapters'
 import { contextWindowFor } from './context-window'
 import * as db from './db'
@@ -226,8 +227,10 @@ const SPAWN_AGENT_SPEC: ToolSpec = {
   description:
     'Delegate a self-contained sub-task to a child agent that runs in the background with the FULL toolset ' +
     '(read/write files, run commands, browse the web). It works autonomously and returns a summary of what it ' +
-    'did when finished. Use this to parallelize or offload a chunky, well-scoped piece of work — NOT for small ' +
-    'things you can just do yourself. Give it a clear, complete task description; it does not see this conversation.',
+    'did when finished. Use this to parallelize or offload a chunky, well-scoped piece of work — e.g. exploring, ' +
+    'reading, mapping or auditing a large area of the codebase, or a multi-file migration — NOT for small things ' +
+    'you can just do yourself. To cover a whole repo, spawn several IN ONE turn, one per top-level area, and ' +
+    'synthesize their summaries. Give it a clear, complete task description; it does not see this conversation.',
   input_schema: {
     type: 'object',
     properties: {
@@ -328,6 +331,7 @@ const LOAD_GROUP_SPEC: ToolSpec = {
     properties: { group: { type: 'string', enum: Object.keys(TOOL_GROUPS) } },
     required: ['group'],
   },
+  docx: DOCX_TOOL_SPECS,
 }
 const TODO_SPEC = EXTRA_BY_NAME.get('TodoWrite') // common + tiny → keep in core
 
@@ -337,6 +341,7 @@ const TODO_SPEC = EXTRA_BY_NAME.get('TodoWrite') // common + tiny → keep in co
 function coreSpecsFor(opts: ToolSetOpts): ToolSpec[] {
   const specs: ToolSpec[] = [
     ...FILE_TOOL_SPECS.filter((s) => opts.allowBash || s.name !== 'Bash'),
+  docx: 'docx (edit .docx live in the IDE, preserving layout: outline/inspect/read, replace/insert/delete paragraphs, run+paragraph formatting, styles, images, tab-stops + column alignment for forms, tables. ALWAYS DocxOutline first — everything targets a paragraph by its ¶index)',
     ...(opts.isSubAgent ? [] : EDITOR_TOOL_SPECS),
   ]
   if (TODO_SPEC) specs.push(TODO_SPEC)
@@ -380,6 +385,12 @@ export interface OrchestrationBridge {
 
 // A change awaiting the user's verdict in review mode.
 export interface PendingChange {
+  // Whether the top-level chat agent may delegate to child sub-agents via
+  // SpawnAgent. Resolved from ide_agent_config in main; default ON.
+  allowSubagents?: boolean
+  // When sub-agents are allowed, bias the agent toward parallelizing work into
+  // sub-agents rather than doing it all sequentially itself. Default OFF.
+  preferSubagents?: boolean
   changeId: string
   path: string
   kind: 'write' | 'edit'
@@ -452,7 +463,7 @@ function estimateCostUsd(tokensIn: number, tokensOut: number, rates: [number, nu
   return (tokensIn * inRate + tokensOut * outRate) / 1_000_000
 }
 
-function buildSystemPrompt(params: IdeAgentParams, workspaceRoot: string, opts?: { canSpawn?: boolean }): string {
+function buildSystemPrompt(params: IdeAgentParams, workspaceRoot: string, opts?: { canSpawn?: boolean; preferSubagents?: boolean }): string {
   const isSubAgent = Boolean(params.subAgentDepth && params.subAgentDepth > 0)
   const editorLine = isSubAgent
     ? '' // sub-agents don't drive the user's editor; they write to disk directly
@@ -472,9 +483,10 @@ function buildSystemPrompt(params: IdeAgentParams, workspaceRoot: string, opts?:
     'You have TodoWrite to track a plan. ' +
     'Extra tool groups are NOT loaded by default (to save context): git (status/diff/commit/' +
     'push/branch/checkout/config/account), github (PRs & issues), web (WebFetch, WebSearch), ' +
-    'memory (remember/recall notes), background (long-running commands), and browser (drive a ' +
+    'memory (remember/recall notes), background (long-running commands), browser (drive a ' +
     'real page inside the IDE — open/click/type/read console; ideal for testing the localhost ' +
-    'app you are building and reading JS-rendered sites). When the task ' +
+    'app you are building and reading JS-rendered sites), and docx (edit Word .docx files live ' +
+    'in the IDE, preserving/upgrading layout). When the task ' +
     'needs one, call LoadToolGroup(group) FIRST to enable it, then call its tools. ' +
     'If a browser page shows a CAPTCHA or login wall, do NOT retry or try to bypass it — tell ' +
     'the user to complete it by hand in the browser tab, then continue. ' +
@@ -489,11 +501,23 @@ function buildSystemPrompt(params: IdeAgentParams, workspaceRoot: string, opts?:
     'tool and the user will approve or decline. ' +
     (isSubAgent ? '' : 'Open the relevant file with OpenFile so the user can follow along. ') +
     (opts?.canSpawn
-      ? 'For large or parallelizable work, you can delegate a well-scoped sub-task to a child agent with ' +
-        'SpawnAgent(task, label) — it runs autonomously with the full toolset and returns a summary. Do NOT ' +
-        'delegate trivial things you can just do yourself. To run several sub-agents AT THE SAME TIME, emit ' +
-        'multiple SpawnAgent tool calls IN ONE turn (they execute in parallel); if the user asks for N agents, ' +
-        'make N SpawnAgent calls in that single turn. Give each a narrow, specific task — never "the whole workspace". '
+      ? (opts.preferSubagents
+          ? 'PREFER delegating to child sub-agents: whenever a task splits into independent parts, spawn a ' +
+            'sub-agent per part instead of doing them yourself sequentially. In particular, to READ, MAP, ' +
+            'UNDERSTAND or AUDIT a whole repo or many files, do NOT read it all yourself — split the codebase by ' +
+            'top-level area/directory and spawn ONE sub-agent per area to explore and report back, then synthesize ' +
+            'their summaries. Use SpawnAgent(task, label) — each runs autonomously with the full toolset and returns ' +
+            'a summary. To run several AT THE SAME TIME, emit multiple SpawnAgent tool calls IN ONE turn (they ' +
+            'execute in parallel); if the user asks for N agents, make N SpawnAgent calls in that single turn. Give ' +
+            'each a narrow, specific task — never "the whole workspace". Still do a single trivial edit yourself. '
+          : 'For large or parallelizable work, delegate a well-scoped sub-task to a child agent with ' +
+            'SpawnAgent(task, label) — it runs autonomously with the full toolset and returns a summary. Reading, ' +
+            'mapping or auditing a whole repo or many files is a good fit: split by area and spawn one sub-agent per ' +
+            'area rather than reading it all yourself. Do NOT delegate trivial things you can just do yourself. To ' +
+            'run several sub-agents AT THE SAME TIME, emit multiple SpawnAgent tool calls IN ONE turn (they execute ' +
+            'in parallel); if the user asks for N agents, make N SpawnAgent calls in that single turn. Give each a ' +
+            'narrow, specific task — never "the whole workspace". ') +
+        'If the user explicitly asks you to use or spawn sub-agents, do so — even for work you could do yourself. '
       : '') +
     'Work autonomously: inspect the code with Read/Grep/Glob before changing it, make ' +
     'the smallest correct edit, and prefer Edit over Write for existing files. ' +
@@ -513,6 +537,19 @@ function buildSystemPrompt(params: IdeAgentParams, workspaceRoot: string, opts?:
       'and final, call the PresentPlan tool with the full step-by-step plan (files to change and how, ' +
       'key decisions, how to verify). Do NOT call PresentPlan until you have finished investigating — ' +
       'keep using read-only tools until you are confident. Calling PresentPlan is what shows the user ' +
+    'For a .docx: LoadToolGroup("docx"), then ALWAYS call DocxOutline first to get each ' +
+    'paragraph\'s ¶index/style — every docx edit targets a paragraph by that index. ALWAYS edit ' +
+    'a .docx with the Docx* tools — NEVER unzip/edit/repack it by hand with Bash (that corrupts ' +
+    'the file and the live viewer will not update). You cannot SEE the rendered page, so use ' +
+    'DocxInspect to read the real structure (it shows tabs as →, tab stops, indent, and each ' +
+    'run\'s formatting) before and after formatting changes — DocxReadText only gives plain text. ' +
+    'To line up "label: value" rows (e.g. a form/contract) so the colons or values align, use ' +
+    'DocxAlignColumns — do NOT add or remove spaces (spaces never align in a proportional font; ' +
+    'Word aligns with tab stops). For real tabular data use DocxInsertTable/DocxSetCell. Prefer ' +
+    'format-preserving edits (DocxFormatRun/DocxFormatParagraph/DocxApplyStyle) and keep or ' +
+    'improve existing styling rather than flattening it. To add an image, find it with the web ' +
+    'group, DownloadFile it into the workspace, then DocxInsertImage. The user watches every ' +
+    'edit render live, so make focused, ordered changes. ' +
       'the Approve button; until then, no approval is offered. ' +
       'As you investigate, briefly narrate what you find in one line each (this streams live to the ' +
       'user so they can follow your thinking) before you call PresentPlan.\n\n' +
@@ -592,10 +629,11 @@ export async function runIdeAgent(
 
     const allowBash = Boolean(params.allowBash)
     const orchestrationEnabled = Boolean(params.orchestrationEnabled && orchestrationBridge)
-    const isSubAgent = Boolean(params.subAgentDepth && params.subAgentDepth > 0)
     // Top-level chat agent can delegate to child agents; sub-agents cannot
-    // (depth cap). Gated on the same orchestration opt-in.
-    const canSpawn = orchestrationEnabled && !isSubAgent && Boolean(orchestrationBridge?.spawnSubAgent)
+    // (depth cap). Gated on its own "allow sub-agents" setting (default on),
+    // independent of the headless group-orchestration toggle.
+    const canSpawn =
+      params.allowSubagents !== false && !isSubAgent && Boolean(orchestrationBridge?.spawnSubAgent)
     const toolOpts: ToolSetOpts = { allowBash, orchestrationEnabled, isSubAgent, canSpawn }
     const contextWindow = contextWindowFor(model, pc)
     const planMode = Boolean(params.planMode)
@@ -613,7 +651,10 @@ export async function runIdeAgent(
     }
     let adapter = buildAdapter(pc, key, model, activeSpecs)
     const loadedGroups = new Set<string>()
-    const system = buildSystemPrompt(params, workspaceRoot, { canSpawn })
+    const system = buildSystemPrompt(params, workspaceRoot, {
+      canSpawn,
+      preferSubagents: canSpawn && Boolean(params.preferSubagents),
+    })
     // Seed the conversation with the prior chat turns (user + assistant text).
     const messages: unknown[] = params.messages.map((m) => ({ role: m.role, content: m.content }))
 
@@ -883,7 +924,7 @@ export async function runIdeAgent(
         if (call.name === 'SpawnAgent') {
           const a = call.args as { task?: string; label?: string }
           if (!canSpawn || !orchestrationBridge?.spawnSubAgent) {
-            const denied = 'error: SpawnAgent is unavailable — enable orchestration in Backend Settings'
+            const denied = 'error: SpawnAgent is unavailable — enable "Allow agent to spawn sub-agents" in Backend Settings'
             results.push(denied)
             emit({ type: 'tool_result', callId, name: call.name, result: denied, isError: true })
           } else if (!a.task?.trim()) {
@@ -1009,6 +1050,7 @@ export async function runIdeAgent(
         // Cap what goes back to the model — a single huge result (full-file
         // Read, big command output) could blow the context for the whole run.
         results.push(result.length > MODEL_RESULT_CAP
+        const isDocxTool = DOCX_TOOL_NAMES.has(call.name)
           ? result.slice(0, MODEL_RESULT_CAP) + '\n…[output truncated — re-run with a narrower scope (offset/limit, tighter pattern) for more]'
           : result)
         emit({ type: 'tool_result', callId, name: call.name, result: result.slice(0, 2000), isError })
@@ -1033,6 +1075,22 @@ export async function runIdeAgent(
       trimOldToolResults(messages, 8)
     }
 
+        } else if (isDocxTool) {
+          // Docx tools are async (jszip + xmldom) → dispatched like Excel. A
+          // mutating op emits file_changed so the live DocxViewer re-renders,
+          // letting the user watch the edit land step by step.
+          try {
+            const r = await runDocxTool(workspaceRoot, call.name, call.args)
+            result = r == null ? `error: unknown tool ${call.name}` : r
+            isError = result.startsWith('error:')
+          } catch (e: any) {
+            result = `error: ${e?.message || e}`
+            isError = true
+          }
+          if (!isError && DOCX_MUTATORS.has(call.name)) {
+            const rel = (call.args as { path?: string }).path
+            if (rel) emit({ type: 'file_changed', path: rel })
+          }
     emit({ type: 'done', text: finalText, turns })
   } catch (e: any) {
     emit({ type: 'error', error: e?.message || String(e) })
@@ -1103,3 +1161,7 @@ async function reviewMutation(
     ? `wrote ${preview.after.length} chars to ${preview.path} (approved)`
     : `edited ${preview.path} — ${preview.note} (approved)`
 }
+          // A shell command can write anything and we cannot know what. An
+          // empty path means "re-read every live surface" — cheaper than
+          // leaving the editor and the docx viewer showing stale content.
+          if (!isError && call.name === 'Bash') emit({ type: 'file_changed', path: '' })

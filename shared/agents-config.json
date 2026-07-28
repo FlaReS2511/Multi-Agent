@@ -22,17 +22,29 @@
       "name": "VietAPI",
       "base_url": "https://api.vietapi.tech/v1",
       "models": [
-        "claude-opus-4.8",
-        "claude-opus-4.8-thinking",
-        "claude-opus-4.7",
+        "kimi-2.7",
         "gpt-5.5",
+        "claude-opus-4.6-thinking",
+        "claude-opus-4.8-thinking",
+        "claude-opus-5-thinking",
         "gpt-5.5-high",
+        "gpt-5.6-sol",
+        "claude-opus-4.7",
+        "claude-opus-5",
+        "claude-sonnet-5",
         "deepseek-v4-pro",
-        "deepseek-v4-flash",
         "glm-5.2",
-        "qwen3.5",
-        "kimi-k2.6"
-      ]
+        "kimi-k2.6",
+        "gpt-5.5-xhigh",
+        "gpt-5.6-luna",
+        "claude-opus-4.8",
+        "gpt-5.6-terra",
+        "claude-opus-4.6",
+        "claude-opus-4.7-thinking",
+        "deepseek-v4-flash"
+      ],
+      "price_in": 0.5,
+      "price_out": 0.5
     },
     "anthropic": {
       "kind": "anthropic",

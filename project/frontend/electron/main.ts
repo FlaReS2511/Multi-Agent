@@ -12,6 +12,7 @@ import { normalizeDiscordConfig, type DiscordConfig } from './group-params'
 import { runIdeAgent, IdeAgentParams, IdeAgentEvent, PendingChange, ReviewDecision, EditorRequest, EditorResponse } from './ide-agent'
 import { PendingAction, killAllBackgroundJobs } from './extra-tools'
 import { resolveDefinition, resetDefinitionServices } from './ts-definitions'
+import { closeDocxSession, resetDocxSessions } from './docx-tools'
 import {
   initBrowserTools, browserSetBounds, browserSetVisible, browserUserNavigate, closeBrowserView,
 } from './browser-tools'
@@ -1494,6 +1495,7 @@ function setWorkspaceRoot(dir: string): void {
   // The TS language service caches file lists / configs per root — drop it so
   // Peek Definition resolves against the new workspace.
   resetDefinitionServices()
+  resetDocxSessions()
 }
 
 // Resolve a workspace-relative path to an absolute path, guarding against
@@ -1571,6 +1573,26 @@ ipcMain.handle('workspace-read-file', async (_evt, relPath: string) => {
   } catch (err: any) {
     return { ok: false, content: err.message }
   }
+})
+
+// Binary read (base64) — the DocxViewer needs the raw .docx bytes to render
+// with docx-preview; utf-8 read would corrupt the zip.
+ipcMain.handle('workspace-read-file-bytes', async (_evt, relPath: string) => {
+  const absPath = resolveInWorkspace(relPath)
+  if (!absPath) return { ok: false, error: 'Access denied: path is outside workspace root' }
+  try {
+    const buf = await fs.readFile(absPath)
+    return { ok: true, base64: buf.toString('base64') }
+  } catch (err: any) {
+    return { ok: false, error: err.message }
+  }
+})
+
+// Drop a cached docx edit session when its tab closes (frees the parsed DOM).
+ipcMain.handle('docx-close', (_evt, relPath: string) => {
+  const absPath = resolveInWorkspace(relPath)
+  if (absPath) closeDocxSession(absPath)
+  return { ok: true }
 })
 
 // Peek / Go-to Definition: resolve the symbol at a character offset via the
@@ -2102,6 +2124,10 @@ ipcMain.handle('ai-agent-run', async (_evt, runId: string, params: IdeAgentParam
     if (subAgents.size > 30) {
       const finished = [...subAgents.values()].filter((s) => s.status !== 'running').sort((a, b) => (a.endedAt ?? 0) - (b.endedAt ?? 0))
       for (const s of finished.slice(0, subAgents.size - 30)) subAgents.delete(s.childRunId)
+    // Sub-agent delegation: default ON (only false when explicitly disabled);
+    // "prefer" biases the prompt toward parallelizing and is off by default.
+    allowSubagents: ideCfg.allowSubagents !== false,
+    preferSubagents: Boolean(ideCfg.preferSubagents),
     }
     const childRunId = `${runId}.sub-${++subAgentCounter}`
     const label = (input.label || input.task).slice(0, 60)
@@ -2206,20 +2232,31 @@ ipcMain.handle('ai-agent-cancel', (_evt, runId: string) => {
   return { ok: true }
 })
 
-// IDE-agent config (reviewMode + allowBash) persisted in meta.
-ipcMain.handle('ide-agent-config-get', () => {
+// IDE-agent config (reviewMode + allowBash + sub-agent settings) in meta.
+// allowSubagents defaults ON (absent key → true); preferSubagents defaults OFF.
+function readIdeAgentConfig() {
   const raw = db.getMeta('ide_agent_config')
   const cfg = raw ? JSON.parse(raw) : {}
-  return { reviewMode: Boolean(cfg.reviewMode), allowBash: Boolean(cfg.allowBash) }
-})
+  return {
+    reviewMode: Boolean(cfg.reviewMode),
+    allowBash: Boolean(cfg.allowBash),
+    allowSubagents: cfg.allowSubagents !== false,
+    preferSubagents: Boolean(cfg.preferSubagents),
+  }
+}
 
-ipcMain.handle('ide-agent-config-set', (_evt, patch: { reviewMode?: boolean; allowBash?: boolean }) => {
-  const raw = db.getMeta('ide_agent_config')
-  const cfg = raw ? JSON.parse(raw) : {}
-  const next = { ...cfg, ...patch }
-  db.setMeta('ide_agent_config', JSON.stringify(next))
-  return { ok: true, reviewMode: Boolean(next.reviewMode), allowBash: Boolean(next.allowBash) }
-})
+ipcMain.handle('ide-agent-config-get', () => readIdeAgentConfig())
+
+ipcMain.handle(
+  'ide-agent-config-set',
+  (_evt, patch: { reviewMode?: boolean; allowBash?: boolean; allowSubagents?: boolean; preferSubagents?: boolean }) => {
+    const raw = db.getMeta('ide_agent_config')
+    const cfg = raw ? JSON.parse(raw) : {}
+    const next = { ...cfg, ...patch }
+    db.setMeta('ide_agent_config', JSON.stringify(next))
+    return { ok: true, ...readIdeAgentConfig() }
+  },
+)
 
 // ── Git account profiles (used by the IDE agent's SwitchGitAccount) ──
 

@@ -109,6 +109,8 @@ const api = {
   workspaceReadFile: (relPath: string) => ipcRenderer.invoke('workspace-read-file', relPath),
   resolveDefinition: (relPath: string, offset: number, contents?: string) =>
     ipcRenderer.invoke('resolve-definition', relPath, offset, contents),
+  workspaceReadFileBytes: (relPath: string) => ipcRenderer.invoke('workspace-read-file-bytes', relPath),
+  docxClose: (relPath: string) => ipcRenderer.invoke('docx-close', relPath),
   workspaceWriteFile: (relPath: string, content: string) => ipcRenderer.invoke('workspace-write-file', relPath, content),
   workspaceGitStatus: () => ipcRenderer.invoke('workspace-git-status'),
   workspaceGitShowHead: (relPath: string) => ipcRenderer.invoke('workspace-git-show-head', relPath),
@@ -220,7 +222,7 @@ const api = {
     return () => ipcRenderer.removeListener(channel, listener)
   },
   ideAgentConfigGet: () => ipcRenderer.invoke('ide-agent-config-get'),
-  ideAgentConfigSet: (patch: { reviewMode?: boolean; allowBash?: boolean }) =>
+  ideAgentConfigSet: (patch: { reviewMode?: boolean; allowBash?: boolean; allowSubagents?: boolean; preferSubagents?: boolean }) =>
     ipcRenderer.invoke('ide-agent-config-set', patch),
   // Editor round-trip tools: main asks the renderer to drive Monaco.
   onAiAgentEditorReq: (runId: string, cb: (req: unknown) => void) => {

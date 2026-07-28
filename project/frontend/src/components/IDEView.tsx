@@ -51,6 +51,10 @@ const SearchPanel = lazy(() => import('./SearchPanel').then((m) => ({ default: m
 const GitPanel = lazy(() => import('./GitPanel').then((m) => ({ default: m.GitPanel })))
 const GroupsPanel = lazy(() => import('./GroupsPanel').then((m) => ({ default: m.GroupsPanel })))
 const AgentsLivePanel = lazy(() => import('./AgentsLivePanel').then((m) => ({ default: m.AgentsLivePanel })))
+// docx-preview is heavy — keep it (and its chunk) out until a .docx opens.
+const DocxViewer = lazy(() => import('./DocxViewer').then((m) => ({ default: m.DocxViewer })))
+
+const isDocx = (p: string | null): boolean => !!p && /\.docx$/i.test(p)
 
 // Sentinel tab id for the embedded agent browser (not a file on disk).
 const BROWSER_TAB = 'orqon://browser'
@@ -175,6 +179,11 @@ export function IDEView({ onOpenSettings }: { onOpenSettings?: () => void }) {
   const [activeTab, setActiveTab] = useState<string | null>(null)
   // Recently closed tabs (Cmd+Shift+T reopens), newest last.
   const closedTabsRef = useRef<string[]>([])
+  // Live .docx viewer: bump per open-docx path when the agent writes it →
+  // DocxViewer re-fetches + re-renders. `docxTarget` = a paragraph the user
+  // clicked in the viewer, attached to the next chat message (click-to-target).
+  const [docxReload, setDocxReload] = useState<Record<string, number>>({})
+  const [docxTarget, setDocxTarget] = useState<{ path: string; index: number; text: string } | null>(null)
   // Tab currently being drag-reordered.
   const dragTabRef = useRef<string | null>(null)
   // Shared confirm dialog (dirty-close, deletes, discards).
@@ -376,6 +385,15 @@ export function IDEView({ onOpenSettings }: { onOpenSettings?: () => void }) {
     let selection: string | undefined
     const editor = editorRef.current
     if (editor) {
+    // A .docx is open in the live viewer — hand the agent its exact path (so it
+    // edits THIS file with the docx tools) instead of the binary content.
+    if (isDocx(activeTab)) {
+      return {
+        path: activeTab,
+        language: 'docx',
+        content: '[This is a binary Word .docx open in the live viewer. Use LoadToolGroup("docx"), then DocxOutline on this path to read it, then the Docx* tools to edit — the user watches changes render live.]',
+      }
+    }
       const sel = editor.getSelection()
       if (sel && !sel.isEmpty()) {
         selection = editor.getModel()?.getValueInRange(sel) || undefined
@@ -613,7 +631,7 @@ export function IDEView({ onOpenSettings }: { onOpenSettings?: () => void }) {
   // active tab — the old deps on fileContents/dirtyFiles rebuilt this interval
   // on every keystroke; live values are read from refs instead.
   useEffect(() => {
-    if (!activeTab || activeTab === BROWSER_TAB) return
+    if (!activeTab || activeTab === BROWSER_TAB || isDocx(activeTab)) return
     const rel = activeTab
 
     const checkFileOnDisk = async () => {
@@ -650,7 +668,7 @@ export function IDEView({ onOpenSettings }: { onOpenSettings?: () => void }) {
   useEffect(() => {
     const ed = editorRef.current
     const mon = monacoRef.current
-    if (!ed || !mon || !activeTab || activeTab === BROWSER_TAB || diffMode) {
+    if (!ed || !mon || !activeTab || activeTab === BROWSER_TAB || isDocx(activeTab) || diffMode) {
       try { gitGutterRef.current?.clear() } catch { /* ignore */ }
       return
     }
@@ -755,6 +773,14 @@ export function IDEView({ onOpenSettings }: { onOpenSettings?: () => void }) {
     const firstOpen = !openTabsRef.current.includes(relPath)
     if (firstOpen) {
       const [diskFile, originalFile] = await Promise.all([
+    // .docx is binary — it renders in the DocxViewer, not Monaco. Just open the
+    // tab (no text read into contentsRef, no HEAD baseline, no diff mode).
+    if (isDocx(relPath)) {
+      setOpenTabs((prev) => (prev.includes(relPath) ? prev : [...prev, relPath]))
+      setDiffMode(false)
+      setActiveTab(relPath)
+      return
+    }
         window.api.workspaceReadFile(relPath),
         window.api.workspaceGitShowHead(relPath).catch(() => ({ ok: false, content: '' })),
       ])
@@ -1087,6 +1113,10 @@ export function IDEView({ onOpenSettings }: { onOpenSettings?: () => void }) {
     toast(`Save failed: ${res.error}`, 'error')
     return false
   }
+    if (isDocx(relPath)) {
+      window.api.docxClose(relPath).catch(() => {})
+      setDocxTarget((t) => (t?.path === relPath ? null : t))
+    }
 
   const saveActiveFile = async () => {
     if (!activeTab || !dirtyFiles[activeTab]) return
@@ -1795,7 +1825,17 @@ export function IDEView({ onOpenSettings }: { onOpenSettings?: () => void }) {
               <div ref={browserHostRef} className="flex-1 bg-zinc-950" />
             </div>
           )}
-          {activeTab && activeTab !== BROWSER_TAB ? (
+          {isDocx(activeTab) && (
+            <Suspense fallback={null}>
+              <DocxViewer
+                relPath={activeTab as string}
+                reloadKey={docxReload[activeTab as string] ?? 0}
+                busy={agentBusy}
+                onSelectParagraph={setDocxTarget}
+              />
+            </Suspense>
+          )}
+          {activeTab && activeTab !== BROWSER_TAB && !isDocx(activeTab) ? (
             <div className="absolute inset-0 flex flex-col">
               {diffMode ? (
                 <div className="flex-1 w-full overflow-hidden relative">
@@ -2214,3 +2254,5 @@ function Kbd({ children }: { children: React.ReactNode }) {
     </kbd>
   )
 }
+            docxTarget={docxTarget}
+            onDocxTargetUsed={() => setDocxTarget(null)}

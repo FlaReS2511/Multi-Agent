@@ -196,3 +196,11 @@ Nâng `ChatPanel.tsx` (không tạo panel mới):
 - KHÔNG bật Bash / group tools mặc định (gate riêng).
 - KHÔNG auto-commit; undo là git thủ công (GĐ4 mới có nút undo run).
 - KHÔNG build lại adapter/provider — tái dùng, chỉ trích ra chung.
+
+---
+
+## 10. Sub-agent — bug đã quan sát
+
+Hành vi lỗi thật của `SpawnAgent` (con dùng chung AbortController với cha;
+`done` rỗng bị tính là thành công) ghi riêng ở **`agent-behavior-bug.md`**.
+Chưa vá.

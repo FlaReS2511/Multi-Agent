@@ -429,6 +429,8 @@ declare global {
       workspaceRename(fromRel: string, toRel: string): Promise<{ ok: boolean; error?: string }>
       workspaceDelete(relPath: string): Promise<{ ok: boolean; error?: string }>
       workspaceSearch(query: string, opts?: { caseSensitive?: boolean; regex?: boolean; maxResults?: number; include?: string; exclude?: string }): Promise<{ ok: boolean; error?: string; matches: { file: string; line: number; column: number; text: string }[] }>
+      workspaceReadFileBytes(relPath: string): Promise<{ ok: boolean; base64?: string; error?: string }>
+      docxClose(relPath: string): Promise<{ ok: boolean }>
       workspaceReplaceInFile(relPath: string, find: string, replace: string, opts?: { regex?: boolean; caseSensitive?: boolean }): Promise<{ ok: boolean; error?: string }>
       workspaceGitBranch(): Promise<{ current: string; branches: string[] }>
       workspaceGitStage(file: string): Promise<{ ok: boolean; error?: string }>
@@ -485,8 +487,8 @@ declare global {
       agentSessionRename(id: number, title: string): Promise<{ ok: boolean }>
       agentSessionDelete(id: number): Promise<{ ok: boolean }>
       onAiAgentEvent(runId: string, cb: (e: IdeAgentEvent) => void): () => void
-      ideAgentConfigGet(): Promise<{ reviewMode: boolean; allowBash: boolean }>
-      ideAgentConfigSet(patch: { reviewMode?: boolean; allowBash?: boolean }): Promise<{ ok: boolean; reviewMode: boolean; allowBash: boolean }>
+      ideAgentConfigGet(): Promise<{ reviewMode: boolean; allowBash: boolean; allowSubagents: boolean; preferSubagents: boolean }>
+      ideAgentConfigSet(patch: { reviewMode?: boolean; allowBash?: boolean; allowSubagents?: boolean; preferSubagents?: boolean }): Promise<{ ok: boolean; reviewMode: boolean; allowBash: boolean; allowSubagents: boolean; preferSubagents: boolean }>
       onAiAgentEditorReq(runId: string, cb: (req: EditorRequest) => void): () => void
       aiAgentEditorRes(resp: EditorResponse): Promise<{ ok: boolean }>
       browserSetBounds(rect: { x: number; y: number; width: number; height: number }): void
