@@ -35,6 +35,58 @@ const pt2halfPt = (pt: number) => String(Math.round(pt * 2)) // w:sz is half-poi
 const pt2twip = (pt: number) => Math.round(pt * 20) // spacing/indent are twips (1pt = 20)
 const twip2pt = (v: string | null) => (v ? Math.round(Number(v) / 20) : 0)
 
+// ── Text width estimation ────────────────────────────────────────
+// The agent cannot see the rendered page, so alignment has to be COMPUTED, not
+// eyeballed. Tab stops align by construction — provided the stop sits past the
+// widest label. Undershoot makes that one row jump to the next default stop and
+// the column visibly breaks.
+//
+// The old estimate was `charCount * 7pt`: it ignored the font size AND the glyph
+// widths, so it was wrong in both directions. Measured against the browser's own
+// text metrics: "Người đại diện theo pháp luật:" at 11pt is 134pt wide, not the
+// 228pt it guessed (a 3cm hole); "Số CMND/CCCD:" at 18pt is 137pt, not 109 —
+// undershoot, which is the one that actually breaks the layout.
+//
+// Widths are em fractions for Times New Roman; the samples tested land within
+// ~1pt of the real metrics.
+const EM_WIDTH: Record<string, number> = {
+  A: .72, B: .67, C: .67, D: .72, E: .61, F: .56, G: .72, H: .72, I: .33, J: .39,
+  K: .72, L: .61, M: .89, N: .72, O: .72, P: .56, Q: .72, R: .67, S: .56, T: .61,
+  U: .72, V: .72, W: .94, X: .72, Y: .72, Z: .61, 'Đ': .72,
+  a: .44, b: .5, c: .44, d: .5, e: .44, f: .33, g: .5, h: .5, i: .28, j: .28,
+  k: .5, l: .28, m: .78, n: .5, o: .5, p: .5, q: .5, r: .33, s: .39, t: .28,
+  u: .5, v: .5, w: .72, x: .5, y: .5, z: .44, 'đ': .5,
+  ' ': .25, '.': .25, ',': .25, ':': .25, ';': .25, "'": .18, '"': .41,
+  '!': .33, '?': .44, '-': .33, '–': .5, '—': 1, '(': .33, ')': .33,
+  '[': .33, ']': .33, '/': .28, '\\': .28, '%': .83, '&': .78, '+': .56, '=': .56,
+}
+const EM_UPPER_FALLBACK = 0.7
+const EM_FALLBACK = 0.5
+
+// Relative to Times New Roman at the same point size.
+function familyFactor(font?: string): number {
+  const f = (font || '').toLowerCase()
+  if (/courier|consolas|menlo|mono/.test(f)) return 1.2
+  if (/arial|helvetica|verdana|tahoma/.test(f)) return 1.09
+  if (/calibri|segoe|aptos/.test(f)) return 0.96
+  return 1
+}
+
+// Width of `text` in points. Vietnamese diacritics are combining marks in NFD
+// and add no width, so decompose and skip them — "ê" is exactly as wide as "e".
+export function textWidthPt(
+  text: string,
+  sizePt: number,
+  opts?: { bold?: boolean; font?: string },
+): number {
+  let em = 0
+  for (const ch of text.normalize('NFD')) {
+    if (ch >= '̀' && ch <= 'ͯ') continue // combining accent
+    em += EM_WIDTH[ch] ?? (ch === ch.toUpperCase() && ch !== ch.toLowerCase() ? EM_UPPER_FALLBACK : EM_FALLBACK)
+  }
+  return em * sizePt * familyFactor(opts?.font) * (opts?.bold ? 1.05 : 1)
+}
+
 // ── Session cache (one parsed doc per open path) ─────────────────
 interface DocxSession {
   zip: JSZip
@@ -48,6 +100,8 @@ interface DocxSession {
   // reported success. See agent-behavior-bug.md §7.
   structureVersion: number
   outlinedVersion: number
+  // Document-wide default run font, parsed from styles.xml on first use.
+  defaults?: { sizePt: number; font?: string }
 }
 const sessions = new Map<string, DocxSession>()
 
@@ -134,6 +188,45 @@ function requireFreshOutline(s: DocxSession, tool: string): void {
         `DocxOutline (inserting or deleting a paragraph shifts every index after it), so this call would hit ` +
         `the wrong paragraph. Call DocxOutline again and use the NEW indices.`,
   )
+}
+
+// The run font a paragraph actually renders with: the first text run wins,
+// anything it leaves unset falls back to the document defaults. Ignoring this is
+// why the old estimate could not be right — a 20-char label is 90pt at 11pt and
+// 150pt at 18pt, and the guess used neither.
+async function docDefaults(s: DocxSession): Promise<{ sizePt: number; font?: string }> {
+  if (s.defaults) return s.defaults
+  let sizePt = 11 // Word's default when styles.xml says nothing
+  let font: string | undefined
+  const f = s.zip.file('word/styles.xml')
+  if (f) {
+    try {
+      const d = new DOMParser().parseFromString(await f.async('string'), 'text/xml') as unknown as Document
+      const dd = d.getElementsByTagName('w:rPrDefault').item(0)
+      if (dd) {
+        const sz = dd.getElementsByTagName('w:sz').item(0)?.getAttribute('w:val')
+        if (sz && Number(sz) > 0) sizePt = Number(sz) / 2
+        font = dd.getElementsByTagName('w:rFonts').item(0)?.getAttribute('w:ascii') || undefined
+      }
+    } catch { /* malformed styles.xml → keep the defaults */ }
+  }
+  s.defaults = { sizePt, font }
+  return s.defaults
+}
+
+function firstRunFont(p: Element): { sizePt?: number; font?: string; bold: boolean } {
+  for (const r of childrenNamed(p, 'w:r')) {
+    if (!r.getElementsByTagName('w:t').length) continue
+    const rPr = firstChildNamed(r, 'w:rPr')
+    if (!rPr) return { bold: false }
+    const sz = firstChildNamed(rPr, 'w:sz')?.getAttribute('w:val')
+    return {
+      sizePt: sz && Number(sz) > 0 ? Number(sz) / 2 : undefined,
+      font: firstChildNamed(rPr, 'w:rFonts')?.getAttribute('w:ascii') || undefined,
+      bold: Boolean(firstChildNamed(rPr, 'w:b')),
+    }
+  }
+  return { bold: false }
 }
 
 function requireParagraph(doc: Document, index: number): Element {
@@ -624,13 +717,50 @@ function runContent(r: Element): string {
   }
   return s
 }
-function inspectParagraph(p: Element, index: number): string {
+// Width of the text up to the FIRST tab — exactly what must fit before the
+// first tab stop for the row to line up. null when the paragraph has no tab.
+function widthBeforeFirstTab(p: Element, defs: { sizePt: number; font?: string }): number | null {
+  let w = 0
+  for (const r of childrenNamed(p, 'w:r')) {
+    const rPr = firstChildNamed(r, 'w:rPr')
+    const sz = rPr ? firstChildNamed(rPr, 'w:sz')?.getAttribute('w:val') : null
+    const font = (rPr ? firstChildNamed(rPr, 'w:rFonts')?.getAttribute('w:ascii') : null) || defs.font
+    const bold = Boolean(rPr && firstChildNamed(rPr, 'w:b'))
+    const size = sz && Number(sz) > 0 ? Number(sz) / 2 : defs.sizePt
+    const kids = r.childNodes
+    for (let i = 0; i < kids.length; i++) {
+      const c = kids.item(i)
+      if (!c) continue
+      if (c.nodeName === 'w:tab') return w
+      if (c.nodeName === 'w:t') w += textWidthPt(c.textContent ?? '', size, { bold, font })
+    }
+  }
+  return null
+}
+
+function inspectParagraph(p: Element, index: number, defs: { sizePt: number; font?: string }): string {
   const pPr = firstChildNamed(p, 'w:pPr')
   const style = paragraphStyleId(p)
   const jc = pPr ? firstChildNamed(pPr, 'w:jc')?.getAttribute('w:val') : undefined
   const tabsEl = pPr ? firstChildNamed(pPr, 'w:tabs') : null
   const stops: string[] = []
-  if (tabsEl) for (const t of childrenNamed(tabsEl, 'w:tab')) stops.push(`${t.getAttribute('w:val') || 'left'}@${twip2pt(t.getAttribute('w:pos'))}pt`)
+  let firstStopPt: number | null = null
+  if (tabsEl) for (const t of childrenNamed(tabsEl, 'w:tab')) {
+    const pos = twip2pt(t.getAttribute('w:pos'))
+    if (firstStopPt == null) firstStopPt = pos
+    stops.push(`${t.getAttribute('w:val') || 'left'}@${pos}pt`)
+  }
+  // The agent cannot look at the page, so hand it the one number that decides
+  // whether the column is straight: does the text before the tab clear the stop?
+  let fitNote = ''
+  if (firstStopPt != null) {
+    const w = widthBeforeFirstTab(p, defs)
+    if (w != null) {
+      fitNote = w <= firstStopPt
+        ? ` beforeTab≈${Math.round(w)}pt (fits, +${Math.round(firstStopPt - w)}pt)`
+        : ` beforeTab≈${Math.round(w)}pt OVERFLOWS the ${firstStopPt}pt stop by ${Math.round(w - firstStopPt)}pt — this row jumps to the next default stop and breaks the column`
+    }
+  }
   const ind = pPr ? firstChildNamed(pPr, 'w:ind') : null
   const indStr = ind ? `indent(left=${twip2pt(ind.getAttribute('w:left'))}pt,firstLine=${twip2pt(ind.getAttribute('w:firstLine'))}pt)` : ''
   const parts: string[] = []
@@ -649,17 +779,23 @@ function inspectParagraph(p: Element, index: number): string {
     }
     parts.push(marks.length ? `${JSON.stringify(seg)}{${marks.join(',')}}` : JSON.stringify(seg))
   }
-  const meta = [style ? `style=${style}` : '', jc ? `align=${jc}` : '', stops.length ? `tabStops=[${stops.join(', ')}]` : '', indStr].filter(Boolean).join(' ')
+  const meta = [style ? `style=${style}` : '', jc ? `align=${jc}` : '', stops.length ? `tabStops=[${stops.join(', ')}]` : '', indStr].filter(Boolean).join(' ') + fitNote
   return `¶${index}${meta ? ' — ' + meta : ''}\n  runs: ${parts.join(' + ') || '(empty)'}`
 }
 async function inspect(cwd: string, a: { path: string; from?: number; to?: number }): Promise<string> {
   const abs = resolveIn(cwd, a.path)
-  const { doc } = await getSession(abs)
+  const s = await getSession(abs)
+  const doc = s.doc
+  const defs = await docDefaults(s)
   const ps = bodyParagraphs(doc)
   const from = a.from ?? 0
   const to = a.to ?? ps.length - 1
-  const out: string[] = ['Legend: → = tab, ↵ = line break. Run text shown with {formatting}.']
-  for (let i = from; i <= to && i < ps.length; i++) out.push(inspectParagraph(ps[i], i))
+  const out: string[] = [
+    'Legend: → = tab, ↵ = line break. Run text shown with {formatting}. ' +
+    `beforeTab≈Npt = measured width of the text before the first tab (default font ${defs.sizePt}pt` +
+    `${defs.font ? ' ' + defs.font : ''}) — it must be ≤ the first tab stop or that row breaks.`,
+  ]
+  for (let i = from; i <= to && i < ps.length; i++) out.push(inspectParagraph(ps[i], i, defs))
   return out.join('\n')
 }
 
@@ -713,10 +849,8 @@ async function alignColumns(cwd: string, a: { path: string; from?: number; to?: 
   const ps = bodyParagraphs(doc)
   const from = a.from ?? 0
   const to = a.to ?? ps.length - 1
-  // Auto tab position: a bit past the longest label (~0.11" per char + margin),
-  // unless the caller pins one.
-  let maxLabel = 0
-  const targets: { p: Element; label: string; value: string }[] = []
+  const defs = await docDefaults(s)
+  const targets: { p: Element; label: string; value: string; widthPt: number; index: number }[] = []
   for (let i = from; i <= to && i < ps.length; i++) {
     const p = ps[i]
     if (childrenNamed(p, 'w:tbl').length) continue
@@ -726,12 +860,29 @@ async function alignColumns(cwd: string, a: { path: string; from?: number; to?: 
     const label = full.slice(0, idx + sep.length)
     let v = idx + sep.length
     while (v < full.length && /\s/.test(full[v])) v++
-    const value = full.slice(v)
-    maxLabel = Math.max(maxLabel, label.length)
-    targets.push({ p, label, value })
+    // Each row is measured with ITS OWN font — a doc mixing 11pt body with a
+    // 14pt heading row cannot share one guess.
+    const f = firstRunFont(p)
+    targets.push({
+      p, label, index: i, value: full.slice(v),
+      widthPt: textWidthPt(label, f.sizePt ?? defs.sizePt, { bold: f.bold, font: f.font ?? defs.font }),
+    })
   }
   if (!targets.length) throw new Error(`no "${sep}" separator found in ¶${from}..¶${to}`)
-  const posPt = a.position ?? Math.round(maxLabel * 7 + 18) // ~7pt/char + margin
+
+  const widest = targets.reduce((m, t) => (t.widthPt > m.widthPt ? t : m))
+  // Bias the margin outward: too wide is merely ugly, too narrow sends that one
+  // row to the next default stop and visibly breaks the column. Rounded to a 6pt
+  // grid so the number reads like something a person would have chosen.
+  const autoPt = Math.ceil((widest.widthPt * 1.08 + 8) / 6) * 6
+  if (a.position != null && a.position < widest.widthPt + 2) {
+    throw new Error(
+      `DocxAlignColumns: position ${a.position}pt is narrower than the widest label ` +
+      `(¶${widest.index} "${widest.label}" ≈ ${Math.round(widest.widthPt)}pt). That row's tab would jump to the ` +
+      `next default stop and break the column. Use at least ${autoPt}pt, or omit position and let it be measured.`,
+    )
+  }
+  const posPt = a.position ?? autoPt
   for (const { p, label, value } of targets) {
     // preserve the label's run formatting + the value's run formatting
     const runs = childrenNamed(p, 'w:r')
@@ -757,7 +908,11 @@ async function alignColumns(cwd: string, a: { path: string; from?: number; to?: 
     setParagraphTabStops(doc, p, [posPt], 'left')
   }
   await saveSession(abs, s)
-  return `aligned ${targets.length} "${sep}" rows at a ${posPt}pt tab stop`
+  // Report the measurement, not just the action — this is how the agent knows
+  // the column is straight without being able to look at it.
+  return `aligned ${targets.length} "${sep}" rows at a ${posPt}pt tab stop. Widest label is ¶${widest.index} ` +
+    `"${widest.label}" ≈ ${Math.round(widest.widthPt)}pt, so every label clears the stop by at least ` +
+    `${Math.round(posPt - widest.widthPt)}pt — the values line up. Confirm with DocxInspect.`
 }
 
 // ── Tables ───────────────────────────────────────────────────────
@@ -858,9 +1013,9 @@ export const DOCX_TOOL_SPECS: ToolSpec[] = [
   { name: 'DocxFormatParagraph', description: 'Set paragraph formatting: alignment (left|center|right|both), indentLeft/indentRight/firstLine/hanging (points), lineSpacing (multiple e.g. 1.5), spaceBefore/spaceAfter (points).', input_schema: obj({ path: str, paragraphIndex: num, formatting: obj({ alignment: { type: 'string', enum: ['left', 'center', 'right', 'both'] }, indentLeft: num, indentRight: num, firstLine: num, hanging: num, lineSpacing: num, spaceBefore: num, spaceAfter: num }, []) }, ['path', 'paragraphIndex', 'formatting']) },
   { name: 'DocxApplyStyle', description: 'Apply a paragraph style (styleId from DocxOutline, e.g. "Heading1", "Normal") to paragraph `paragraphIndex`.', input_schema: obj({ path: str, paragraphIndex: num, styleId: str }, ['path', 'paragraphIndex', 'styleId']) },
   { name: 'DocxInsertImage', description: 'Insert an image file (already in the workspace — download it first with DownloadFile) into paragraph `paragraphIndex`. Optional width/height in px (aspect kept if only one given) and align (left|center|right).', input_schema: obj({ path: str, paragraphIndex: num, imagePath: str, width: num, height: num, align: { type: 'string', enum: ['left', 'center', 'right'] } }, ['path', 'paragraphIndex', 'imagePath']) },
-  { name: 'DocxInspect', description: 'Show the DETAILED structure of a paragraph range (from..to): every run with its text + formatting {bold,#color,pt,…}, tabs (→), line breaks (↵), the paragraph style, alignment, tab stops and indent. Use this to SEE what you are editing — DocxReadText only gives plain text.', input_schema: obj({ path: str, from: num, to: num }, ['path']) },
+  { name: 'DocxInspect', description: 'Show the DETAILED structure of a paragraph range (from..to): every run with its text + formatting {bold,#color,pt,…}, tabs (→), line breaks (↵), the paragraph style, alignment, tab stops and indent. Use this to SEE what you are editing — DocxReadText only gives plain text. For any paragraph with a tab stop it also reports beforeTab≈Npt, the measured width of the text before the first tab, and flags when it overflows the stop — that is how you verify an alignment without looking at the page.', input_schema: obj({ path: str, from: num, to: num }, ['path']) },
   { name: 'DocxSetTabStops', description: 'Set tab stops (in points from the left margin) on a paragraph or range. positions e.g. [120] or [72,240]; align = left|right|center|decimal. Tab stops are how Word lines up columns.', input_schema: obj({ path: str, paragraphIndex: num, from: num, to: num, positions: { type: 'array', items: num }, align: { type: 'string', enum: ['left', 'right', 'center', 'decimal'] } }, ['path', 'positions']) },
-  { name: 'DocxAlignColumns', description: 'Line up "label: value" rows in a paragraph range so the values start at the SAME column (the correct way to align colons — spaces never align in Word). Puts a single tab after `separator` (default ":") and one shared tab stop on every row. Optional position (points) — otherwise auto-sized just past the longest label.', input_schema: obj({ path: str, from: num, to: num, separator: str, position: num }, ['path', 'from', 'to']) },
+  { name: 'DocxAlignColumns', description: 'Line up "label: value" rows in a paragraph range so the values start at the SAME column (the correct way to align colons — spaces never align in Word). Puts a single tab after `separator` (default ":") and one shared tab stop on every row. Optional position (points) — otherwise MEASURED from the real glyph widths and font size of every row and set just past the widest label. Returns the measurement (widest label and the clearance) so you can confirm the column is straight without seeing the page. A pinned position narrower than the widest label is refused, because the tab on that row would jump to the next default stop and break the column.', input_schema: obj({ path: str, from: num, to: num, separator: str, position: num }, ['path', 'from', 'to']) },
   { name: 'DocxInsertTable', description: 'Insert a bordered table. Give rows+cols, and/or data as a 2D array of cell strings (rows). Inserts before/after paragraph atIndex, or at the end of the document if atIndex is omitted.', input_schema: obj({ path: str, atIndex: num, rows: num, cols: num, data: { type: 'array', items: { type: 'array' } }, position: { type: 'string', enum: ['before', 'after'] } }, ['path']) },
   { name: 'DocxSetCell', description: 'Set the text of one table cell. tableIndex (0-based order in the doc, default 0), row, col.', input_schema: obj({ path: str, tableIndex: num, row: num, col: num, text: str }, ['path', 'row', 'col', 'text']) },
 ]

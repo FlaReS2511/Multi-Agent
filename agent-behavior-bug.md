@@ -241,6 +241,37 @@ hiểu path rỗng là "làm mới tất cả" (`bumpOpenDocx` + `reloadOpenText
   (`bodyParagraphs` = con trực tiếp của `w:body`; `tagParagraphs` loại
   `p.closest("table")` + header/footer → hai cách đếm trùng nhau.)
 
+**7.4 — Căn cột: đo sai, không phải "không nhìn thấy".**
+Câu hỏi tự nhiên là *"agent đâu có thấy mà căn"*. Nhưng căn bằng tab stop là thứ
+**kiểm chứng được bằng cấu trúc**: mọi dòng chung một tab stop + đúng một tab sau
+nhãn ⇒ thẳng hàng, **miễn là không nhãn nào rộng hơn vị trí tab stop**. Vượt qua
+thì tab nhảy sang mốc mặc định kế tiếp và riêng dòng đó lệch.
+
+Chỗ tính vị trí đó đang đoán: `số ký tự × 7 + 18`, **không đọc cỡ chữ lẫn font**.
+Đo bằng chính text metrics của trình duyệt cho thấy sai cả hai chiều:
+`Người đại diện theo pháp luật:` ở 11pt rộng 134pt chứ không phải 228pt (thừa
+~3cm), còn `Số CMND/CCCD:` ở 18pt rộng 137pt chứ không phải 109pt — **thiếu, và
+thiếu mới là cái làm vỡ hàng**.
+
+**Vá:** bảng bề rộng em cho Times New Roman + hệ số theo họ font, nhân cỡ chữ đọc
+từ `w:sz` của chính run đó (dấu tiếng Việt là combining mark trong NFD nên không
+cộng bề rộng — `ê` rộng đúng bằng `e`). Biên lệch ra ngoài 8% + 8pt vì thừa chỉ
+xấu còn thiếu là hỏng. `DocxAlignColumns` trả về luôn số đo, và từ chối nếu bị
+ghim một `position` hẹp hơn nhãn rộng nhất. `DocxInspect` báo `beforeTab≈Npt` cho
+mọi đoạn có tab stop — đó là cách agent tự xác nhận mà không cần nhìn.
+
+**Đã kiểm chứng** trên tài liệu trộn 11pt và 20pt, đối chiếu với canvas:
+
+| nhãn | ước lượng | đo thật | lệch |
+|---|---|---|---|
+| `Họ và tên:` | 48pt | 49pt | −1 |
+| `Số CMND/CCCD:` | 87pt | 87pt | 0 |
+| `Người đại diện theo pháp luật:` | 140pt | 144pt | −4 |
+
+Sai số ~3% và luôn lệch **thấp**, nên biên an toàn là cần chứ không thừa. Tool
+chọn 162pt cho nhãn rộng nhất 144pt (dư 18pt); công thức cũ sẽ chọn 228pt. Ghim
+`position: 100` bị từ chối kèm đúng con số phải dùng.
+
 **CÒN LẠI, chưa vá:**
 - `DocxReplaceText` rơi vào nhánh dự phòng (chuỗi vắt qua nhiều run) thì làm
   phẳng định dạng cả đoạn mà **câu trả về không hề khác** nhánh an toàn.
