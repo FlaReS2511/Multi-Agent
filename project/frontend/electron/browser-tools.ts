@@ -541,13 +541,29 @@ async function clearField(pg: Page, loc: ReturnType<Page['locator']>): Promise<v
   } catch { /* best effort — the dirty-stop below is the real guard */ }
 }
 
-// Did `want` actually land? Widgets reformat while you type (phone numbers,
-// dates, currency), so compare on a prefix and ignore whitespace differences.
-function textLanded(got: string, want: string): boolean {
+// Did `want` actually land?
+//
+// The field is cleared before every rung, so a correct write leaves EXACTLY the
+// text and nothing else. Substring matching is what let this lie: an append
+// still contains the text, so a buffer holding the solution twice reported
+// "typed (via paste)" — and a Monaco staircase, which contains every character
+// of the original with extra indentation, passed a whitespace-insensitive
+// check too. Equality is the only test that separates "wrote it" from "wrote it
+// again underneath the last one".
+//
+// `strict` (multi-line, i.e. code) demands equality. Single-line fields get one
+// concession: widgets that reformat as you type — phone numbers, dates,
+// currency — legitimately hold something other than what was typed, so those
+// match loosely, but only while the field has not grown beyond the input, which
+// is what an append looks like.
+function textLanded(got: string, want: string, strict: boolean): boolean {
   if (want === '') return got.trim() === ''
+  if (got.trim() === want.trim()) return true
+  if (strict) return false
   const squash = (s: string) => s.replace(/\s+/g, '')
-  const probe = want.slice(0, 12)
-  return got.includes(probe) || squash(got).includes(squash(probe))
+  const g = squash(got)
+  const w = squash(want)
+  return g.includes(w) && g.length <= w.length * 1.3
 }
 
 // Is this page our embedded view (as opposed to an attached external browser)?
@@ -619,6 +635,62 @@ async function clipboardPaste(pg: Page, loc: ReturnType<Page['locator']>, text: 
   }
 }
 
+// Per-character delay for the visible typing rung. Slow enough to read, fast
+// enough that a full solution lands in a few seconds (~150 chars ≈ 3.5s).
+const TYPE_DELAY_MS = 12
+
+// Options a code editor applies to TYPED input that rewrite what was typed:
+// auto-indent re-indents every newline (a 6-line Python function becomes a
+// widening staircase), auto-closing pairs inject characters that were never
+// sent, and Enter can accept a suggestion instead of breaking the line.
+const TYPING_HOSTILE_OPTIONS = {
+  autoIndent: 'none', autoClosingBrackets: 'never', autoClosingQuotes: 'never',
+  autoSurround: 'never', formatOnType: false, acceptSuggestionOnEnter: 'off',
+  quickSuggestions: false, tabCompletion: 'off',
+} as const
+
+// Rung: type character by character, visibly.
+//
+// The point of driving a real browser is that the user can watch the work
+// happen; a paste appears instantly and shows nothing. So this stays the
+// preferred path for code, and the editor's rewriting is switched off for the
+// duration rather than fought afterwards — verified on LeetCode's Monaco, where
+// 153 characters typed at 12ms landed byte-for-byte with indentation intact,
+// against a staircase when the same keystrokes ran with auto-indent on.
+// Editors we cannot reach through the monaco API just get plain typing; the
+// verification below catches it if that comes out wrong.
+async function typewriter(pg: Page, loc: ReturnType<Page['locator']>, text: string): Promise<void> {
+  const suppressed = await loc.evaluate((el: any, opts: Record<string, unknown>) => {
+    const host = el.closest?.('.monaco-editor')
+    if (!host) return false
+    const editors = (window as any).monaco?.editor?.getEditors?.() ?? []
+    const ed = editors.find((e: any) => host.contains(e.getDomNode?.())) ?? editors[0]
+    if (!ed?.updateOptions) return false
+    const raw = ed.getRawOptions?.() ?? {}
+    const prev: Record<string, unknown> = {}
+    for (const k of Object.keys(opts)) prev[k] = raw[k]
+    ;(window as any).__orqonTypingOpts = prev
+    ed.updateOptions(opts)
+    return true
+  }, { ...TYPING_HOSTILE_OPTIONS }).catch(() => false)
+
+  try {
+    await loc.click({ force: true, timeout: 2500 }).catch(() => { /* focus best effort */ })
+    await pg.keyboard.type(text, { delay: TYPE_DELAY_MS })
+  } finally {
+    if (suppressed) {
+      await loc.evaluate((el: any) => {
+        const host = el.closest?.('.monaco-editor')
+        const editors = (window as any).monaco?.editor?.getEditors?.() ?? []
+        const ed = editors.find((e: any) => host?.contains(e.getDomNode?.())) ?? editors[0]
+        const prev = (window as any).__orqonTypingOpts
+        if (ed?.updateOptions && prev) ed.updateOptions(prev)
+        delete (window as any).__orqonTypingOpts
+      }).catch(() => { /* the page navigated away — options die with it */ })
+    }
+  }
+}
+
 // Walk the rungs until the text is verifiably in the field. Returns which rung
 // worked (null = none did) plus everything tried, for the error message.
 async function typeIntoField(
@@ -666,14 +738,16 @@ async function typeIntoField(
 
   const paste: [string, () => Promise<void>] =
     ['paste', async () => { await clipboardPaste(pg, loc, text) }]
+  const typewriterRung: [string, () => Promise<void>] =
+    ['typewriter', async () => { await typewriter(pg, loc, text) }]
 
-  // Multi-line goes to paste FIRST. Not a preference — an ordering constraint:
-  // any earlier rung that half-writes trips the dirty-stop below, and paste
-  // would never be reached. Single-line text is unaffected by auto-indent, so
-  // it keeps the cheap rungs first and only borrows the clipboard as a
-  // late fallback.
+  // Multi-line leads with the visible typing rung — watching the agent write is
+  // the reason for driving a real browser at all — and falls back to paste,
+  // which is instant but correct anywhere. Single-line text is not affected by
+  // auto-indent, so it keeps the cheap rungs first and only borrows the
+  // clipboard late.
   const rungs: [string, () => Promise<void>][] = multiline
-    ? [paste, fill, insertText, ...lowlevel, type, chars, nativeSet]
+    ? [typewriterRung, paste, fill, insertText, ...lowlevel, chars, nativeSet]
     : [fill, type, insertText, ...lowlevel, chars, paste, nativeSet]
 
   const tried: string[] = []
@@ -686,12 +760,16 @@ async function typeIntoField(
     try { await run() } catch { /* rung failed outright — escalate */ }
     tried.push(name)
     const after = await readFieldText(loc)
-    if (textLanded(after, text)) return { via: name, tried }
-    // The rung did not land the text but DID change the field. Escalating now
-    // would write a second copy on top of the first — which is exactly how six
-    // rungs put a LeetCode solution into Monaco six times, each spliced into
-    // the middle of the last. Stop and report instead.
-    if (after !== before && after.trim() !== '') return { via: null, tried, dirtied: true }
+    if (textLanded(after, text, multiline)) return { via: name, tried }
+    // The rung wrote something wrong. Escalating on top of it is how six rungs
+    // put a LeetCode solution into Monaco six times, each spliced into the
+    // middle of the last — so the leftovers have to go before anything else
+    // runs. If they will not go, the field is beyond our control: stop rather
+    // than pile on.
+    if (after !== before && after.trim() !== '') {
+      await clearField(pg, loc)
+      if ((await readFieldText(loc)).trim() !== '') return { via: null, tried, dirtied: true }
+    }
   }
   return { via: null, tried, dirtied: false }
 }
@@ -852,8 +930,11 @@ export async function runBrowserTool(
       const how = via === 'fill' ? '' : ` (via ${via})`
       return snapshot(pg, {
         settleFirst: true,
+        // The rung is named on every path, navigation included — dropping it
+        // when a submit navigated hid exactly the fact needed to tell whether
+        // the text was typed or pasted.
         after: navved
-          ? `submitted → navigated to ${pg.url()}`
+          ? `submitted${how} → navigated to ${pg.url()}`
           : args.submit ? `after submit${how}` : `typed${how}`,
       })
     }
