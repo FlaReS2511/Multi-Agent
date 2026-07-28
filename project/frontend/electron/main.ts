@@ -2010,8 +2010,24 @@ interface SubAgentRec {
   summary: string
 }
 const subAgents = new Map<string, SubAgentRec>()
+// Abort handle per child, kept OUT of SubAgentRec: that record is structured-
+// cloned to the renderer by broadcastSubAgents() and a function is not cloneable.
+const subAgentAborts = new Map<string, AbortController>()
 let subAgentCounter = 0
 const MAX_SUBAGENTS = 4
+
+// Events a child agent must ALSO deliver on its PARENT's channel: the
+// approve/decline UI and the editor reload both live there, and the child has no
+// surface of its own for them. Without this, review mode + SpawnAgent deadlocked
+// (the child waited forever on a pending_change nothing displayed) and files a
+// sub-agent wrote never live-reloaded.
+//
+// This is the contract for the parent↔child boundary — all three bugs in
+// agent-behavior-bug.md were born here. Adding a new event of this kind means
+// adding it to THIS set, not to a hand-written condition somewhere.
+const FORWARD_TO_PARENT: ReadonlySet<IdeAgentEvent['type']> = new Set([
+  'pending_change', 'change_resolved', 'pending_action', 'action_resolved', 'file_changed',
+])
 function broadcastSubAgents(): void {
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('subagent-event', [...subAgents.values()])
@@ -2108,6 +2124,10 @@ ipcMain.handle('ai-agent-run', async (_evt, runId: string, params: IdeAgentParam
     ...params,
     allowBash: Boolean(ideCfg.allowBash),
     orchestrationEnabled: Boolean(orch.enabled),
+    // Sub-agent delegation: default ON (only false when explicitly disabled);
+    // "prefer" biases the prompt toward parallelizing and is off by default.
+    allowSubagents: ideCfg.allowSubagents !== false,
+    preferSubagents: Boolean(ideCfg.preferSubagents),
   }
   // Delegate a sub-task to a child IDE-agent (full toolset, minus editor
   // round-trip and minus its own SpawnAgent). Runs to completion; returns the
@@ -2124,10 +2144,6 @@ ipcMain.handle('ai-agent-run', async (_evt, runId: string, params: IdeAgentParam
     if (subAgents.size > 30) {
       const finished = [...subAgents.values()].filter((s) => s.status !== 'running').sort((a, b) => (a.endedAt ?? 0) - (b.endedAt ?? 0))
       for (const s of finished.slice(0, subAgents.size - 30)) subAgents.delete(s.childRunId)
-    // Sub-agent delegation: default ON (only false when explicitly disabled);
-    // "prefer" biases the prompt toward parallelizing and is off by default.
-    allowSubagents: ideCfg.allowSubagents !== false,
-    preferSubagents: Boolean(ideCfg.preferSubagents),
     }
     const childRunId = `${runId}.sub-${++subAgentCounter}`
     const label = (input.label || input.task).slice(0, 60)
@@ -2140,22 +2156,19 @@ ipcMain.handle('ai-agent-run', async (_evt, runId: string, params: IdeAgentParam
     broadcastSubAgents()
 
     let summary = ''
+    // Did the child actually DO anything? A child that ran no tool and produced
+    // only an opening line has not done the work — reporting that as success is
+    // what let "I'll map that tree now." reach the lead as a result.
+    let childRanTool = false
+    let childStopReason: string = 'completed'
     const childEmit = (e: IdeAgentEvent) => {
-      if (e.type === 'done') summary = e.text || ''
+      if (e.type === 'tool_call') childRanTool = true
+      else if (e.type === 'done') { summary = e.text || ''; childStopReason = e.reason }
       else if (e.type === 'blocked') summary = `blocked: ${e.reason}`
       else if (e.type === 'error') summary = `error: ${e.error}`
       if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.webContents.send(`ai-agent-event:${childRunId}`, e)
-        // Approval requests and file writes must ALSO reach the parent
-        // channel — that is where the approve/decline UI and the editor
-        // reload live. Without this, review mode + SpawnAgent deadlocked
-        // (the child waited forever on a pending_change no surface showed)
-        // and files a sub-agent wrote never live-reloaded in the editor.
-        if (
-          e.type === 'pending_change' || e.type === 'change_resolved' ||
-          e.type === 'pending_action' || e.type === 'action_resolved' ||
-          e.type === 'file_changed'
-        ) {
+        if (FORWARD_TO_PARENT.has(e.type)) {
           mainWindow.webContents.send(`ai-agent-event:${runId}`, e)
         }
       }
@@ -2174,14 +2187,40 @@ ipcMain.handle('ai-agent-run', async (_evt, runId: string, params: IdeAgentParam
       createTask: orchestrationBridge.createTask,
       createGroup: orchestrationBridge.createGroup,
     }
+    // The child gets its OWN AbortController, LINKED to the parent's: stopping
+    // the parent still stops the child, but the child is no longer killed by
+    // whatever else touches the parent's signal, and it can be cancelled alone.
+    // Sharing one controller is why four SpawnAgents in a turn reported
+    // "cancelled" together (agent-behavior-bug.md §1).
+    const childAc = new AbortController()
+    subAgentAborts.set(childRunId, childAc)
+    const onParentAbort = () => childAc.abort()
+    if (ac.signal.aborted) childAc.abort()
+    else ac.signal.addEventListener('abort', onParentAbort, { once: true })
+
     try {
       // editorBridge = undefined: a sub-agent must not drive the user's single
       // editor; it writes to disk and the file_changed events reload the tab.
-      await runIdeAgent(SHARED, childParams, decryptKey, childEmit, ac.signal, requestReview, undefined, subBridge, requestAction)
-      rec.status = summary.startsWith('error:') ? 'error' : 'done'
+      await runIdeAgent(SHARED, childParams, decryptKey, childEmit, childAc.signal, requestReview, undefined, subBridge, requestAction)
+      // A run the user (or the parent) stopped is not a failure — keep it out
+      // of the error bucket so a deliberate Stop doesn't read as a crash.
+      if (childStopReason === 'parent_stopped' || childStopReason === 'user_stopped') {
+        rec.status = 'done'
+        summary = summary.trim() || '(stopped before finishing)'
+      } else if (!childRanTool && !summary.startsWith('error:')) {
+        summary = summary.trim()
+          ? `error: sub-agent ended without running a single tool — it only said: ${JSON.stringify(summary.slice(0, 200))}`
+          : 'error: sub-agent ended without running any tool and without a summary'
+        rec.status = 'error'
+      } else {
+        rec.status = summary.startsWith('error:') ? 'error' : 'done'
+      }
     } catch (e) {
       summary = `error: ${(e as Error).message || e}`
       rec.status = 'error'
+    } finally {
+      ac.signal.removeEventListener('abort', onParentAbort)
+      subAgentAborts.delete(childRunId)
     }
     rec.summary = summary
     rec.endedAt = Date.now()

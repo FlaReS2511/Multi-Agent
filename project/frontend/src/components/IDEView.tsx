@@ -208,6 +208,10 @@ export function IDEView({ onOpenSettings }: { onOpenSettings?: () => void }) {
   useEffect(() => { activeTabRef.current = activeTab }, [activeTab])
   const gitChangesRef = useRef<GitChange[]>([])
   useEffect(() => { gitChangesRef.current = gitChanges }, [gitChanges])
+  // Mirrored so path resolution below stays a stable callback (it is handed to
+  // the memoized ChatPanel — a changing identity would re-render it).
+  const workspaceRootRef = useRef('')
+  useEffect(() => { workspaceRootRef.current = workspaceRootPath }, [workspaceRootPath])
 
   // Editor View Configuration
   const [diffMode, setDiffMode] = useState(false)
@@ -381,10 +385,6 @@ export function IDEView({ onOpenSettings }: { onOpenSettings?: () => void }) {
   // at send time so the model always sees the latest file + selection).
   const getChatContext = useCallback(() => {
     if (!activeTab || activeTab === BROWSER_TAB) return null
-    const content = contentsRef.current.get(activeTab) ?? ''
-    let selection: string | undefined
-    const editor = editorRef.current
-    if (editor) {
     // A .docx is open in the live viewer — hand the agent its exact path (so it
     // edits THIS file with the docx tools) instead of the binary content.
     if (isDocx(activeTab)) {
@@ -394,6 +394,10 @@ export function IDEView({ onOpenSettings }: { onOpenSettings?: () => void }) {
         content: '[This is a binary Word .docx open in the live viewer. Use LoadToolGroup("docx"), then DocxOutline on this path to read it, then the Docx* tools to edit — the user watches changes render live.]',
       }
     }
+    const content = contentsRef.current.get(activeTab) ?? ''
+    let selection: string | undefined
+    const editor = editorRef.current
+    if (editor) {
       const sel = editor.getSelection()
       if (sel && !sel.isEmpty()) {
         selection = editor.getModel()?.getValueInRange(sel) || undefined
@@ -769,10 +773,6 @@ export function IDEView({ onOpenSettings }: { onOpenSettings?: () => void }) {
   // Handle open a file. Stable identity (reads live state from refs) so the
   // memoized tree/palette/panels that receive it don't re-render for nothing.
   const openFile = useCallback(async (relPath: string) => {
-    // If not already in tabs, load content + HEAD baseline (in parallel), then add it
-    const firstOpen = !openTabsRef.current.includes(relPath)
-    if (firstOpen) {
-      const [diskFile, originalFile] = await Promise.all([
     // .docx is binary — it renders in the DocxViewer, not Monaco. Just open the
     // tab (no text read into contentsRef, no HEAD baseline, no diff mode).
     if (isDocx(relPath)) {
@@ -781,6 +781,10 @@ export function IDEView({ onOpenSettings }: { onOpenSettings?: () => void }) {
       setActiveTab(relPath)
       return
     }
+    // If not already in tabs, load content + HEAD baseline (in parallel), then add it
+    const firstOpen = !openTabsRef.current.includes(relPath)
+    if (firstOpen) {
+      const [diskFile, originalFile] = await Promise.all([
         window.api.workspaceReadFile(relPath),
         window.api.workspaceGitShowHead(relPath).catch(() => ({ ok: false, content: '' })),
       ])
@@ -817,15 +821,102 @@ export function IDEView({ onOpenSettings }: { onOpenSettings?: () => void }) {
     return () => setDefinitionOpener(null)
   }, [openFileAtLine])
 
+  // Re-render every open .docx viewer from its current on-disk bytes.
+  const bumpOpenDocx = useCallback(() => {
+    setDocxReload((m) => {
+      let changed = false
+      const next = { ...m }
+      for (const tab of openTabsRef.current) if (isDocx(tab)) { next[tab] = (next[tab] ?? 0) + 1; changed = true }
+      return changed ? next : m
+    })
+  }, [])
+
+  // Map a path the AGENT reported to the key of an open buffer. Exact string
+  // matching missed three real cases: the agent may report an ABSOLUTE path;
+  // macOS stores filenames as NFD while a tab key can be NFC (any Vietnamese
+  // name with diacritics differs byte-wise); and separators can be mixed on
+  // Windows. Returns null when there is no unambiguous match.
+  const resolveOpenBuffer = useCallback((incoming: string): string | null => {
+    const norm = (p: string) => p.replace(/\\/g, '/').normalize('NFC')
+    const keys = Array.from(contentsRef.current.keys())
+    const target = norm(incoming)
+
+    const exact = keys.find((k) => norm(k) === target)
+    if (exact) return exact
+
+    // Absolute path under the workspace → strip the root and retry.
+    const root = norm(workspaceRootRef.current)
+    if (root && target.startsWith(root + '/')) {
+      const rel = target.slice(root.length + 1)
+      const m = keys.find((k) => norm(k) === rel)
+      if (m) return m
+    }
+
+    // Last resort: basename, and ONLY when it is unique among open buffers —
+    // guessing between two same-named files would reload the wrong one.
+    const base = target.split('/').pop()
+    const hits = keys.filter((k) => norm(k).split('/').pop() === base)
+    return hits.length === 1 ? hits[0] : null
+  }, [])
+
+  // Re-read every open text buffer from disk (skipping unsaved ones — an
+  // agent's write must never clobber the user's edits). The safety net for a
+  // per-file event that was missed: docx already had one, text files did not.
+  const reloadOpenTextBuffers = useCallback(async () => {
+    for (const rel of openTabsRef.current) {
+      if (rel === BROWSER_TAB || isDocx(rel)) continue
+      if (dirtyRef.current[rel]) continue
+      try {
+        const disk = await window.api.workspaceReadFile(rel)
+        if (disk.ok && disk.content !== contentsRef.current.get(rel)) setBufferText(rel, disk.content)
+      } catch { /* a file that vanished is handled by the tree refresh */ }
+    }
+  }, [setBufferText])
+
   // Called when the IDE agent writes/edits a file. Re-read it from disk if it's
   // open so the editor reflects the agent's change, and refresh tree + git.
   const onAgentFileChanged = useCallback(async (relPath: string) => {
-    if (contentsRef.current.has(relPath)) {
-      const disk = await window.api.workspaceReadFile(relPath)
-      if (disk.ok) setBufferText(relPath, disk.content)
+    // Empty path = "something changed, we don't know what" (a Bash command, a
+    // git checkout). Re-read every live surface rather than guess.
+    if (!relPath) {
+      bumpOpenDocx()
+      void reloadOpenTextBuffers()
+      refreshWorkspace()
+      return
+    }
+    if (isDocx(relPath)) {
+      // Binary — the DocxViewer re-fetches + re-renders when its key bumps.
+      // Path matching is fragile here (agent may use an absolute path; macOS
+      // filenames are NFD while the tab may be NFC; Vietnamese diacritics), so
+      // just refresh EVERY open docx viewer. Re-rendering an unchanged doc is a
+      // harmless no-op, and this guarantees the live view never goes stale.
+      bumpOpenDocx()
+      refreshWorkspace()
+      return
+    }
+    const key = resolveOpenBuffer(relPath)
+    if (key && !dirtyRef.current[key]) {
+      // Read through the buffer's OWN key, not the agent's spelling of it —
+      // the two can differ (absolute vs relative, NFD vs NFC).
+      const disk = await window.api.workspaceReadFile(key)
+      if (disk.ok) setBufferText(key, disk.content)
     }
     refreshWorkspace()
-  }, [setBufferText, refreshWorkspace])
+  }, [setBufferText, refreshWorkspace, bumpOpenDocx, resolveOpenBuffer, reloadOpenTextBuffers])
+
+  // Safety net: when an agent run finishes (busy → idle), refresh every open
+  // docx viewer to the final on-disk state — so even if a per-edit event was
+  // missed, the view is never left stale after a run.
+  const prevBusyRef = useRef(false)
+  useEffect(() => {
+    if (prevBusyRef.current && !agentBusy) {
+      bumpOpenDocx()
+      // Text files get the same net as docx now — a sub-agent writes with
+      // editorBridge = undefined, so `file_changed` was their ONLY reload path.
+      void reloadOpenTextBuffers()
+    }
+    prevBusyRef.current = agentBusy
+  }, [agentBusy, bumpOpenDocx, reloadOpenTextBuffers])
 
   // ── Agent review mode: pending change awaiting the user's verdict ─────
   const [pendingChange, setPendingChange] = useState<PendingChange | null>(null)
@@ -1022,6 +1113,10 @@ export function IDEView({ onOpenSettings }: { onOpenSettings?: () => void }) {
   // Close a tab unconditionally (dirty state already resolved by the caller).
   const doCloseTab = (relPath: string) => {
     if (relPath === BROWSER_TAB) window.api.browserTabClosed()
+    if (isDocx(relPath)) {
+      window.api.docxClose(relPath).catch(() => {})
+      setDocxTarget((t) => (t?.path === relPath ? null : t))
+    }
     const nextTabs = openTabs.filter((t) => t !== relPath)
     setOpenTabs(nextTabs)
     if (activeTab === relPath) {
@@ -1113,10 +1208,6 @@ export function IDEView({ onOpenSettings }: { onOpenSettings?: () => void }) {
     toast(`Save failed: ${res.error}`, 'error')
     return false
   }
-    if (isDocx(relPath)) {
-      window.api.docxClose(relPath).catch(() => {})
-      setDocxTarget((t) => (t?.path === relPath ? null : t))
-    }
 
   const saveActiveFile = async () => {
     if (!activeTab || !dirtyFiles[activeTab]) return
@@ -2187,6 +2278,8 @@ export function IDEView({ onOpenSettings }: { onOpenSettings?: () => void }) {
             onAttentionNeeded={onChatAttentionNeeded}
             onRunFinished={onChatRunFinished}
             onOpenSettings={onOpenSettings}
+            docxTarget={docxTarget}
+            onDocxTargetUsed={() => setDocxTarget(null)}
           />
         </div>
       </motion.aside>
@@ -2254,5 +2347,3 @@ function Kbd({ children }: { children: React.ReactNode }) {
     </kbd>
   )
 }
-            docxTarget={docxTarget}
-            onDocxTargetUsed={() => setDocxTarget(null)}

@@ -331,6 +331,19 @@ export interface AgentSessionRow extends AgentSessionMeta {
   created_at: string
 }
 
+// MIRRORS `StopReason` in electron/ide-agent.ts — keep both in sync (tsc cannot
+// see across the process boundary, so a one-sided edit compiles and breaks at
+// runtime). Why a run ended; anything other than 'completed' is shown to the user.
+export type StopReason =
+  | 'completed'
+  | 'no_progress'
+  | 'budget'
+  | 'hard_ceiling'
+  | 'empty_response'
+  | 'nudge_exhausted'
+  | 'user_stopped'
+  | 'parent_stopped'
+
 export type IdeAgentEvent =
   | { type: 'reasoning'; delta: string; turn: number }
   | { type: 'token'; delta: string; turn: number }
@@ -345,9 +358,24 @@ export type IdeAgentEvent =
   | { type: 'context'; used: number; window: number; turn: number }
   | { type: 'blocked'; reason: string; turns: number }
   | { type: 'plan'; plan: string; turns: number }
-  | { type: 'done'; text: string; turns: number }
+  | { type: 'done'; text: string; turns: number; reason: StopReason }
+  | { type: 'checkpoint'; turns: number; costUsd: number }
   | { type: 'error'; error: string }
   | { type: 'subagent_started'; childRunId: string; label: string; task: string }
+
+// One line shown in the transcript when a run ended for a reason the user did
+// not choose. 'completed' and 'user_stopped' render nothing: the first is the
+// normal case, the second already showed "⏹ Stopped." when Stop was pressed.
+export const STOP_REASON_NOTE: Record<StopReason, string | null> = {
+  completed: null,
+  user_stopped: null,
+  parent_stopped: null,
+  no_progress: '⚠ Dừng: nhiều lượt liên tiếp không có tiến triển mới — agent có thể đang kẹt vòng lặp. Xem lại yêu cầu rồi gửi tiếp.',
+  budget: '⚠ Dừng: run này đã vượt trần chi phí. Gửi tiếp để chạy thêm, hoặc nâng IDE_AGENT_MAX_USD.',
+  hard_ceiling: '⚠ Dừng: chạm trần số lượt của một run. Gõ "tiếp tục" để chạy tiếp.',
+  empty_response: '⚠ Dừng: provider trả về rỗng (stream bị đứt) — gửi lại để tiếp tục.',
+  nudge_exhausted: '⚠ Dừng: model nói sẽ làm nhưng không gọi tool sau 2 lần nhắc. Thử diễn đạt lại yêu cầu cụ thể hơn.',
+}
 
 declare global {
   interface Window {
@@ -401,6 +429,8 @@ declare global {
       onAgentKilled(cb: (info: { agent: string; reason: string }) => void): () => void
       workspaceListFiles(): Promise<any[]>
       workspaceReadFile(relPath: string): Promise<{ ok: boolean; content: string }>
+      workspaceReadFileBytes(relPath: string): Promise<{ ok: boolean; base64?: string; error?: string }>
+      docxClose(relPath: string): Promise<{ ok: boolean }>
       resolveDefinition(
         relPath: string,
         offset: number,
@@ -429,8 +459,6 @@ declare global {
       workspaceRename(fromRel: string, toRel: string): Promise<{ ok: boolean; error?: string }>
       workspaceDelete(relPath: string): Promise<{ ok: boolean; error?: string }>
       workspaceSearch(query: string, opts?: { caseSensitive?: boolean; regex?: boolean; maxResults?: number; include?: string; exclude?: string }): Promise<{ ok: boolean; error?: string; matches: { file: string; line: number; column: number; text: string }[] }>
-      workspaceReadFileBytes(relPath: string): Promise<{ ok: boolean; base64?: string; error?: string }>
-      docxClose(relPath: string): Promise<{ ok: boolean }>
       workspaceReplaceInFile(relPath: string, find: string, replace: string, opts?: { regex?: boolean; caseSensitive?: boolean }): Promise<{ ok: boolean; error?: string }>
       workspaceGitBranch(): Promise<{ current: string; branches: string[] }>
       workspaceGitStage(file: string): Promise<{ ok: boolean; error?: string }>
