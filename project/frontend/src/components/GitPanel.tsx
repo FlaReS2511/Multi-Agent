@@ -170,7 +170,7 @@ export const GitPanel = React.memo(function GitPanel({ status, branch, onOpenFil
         <button
           onClick={() => onDiscard(entry.file)}
           title="Discard changes"
-          className="opacity-0 group-hover:opacity-100 text-zinc-400 hover:text-rose-400 shrink-0"
+          className="opacity-0 group-hover:opacity-100 focus-visible:opacity-100 group-focus-within:opacity-100 text-zinc-400 hover:text-rose-400 shrink-0"
         >
           <Undo2 className="w-3.5 h-3.5" />
         </button>
@@ -178,7 +178,7 @@ export const GitPanel = React.memo(function GitPanel({ status, branch, onOpenFil
       <button
         onClick={() => (isStaged ? unstage(entry.file) : stage(entry.file))}
         title={isStaged ? 'Unstage' : 'Stage'}
-        className="opacity-0 group-hover:opacity-100 text-zinc-400 hover:text-white shrink-0"
+        className="opacity-0 group-hover:opacity-100 focus-visible:opacity-100 group-focus-within:opacity-100 text-zinc-400 hover:text-white shrink-0"
       >
         {isStaged ? (
           <Minus className="w-3.5 h-3.5" />

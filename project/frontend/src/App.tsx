@@ -58,7 +58,7 @@ export default function App() {
       {/* Body: the IDE is the whole surface. */}
       <div className="flex-1 min-h-0 relative overflow-hidden">
         <div className="absolute inset-0">
-          <IDEView />
+          <IDEView onOpenSettings={() => setShowBackendSettings(true)} />
         </div>
       </div>
 

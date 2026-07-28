@@ -34,8 +34,12 @@ const api = {
   getBackendSettings: () => ipcRenderer.invoke('get-backend-settings'),
   setAgentBackend: (input: { agent: string; provider: string; model?: string }) =>
     ipcRenderer.invoke('set-agent-backend', input),
-  setProvider: (input: { id: string; kind: string; name?: string; base_url?: string; models?: string[] }) =>
+  setProvider: (input: { id: string; kind: string; name?: string; base_url?: string; models?: string[]; price_in?: number; price_out?: number }) =>
     ipcRenderer.invoke('set-provider', input),
+  providerTest: (id: string, apiKey?: string): Promise<{ ok: boolean; error?: string; modelCount?: number }> =>
+    ipcRenderer.invoke('provider-test', id, apiKey),
+  providerFetchModels: (id: string, apiKey?: string): Promise<{ ok: boolean; error?: string; models?: string[] }> =>
+    ipcRenderer.invoke('provider-fetch-models', id, apiKey),
   deleteProvider: (id: string) => ipcRenderer.invoke('delete-provider', id),
   setProviderKey: (input: { provider: string; apiKey: string }) =>
     ipcRenderer.invoke('set-provider-key', input),
@@ -103,6 +107,10 @@ const api = {
   },
   workspaceListFiles: () => ipcRenderer.invoke('workspace-list-files'),
   workspaceReadFile: (relPath: string) => ipcRenderer.invoke('workspace-read-file', relPath),
+  resolveDefinition: (relPath: string, offset: number, contents?: string) =>
+    ipcRenderer.invoke('resolve-definition', relPath, offset, contents),
+  workspaceReadFileBytes: (relPath: string) => ipcRenderer.invoke('workspace-read-file-bytes', relPath),
+  docxClose: (relPath: string) => ipcRenderer.invoke('docx-close', relPath),
   workspaceWriteFile: (relPath: string, content: string) => ipcRenderer.invoke('workspace-write-file', relPath, content),
   workspaceGitStatus: () => ipcRenderer.invoke('workspace-git-status'),
   workspaceGitShowHead: (relPath: string) => ipcRenderer.invoke('workspace-git-show-head', relPath),
@@ -214,7 +222,7 @@ const api = {
     return () => ipcRenderer.removeListener(channel, listener)
   },
   ideAgentConfigGet: () => ipcRenderer.invoke('ide-agent-config-get'),
-  ideAgentConfigSet: (patch: { reviewMode?: boolean; allowBash?: boolean }) =>
+  ideAgentConfigSet: (patch: { reviewMode?: boolean; allowBash?: boolean; allowSubagents?: boolean; preferSubagents?: boolean }) =>
     ipcRenderer.invoke('ide-agent-config-set', patch),
   // Editor round-trip tools: main asks the renderer to drive Monaco.
   onAiAgentEditorReq: (runId: string, cb: (req: unknown) => void) => {

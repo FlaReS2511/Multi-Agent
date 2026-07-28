@@ -28,6 +28,8 @@ export function BackendSettingsModal({ open, onClose }: Props) {
   const [orch, setOrch] = useState<OrchestrationConfig | null>(null)
   const [reviewMode, setReviewMode] = useState(false)
   const [allowBash, setAllowBash] = useState(false)
+  const [allowSubagents, setAllowSubagents] = useState(true)
+  const [preferSubagents, setPreferSubagents] = useState(false)
   const [discord, setDiscord] = useState<DiscordConfig | null>(null)
   const [discordHasToken, setDiscordHasToken] = useState(false)
 
@@ -39,6 +41,8 @@ export function BackendSettingsModal({ open, onClose }: Props) {
     const cfg = await window.api.ideAgentConfigGet()
     setReviewMode(cfg.reviewMode)
     setAllowBash(cfg.allowBash)
+    setAllowSubagents(cfg.allowSubagents)
+    setPreferSubagents(cfg.preferSubagents)
   }, [])
 
   const toggleReview = async () => {
@@ -51,6 +55,21 @@ export function BackendSettingsModal({ open, onClose }: Props) {
     const next = !allowBash
     setAllowBash(next)
     await window.api.ideAgentConfigSet({ allowBash: next }).catch(() => {})
+  }
+
+  const toggleAllowSubagents = async () => {
+    const next = !allowSubagents
+    setAllowSubagents(next)
+    // Turning delegation off also clears the "prefer" bias so it can't linger.
+    const patch = next ? { allowSubagents: true } : { allowSubagents: false, preferSubagents: false }
+    if (!next) setPreferSubagents(false)
+    await window.api.ideAgentConfigSet(patch).catch(() => {})
+  }
+
+  const togglePreferSubagents = async () => {
+    const next = !preferSubagents
+    setPreferSubagents(next)
+    await window.api.ideAgentConfigSet({ preferSubagents: next }).catch(() => {})
   }
 
   useEffect(() => { if (open) refresh() }, [open, refresh])
@@ -162,13 +181,16 @@ export function BackendSettingsModal({ open, onClose }: Props) {
                 try { await window.api.clearProviderKey(pid); await refresh() }
                 finally { setSavingKey(null) }
               }}
-              onSaveModels={async (models) => {
+              onSaveProvider={async (patch) => {
+                const p = settings.providers[pid]
                 await window.api.setProvider({
                   id: pid,
-                  kind: settings.providers[pid].kind,
-                  name: settings.providers[pid].name,
-                  base_url: settings.providers[pid].base_url,
-                  models,
+                  kind: p.kind,
+                  name: p.name,
+                  base_url: p.base_url,
+                  models: patch.models ?? p.models,
+                  price_in: patch.price_in,
+                  price_out: patch.price_out,
                 })
                 await refresh()
               }}
@@ -298,6 +320,62 @@ export function BackendSettingsModal({ open, onClose }: Props) {
               <span
                 className={`size-4 rounded-full bg-white shadow-sm transition-transform will-change-transform ${
                   allowBash ? 'translate-x-5' : 'translate-x-0'
+                }`}
+              />
+            </button>
+          </label>
+
+          <label className="flex items-center justify-between gap-4 cursor-pointer group mt-4">
+            <div>
+              <div className="text-xs text-zinc-200 font-medium">Allow agent to spawn sub-agents</div>
+              <div className="text-[11px] text-zinc-500 mt-0.5">
+                Lets the chat agent delegate a well-scoped sub-task to a child agent (SpawnAgent) that runs
+                autonomously and reports back — several can run in parallel. On by default.
+              </div>
+            </div>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={allowSubagents}
+              onClick={toggleAllowSubagents}
+              className={`relative w-10 h-5 rounded-full flex-shrink-0 p-0.5 flex items-center transition-colors ${
+                allowSubagents ? 'bg-emerald-600' : 'bg-zinc-700'
+              }`}
+            >
+              <span
+                className={`size-4 rounded-full bg-white shadow-sm transition-transform will-change-transform ${
+                  allowSubagents ? 'translate-x-5' : 'translate-x-0'
+                }`}
+              />
+            </button>
+          </label>
+
+          {/* Only meaningful when delegation is allowed — nested + dimmed when off. */}
+          <label
+            className={`flex items-center justify-between gap-4 mt-3 ml-4 pl-3 border-l border-zinc-800 ${
+              allowSubagents ? 'cursor-pointer group' : 'opacity-40 cursor-not-allowed'
+            }`}
+          >
+            <div>
+              <div className="text-xs text-zinc-200 font-medium">Prefer sub-agents when possible</div>
+              <div className="text-[11px] text-zinc-500 mt-0.5">
+                Bias the agent toward parallelizing work into sub-agents rather than doing it all itself.
+                Off = delegate only for large/parallel tasks. It still handles trivial edits directly.
+              </div>
+            </div>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={preferSubagents}
+              disabled={!allowSubagents}
+              onClick={togglePreferSubagents}
+              className={`relative w-10 h-5 rounded-full flex-shrink-0 p-0.5 flex items-center transition-colors ${
+                preferSubagents && allowSubagents ? 'bg-emerald-600' : 'bg-zinc-700'
+              }`}
+            >
+              <span
+                className={`size-4 rounded-full bg-white shadow-sm transition-transform will-change-transform ${
+                  preferSubagents && allowSubagents ? 'translate-x-5' : 'translate-x-0'
                 }`}
               />
             </button>
@@ -797,18 +875,43 @@ interface ProviderRowProps {
   saving: boolean
   onSaveKey: (apiKey: string) => Promise<void>
   onClearKey: () => Promise<void>
-  onSaveModels: (models: string[]) => Promise<void>
+  onSaveProvider: (patch: { models?: string[]; price_in?: number; price_out?: number }) => Promise<void>
   onDelete: () => Promise<void>
 }
 
-function ProviderRow({ id, provider, hasKey, disabled, saving, onSaveKey, onClearKey, onSaveModels, onDelete }: ProviderRowProps) {
+function ProviderRow({ id, provider, hasKey, disabled, saving, onSaveKey, onClearKey, onSaveProvider, onDelete }: ProviderRowProps) {
   const [value, setValue] = useState('')
   const [modelsText, setModelsText] = useState((provider.models ?? []).join(', '))
+  const [priceIn, setPriceIn] = useState(provider.price_in != null ? String(provider.price_in) : '')
+  const [priceOut, setPriceOut] = useState(provider.price_out != null ? String(provider.price_out) : '')
   const [expanded, setExpanded] = useState(false)
+  // Connection test / model-fetch feedback: null = idle, else a message.
+  const [testResult, setTestResult] = useState<{ ok: boolean; msg: string } | null>(null)
+  const [busy, setBusy] = useState<'test' | 'fetch' | null>(null)
   const needsKey = providerNeedsKey(provider.kind, provider.base_url)
   const dirtyModels = modelsText !== (provider.models ?? []).join(', ')
+  const dirtyPrice = priceIn !== (provider.price_in != null ? String(provider.price_in) : '') ||
+    priceOut !== (provider.price_out != null ? String(provider.price_out) : '')
 
   useEffect(() => { setModelsText((provider.models ?? []).join(', ')) }, [provider.models])
+
+  const runTest = async () => {
+    setBusy('test'); setTestResult(null)
+    try {
+      const r = await window.api.providerTest(id, value || undefined)
+      setTestResult(r.ok
+        ? { ok: true, msg: `connected${r.modelCount != null ? ` · ${r.modelCount} models` : ''}` }
+        : { ok: false, msg: r.error || 'failed' })
+    } finally { setBusy(null) }
+  }
+  const runFetchModels = async () => {
+    setBusy('fetch'); setTestResult(null)
+    try {
+      const r = await window.api.providerFetchModels(id, value || undefined)
+      if (r.ok && r.models?.length) setModelsText(r.models.join(', '))
+      else setTestResult({ ok: false, msg: r.error || 'no models returned' })
+    } finally { setBusy(null) }
+  }
 
   return (
     <div className="py-2 border-b border-zinc-800/60">
@@ -837,12 +940,25 @@ function ProviderRow({ id, provider, hasKey, disabled, saving, onSaveKey, onClea
           {saving ? '…' : 'Save'}
         </button>
         <button
+          onClick={runTest}
+          disabled={busy !== null || disabled || (needsKey && !hasKey && !value)}
+          title="Test the connection (GET /models — no tokens billed)"
+          className="px-2.5 py-1 text-xs rounded border border-zinc-700 text-zinc-300 hover:border-zinc-500 hover:text-white disabled:opacity-40"
+        >
+          {busy === 'test' ? '…' : 'Test'}
+        </button>
+        <button
           onClick={() => setExpanded((v) => !v)}
           className="px-2 py-1 text-xs rounded border border-zinc-700 text-zinc-400 hover:text-zinc-200"
         >
           {expanded ? '▴' : '▾'}
         </button>
       </div>
+      {testResult && (
+        <div className={`mt-1 pl-[148px] text-[10px] ${testResult.ok ? 'text-emerald-400' : 'text-rose-400'}`}>
+          {testResult.ok ? '✓ ' : '✗ '}{testResult.msg}
+        </div>
+      )}
       {expanded && (
         <div className="mt-2 pl-[148px] pr-1 flex flex-col gap-2">
           {provider.base_url && (
@@ -857,12 +973,46 @@ function ProviderRow({ id, provider, hasKey, disabled, saving, onSaveKey, onClea
               className="flex-1 px-2 py-1 bg-zinc-950 border border-zinc-700 rounded text-xs text-zinc-100 placeholder-zinc-600"
             />
             <button
-              onClick={() => onSaveModels(modelsText.split(',').map((s) => s.trim()).filter(Boolean))}
+              onClick={runFetchModels}
+              disabled={busy !== null || (needsKey && !hasKey && !value)}
+              title="Fetch the model list from the provider (GET /models)"
+              className="px-3 py-1 text-xs rounded border border-zinc-700 text-zinc-300 hover:border-zinc-500 hover:text-white disabled:opacity-40"
+            >
+              {busy === 'fetch' ? '…' : 'Fetch'}
+            </button>
+            <button
+              onClick={() => onSaveProvider({ models: modelsText.split(',').map((s) => s.trim()).filter(Boolean) })}
               disabled={!dirtyModels}
               className="px-3 py-1 text-xs rounded bg-blue-600 hover:bg-blue-500 disabled:bg-zinc-800 disabled:text-zinc-600 text-white"
             >
               Save models
             </button>
+          </div>
+          {/* Pricing → real numbers in the cost dashboard for custom gateways. */}
+          <div className="flex items-center gap-2">
+            <span className="text-[10px] text-zinc-500 w-24">Price /1M tok</span>
+            <input
+              type="number" step="0.01" min="0" value={priceIn}
+              onChange={(e) => setPriceIn(e.target.value)} placeholder="in $"
+              className="w-24 px-2 py-1 bg-zinc-950 border border-zinc-700 rounded text-xs text-zinc-100 placeholder-zinc-600"
+            />
+            <input
+              type="number" step="0.01" min="0" value={priceOut}
+              onChange={(e) => setPriceOut(e.target.value)} placeholder="out $"
+              className="w-24 px-2 py-1 bg-zinc-950 border border-zinc-700 rounded text-xs text-zinc-100 placeholder-zinc-600"
+            />
+            <button
+              onClick={() => onSaveProvider({
+                price_in: priceIn.trim() === '' ? 0 : Number(priceIn),
+                price_out: priceOut.trim() === '' ? 0 : Number(priceOut),
+              })}
+              disabled={!dirtyPrice}
+              className="px-3 py-1 text-xs rounded bg-blue-600 hover:bg-blue-500 disabled:bg-zinc-800 disabled:text-zinc-600 text-white"
+            >
+              Save price
+            </button>
+          </div>
+          <div className="flex items-center gap-2">
             <button
               onClick={onClearKey}
               disabled={!hasKey || disabled}
