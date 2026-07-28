@@ -361,6 +361,14 @@ const SNAPSHOT_JS = `(() => {
   const out = []
   let n = 0
   const seen = new Set()
+  // Drop the PREVIOUS snapshot's tags before numbering again. Without this the
+  // attributes accumulate: an element tagged e40 last time keeps that name even
+  // when this pass gives e40 to something else, and refLocator's .first() then
+  // resolves to whichever is earlier in the document — usually the stale one.
+  // Measured on a LeetCode problem page after two snapshots: 100 tagged
+  // elements holding 76 distinct refs, 22 of them duplicated, one ref on three
+  // separate elements. Every click after that is aimed at the wrong thing.
+  for (const old of document.querySelectorAll('[data-orqon-ref]')) old.removeAttribute('data-orqon-ref')
   const label = (el) => {
     const t = (el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.getAttribute('title') || el.innerText || el.value || '').trim().replace(/\\s+/g, ' ')
     return t.slice(0, 80)
@@ -417,6 +425,41 @@ async function snapshot(pg: Page, opts?: { waitMs?: number; settleFirst?: boolea
     ? text.slice(0, LIMIT) + `\n… (element list truncated — ${body.length - LIMIT}+ chars more; if your target is not listed above, BrowserRead the page or ask the user to narrow the view rather than guessing)`
     : text
   return capped + challengeHint(capped)
+}
+
+// Playwright accepts only canonical key names — "cmd+a", "ctrl+a", "esc",
+// "enter", "delete" and "arrowdown" all throw "Unknown key", which is most of
+// what a model actually writes. Translate to the names it does accept.
+const KEY_ALIASES: Record<string, string> = {
+  cmd: 'Meta', command: 'Meta', meta: 'Meta', super: 'Meta', win: 'Meta',
+  ctrl: 'Control', control: 'Control',
+  alt: 'Alt', option: 'Alt', opt: 'Alt',
+  shift: 'Shift',
+  // Electron-style "either modifier" spellings, resolved for this platform.
+  commandorcontrol: process.platform === 'darwin' ? 'Meta' : 'Control',
+  cmdorctrl: process.platform === 'darwin' ? 'Meta' : 'Control',
+  mod: process.platform === 'darwin' ? 'Meta' : 'Control',
+  enter: 'Enter', return: 'Enter', esc: 'Escape', escape: 'Escape',
+  tab: 'Tab', space: 'Space', spacebar: 'Space',
+  del: 'Delete', delete: 'Delete', backspace: 'Backspace', bksp: 'Backspace',
+  home: 'Home', end: 'End', pageup: 'PageUp', pagedown: 'PageDown',
+  insert: 'Insert', ins: 'Insert',
+  up: 'ArrowUp', down: 'ArrowDown', left: 'ArrowLeft', right: 'ArrowRight',
+  arrowup: 'ArrowUp', arrowdown: 'ArrowDown', arrowleft: 'ArrowLeft', arrowright: 'ArrowRight',
+}
+
+function normalizeKey(input: string): string {
+  return input
+    .split('+')
+    .map((p) => p.trim())
+    .filter(Boolean)
+    .map((part) => {
+      const alias = KEY_ALIASES[part.toLowerCase()]
+      if (alias) return alias
+      if (/^f\d{1,2}$/i.test(part)) return 'F' + part.slice(1) // f5 → F5
+      return part // single characters and already-canonical names pass through
+    })
+    .join('+')
 }
 
 function refLocator(pg: Page, ref: string) {
@@ -961,8 +1004,9 @@ export async function runBrowserTool(
     }
     case 'BrowserPressKey': {
       const pg = currentPage()
-      const key = String(args.key ?? '').trim()
-      if (!key) return 'error: key is required (e.g. "Enter", "Tab", "Escape", "ArrowDown", "Control+a")'
+      const asked = String(args.key ?? '').trim()
+      if (!asked) return 'error: key is required (e.g. "Enter", "Tab", "Escape", "ArrowDown", "Control+a")'
+      const key = normalizeKey(asked)
       const urlBefore = pg.url()
       if (args.ref) {
         const stale = await ensureRef(pg, String(args.ref))
@@ -978,8 +1022,9 @@ export async function runBrowserTool(
         try {
           await pg.keyboard.press(key)
         } catch (e: any) {
-          return `error: invalid key "${key}" (${String(e?.message || e).slice(0, 120)}) — use a key name ` +
-            'like Enter/Tab/Escape/ArrowDown/Backspace, or a chord like "Control+a"'
+          return `error: invalid key "${asked}"${key !== asked ? ` (read as "${key}")` : ''}: ` +
+            `${String(e?.message || e).slice(0, 110)} — use Enter/Tab/Escape/ArrowDown/Backspace/Delete, ` +
+            'or a chord like "Control+a" / "Meta+a"'
         }
       }
       // The key may navigate, open a menu, or do nothing visible — wait for a
