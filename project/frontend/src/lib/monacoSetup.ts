@@ -15,6 +15,7 @@ import cssWorker from 'monaco-editor/language/css/css.worker.js?worker'
 import htmlWorker from 'monaco-editor/language/html/html.worker.js?worker'
 import tsWorker from 'monaco-editor/language/typescript/ts.worker.js?worker'
 import { loader } from '@monaco-editor/react'
+import { registerDefinitionSupport } from './monacoDefinition'
 
 self.MonacoEnvironment = {
   getWorker(_workerId: string, label: string) {
@@ -27,6 +28,9 @@ self.MonacoEnvironment = {
 }
 
 loader.config({ monaco })
+
+// Peek / Go-to Definition backed by the main-process TS compiler service.
+registerDefinitionSupport(monaco)
 
 // Debug handle (harmless in prod): inspect models/editors from the devtools
 // console — the ESM build sets no global otherwise.

@@ -21,11 +21,29 @@ import {
   EXTRA_TOOL_SPECS, EXTRA_TOOL_NAMES, runExtraTool, PendingAction,
 } from './extra-tools'
 import { BROWSER_TOOL_SPECS, BROWSER_TOOL_NAMES, runBrowserTool, browserGateInfo } from './browser-tools'
+import { DOCX_TOOL_SPECS, DOCX_TOOL_NAMES, DOCX_MUTATORS, runDocxTool } from './docx-tools'
 import { buildAdapter, ProviderCfgLike } from './adapters'
 import { contextWindowFor } from './context-window'
 import * as db from './db'
 
-const MAX_TURNS = parseInt(process.env.IDE_AGENT_MAX_TURNS || '30', 10)
+// Turn count is a poor proxy for risk: to it, a long legitimate job and a stuck
+// loop look identical. The old MAX_TURNS=30 stopped real work (each tool call is
+// a turn) while protecting nothing — measured spend is ~$0.5/Mtok flat and 99.9%
+// of turns stay under 128k prompt. The loop is bounded by PROGRESS and COST
+// instead; the turn numbers below are only backstops. See agent-behavior-bug.md §6.
+//
+// Reached but NOT stopped: tells the UI this run is long so the user can decide.
+const SOFT_CHECKPOINT = parseInt(process.env.IDE_AGENT_SOFT_CHECKPOINT || '40', 10)
+// Absolute backstop so a pathological run can't go all night.
+const HARD_CEILING = parseInt(process.env.IDE_AGENT_MAX_TURNS || '400', 10)
+// Consecutive turns that produced nothing new — no successful mutation, and no
+// tool call we hadn't already made with the same arguments. A real job
+// effectively never reaches this; a stuck loop hits it in seconds.
+const MAX_UNPRODUCTIVE = parseInt(process.env.IDE_AGENT_MAX_UNPRODUCTIVE || '8', 10)
+// Cost ceiling for ONE run, USD. Not for thrift — so a loop at 2am doesn't bill
+// until morning. Providers with no price_in/price_out cost 0, so this never
+// fires for them; progress detection is the real guard there.
+const MAX_RUN_USD = parseFloat(process.env.IDE_AGENT_MAX_USD || '5')
 
 // Cap a tool result fed back to the MODEL (the UI event is capped separately).
 // Read of a big file used to inject the whole thing; a few of those and the
@@ -108,6 +126,11 @@ function looksLikeAnnouncedAction(text: string): boolean {
 
 // File-mutating tools whose success should reload the editor/file-tree.
 const FILE_CHANGED_TOOLS = new Set(['Write', 'Edit', 'MultiEdit', 'Move', 'Delete', 'NotebookEdit', 'DownloadFile'])
+
+// Every tool that changes something on disk. A successful call to one of these
+// counts as PROGRESS even when its arguments repeat (re-running a build or a
+// test after a fix is legitimate), so the no-progress detector can't punish it.
+const MUTATOR_TOOLS = new Set([...FILE_CHANGED_TOOLS, ...EXCEL_MUTATORS, ...DOCX_MUTATORS])
 
 // Review mode: Write/Edit render a diff card, but these mutators have no diff
 // to show — they gate on the Approve/Decline action card instead, so nothing
@@ -226,8 +249,10 @@ const SPAWN_AGENT_SPEC: ToolSpec = {
   description:
     'Delegate a self-contained sub-task to a child agent that runs in the background with the FULL toolset ' +
     '(read/write files, run commands, browse the web). It works autonomously and returns a summary of what it ' +
-    'did when finished. Use this to parallelize or offload a chunky, well-scoped piece of work — NOT for small ' +
-    'things you can just do yourself. Give it a clear, complete task description; it does not see this conversation.',
+    'did when finished. Use this to parallelize or offload a chunky, well-scoped piece of work — e.g. exploring, ' +
+    'reading, mapping or auditing a large area of the codebase, or a multi-file migration — NOT for small things ' +
+    'you can just do yourself. To cover a whole repo, spawn several IN ONE turn, one per top-level area, and ' +
+    'synthesize their summaries. Give it a clear, complete task description; it does not see this conversation.',
   input_schema: {
     type: 'object',
     properties: {
@@ -306,6 +331,7 @@ const TOOL_GROUPS: Record<string, ToolSpec[]> = {
   memory: pickExtra(['RememberNote', 'RecallNotes']),
   background: pickExtra(['BashBackground', 'BashOutput', 'BashInput', 'KillBash']),
   excel: EXCEL_TOOL_SPECS,
+  docx: DOCX_TOOL_SPECS,
   browser: BROWSER_TOOL_SPECS,
 }
 const GROUP_BLURBS: Record<string, string> = {
@@ -315,6 +341,7 @@ const GROUP_BLURBS: Record<string, string> = {
   memory: 'memory (remember/recall notes across sessions)',
   background: 'background (run/monitor/kill long-running commands)',
   excel: 'excel (create/read/edit .xlsx: sheets, ranges, formulas, formatting)',
+  docx: 'docx (edit .docx live in the IDE, preserving layout: outline/inspect/read, replace/insert/delete paragraphs, run+paragraph formatting, styles, images, tab-stops + column alignment for forms, tables. ALWAYS DocxOutline first — everything targets a paragraph by its ¶index)',
   browser: 'browser (drive a real page inside the IDE: open/click/type/read console+text — ideal for testing localhost apps and reading JS-rendered sites)',
 }
 const LOAD_GROUP_SPEC: ToolSpec = {
@@ -358,6 +385,12 @@ export interface IdeAgentParams {
   // Opt-in capabilities (resolved from config in main before the run).
   allowBash?: boolean
   orchestrationEnabled?: boolean
+  // Whether the top-level chat agent may delegate to child sub-agents via
+  // SpawnAgent. Resolved from ide_agent_config in main; default ON.
+  allowSubagents?: boolean
+  // When sub-agents are allowed, bias the agent toward parallelizing work into
+  // sub-agents rather than doing it all sequentially itself. Default OFF.
+  preferSubagents?: boolean
   // Plan mode: read-only investigation, then present a plan (no file writes).
   planMode?: boolean
   // Research mode: read-only deep investigation (web + code) → cited answer.
@@ -404,6 +437,19 @@ export interface EditorResponse {
   result: string
 }
 
+// Why a run ended. Every terminal path carries one — a run that stopped for a
+// reason the user did not choose used to look identical to a completed one
+// ("Agent finished" with no explanation). See agent-behavior-bug.md §5.
+export type StopReason =
+  | 'completed'         // the model had nothing left to do
+  | 'no_progress'       // MAX_UNPRODUCTIVE turns with nothing new — likely a loop
+  | 'budget'            // run cost passed MAX_RUN_USD
+  | 'hard_ceiling'      // HARD_CEILING turns
+  | 'empty_response'    // provider returned nothing after retries (dropped stream)
+  | 'nudge_exhausted'   // model kept announcing an action without calling a tool
+  | 'user_stopped'      // the user pressed Stop
+  | 'parent_stopped'    // this is a sub-agent and its parent was stopped
+
 export type IdeAgentEvent =
   | { type: 'reasoning'; delta: string; turn: number }
   | { type: 'token'; delta: string; turn: number }
@@ -418,7 +464,9 @@ export type IdeAgentEvent =
   | { type: 'context'; used: number; window: number; turn: number }
   | { type: 'blocked'; reason: string; turns: number }
   | { type: 'plan'; plan: string; turns: number }
-  | { type: 'done'; text: string; turns: number }
+  | { type: 'done'; text: string; turns: number; reason: StopReason }
+  // Non-terminal: the run passed SOFT_CHECKPOINT turns and is STILL GOING.
+  | { type: 'checkpoint'; turns: number; costUsd: number }
   | { type: 'error'; error: string }
   // A child agent was spawned this turn: the renderer renders a nested card and
   // subscribes to ai-agent-event:<childRunId> for its live transcript.
@@ -452,7 +500,7 @@ function estimateCostUsd(tokensIn: number, tokensOut: number, rates: [number, nu
   return (tokensIn * inRate + tokensOut * outRate) / 1_000_000
 }
 
-function buildSystemPrompt(params: IdeAgentParams, workspaceRoot: string, opts?: { canSpawn?: boolean }): string {
+function buildSystemPrompt(params: IdeAgentParams, workspaceRoot: string, opts?: { canSpawn?: boolean; preferSubagents?: boolean }): string {
   const isSubAgent = Boolean(params.subAgentDepth && params.subAgentDepth > 0)
   const editorLine = isSubAgent
     ? '' // sub-agents don't drive the user's editor; they write to disk directly
@@ -472,10 +520,24 @@ function buildSystemPrompt(params: IdeAgentParams, workspaceRoot: string, opts?:
     'You have TodoWrite to track a plan. ' +
     'Extra tool groups are NOT loaded by default (to save context): git (status/diff/commit/' +
     'push/branch/checkout/config/account), github (PRs & issues), web (WebFetch, WebSearch), ' +
-    'memory (remember/recall notes), background (long-running commands), and browser (drive a ' +
+    'memory (remember/recall notes), background (long-running commands), browser (drive a ' +
     'real page inside the IDE — open/click/type/read console; ideal for testing the localhost ' +
-    'app you are building and reading JS-rendered sites). When the task ' +
+    'app you are building and reading JS-rendered sites), and docx (edit Word .docx files live ' +
+    'in the IDE, preserving/upgrading layout). When the task ' +
     'needs one, call LoadToolGroup(group) FIRST to enable it, then call its tools. ' +
+    'For a .docx: LoadToolGroup("docx"), then ALWAYS call DocxOutline first to get each ' +
+    'paragraph\'s ¶index/style — every docx edit targets a paragraph by that index. ALWAYS edit ' +
+    'a .docx with the Docx* tools — NEVER unzip/edit/repack it by hand with Bash (that corrupts ' +
+    'the file and the live viewer will not update). You cannot SEE the rendered page, so use ' +
+    'DocxInspect to read the real structure (it shows tabs as →, tab stops, indent, and each ' +
+    'run\'s formatting) before and after formatting changes — DocxReadText only gives plain text. ' +
+    'To line up "label: value" rows (e.g. a form/contract) so the colons or values align, use ' +
+    'DocxAlignColumns — do NOT add or remove spaces (spaces never align in a proportional font; ' +
+    'Word aligns with tab stops). For real tabular data use DocxInsertTable/DocxSetCell. Prefer ' +
+    'format-preserving edits (DocxFormatRun/DocxFormatParagraph/DocxApplyStyle) and keep or ' +
+    'improve existing styling rather than flattening it. To add an image, find it with the web ' +
+    'group, DownloadFile it into the workspace, then DocxInsertImage. The user watches every ' +
+    'edit render live, so make focused, ordered changes. ' +
     'If a browser page shows a CAPTCHA or login wall, do NOT retry or try to bypass it — tell ' +
     'the user to complete it by hand in the browser tab, then continue. ' +
     'Every browser action (open/navigate/click/type) returns a fresh "CURRENT PAGE" snapshot ' +
@@ -489,11 +551,23 @@ function buildSystemPrompt(params: IdeAgentParams, workspaceRoot: string, opts?:
     'tool and the user will approve or decline. ' +
     (isSubAgent ? '' : 'Open the relevant file with OpenFile so the user can follow along. ') +
     (opts?.canSpawn
-      ? 'For large or parallelizable work, you can delegate a well-scoped sub-task to a child agent with ' +
-        'SpawnAgent(task, label) — it runs autonomously with the full toolset and returns a summary. Do NOT ' +
-        'delegate trivial things you can just do yourself. To run several sub-agents AT THE SAME TIME, emit ' +
-        'multiple SpawnAgent tool calls IN ONE turn (they execute in parallel); if the user asks for N agents, ' +
-        'make N SpawnAgent calls in that single turn. Give each a narrow, specific task — never "the whole workspace". '
+      ? (opts.preferSubagents
+          ? 'PREFER delegating to child sub-agents: whenever a task splits into independent parts, spawn a ' +
+            'sub-agent per part instead of doing them yourself sequentially. In particular, to READ, MAP, ' +
+            'UNDERSTAND or AUDIT a whole repo or many files, do NOT read it all yourself — split the codebase by ' +
+            'top-level area/directory and spawn ONE sub-agent per area to explore and report back, then synthesize ' +
+            'their summaries. Use SpawnAgent(task, label) — each runs autonomously with the full toolset and returns ' +
+            'a summary. To run several AT THE SAME TIME, emit multiple SpawnAgent tool calls IN ONE turn (they ' +
+            'execute in parallel); if the user asks for N agents, make N SpawnAgent calls in that single turn. Give ' +
+            'each a narrow, specific task — never "the whole workspace". Still do a single trivial edit yourself. '
+          : 'For large or parallelizable work, delegate a well-scoped sub-task to a child agent with ' +
+            'SpawnAgent(task, label) — it runs autonomously with the full toolset and returns a summary. Reading, ' +
+            'mapping or auditing a whole repo or many files is a good fit: split by area and spawn one sub-agent per ' +
+            'area rather than reading it all yourself. Do NOT delegate trivial things you can just do yourself. To ' +
+            'run several sub-agents AT THE SAME TIME, emit multiple SpawnAgent tool calls IN ONE turn (they execute ' +
+            'in parallel); if the user asks for N agents, make N SpawnAgent calls in that single turn. Give each a ' +
+            'narrow, specific task — never "the whole workspace". ') +
+        'If the user explicitly asks you to use or spawn sub-agents, do so — even for work you could do yourself. '
       : '') +
     'Work autonomously: inspect the code with Read/Grep/Glob before changing it, make ' +
     'the smallest correct edit, and prefer Edit over Write for existing files. ' +
@@ -572,6 +646,13 @@ export async function runIdeAgent(
   // Every terminal path below ends with a non-token event (done/error/
   // blocked/plan), which flushes any buffered text first.
   const emit = coalesceEmit(emitRaw)
+  // Hoisted out of the try so the catch can report a clean stop instead of a
+  // failure: an abort that lands INSIDE the in-flight request surfaces as a
+  // thrown AbortError, not as a signal check between turns.
+  const isSubAgent = Boolean(params.subAgentDepth && params.subAgentDepth > 0)
+  const abortReason: StopReason = isSubAgent ? 'parent_stopped' : 'user_stopped'
+  let finalText = ''
+  let turns = 0
   try {
     const providers = loadProviders(sharedDir)
     const pc = providers[params.provider]
@@ -592,10 +673,11 @@ export async function runIdeAgent(
 
     const allowBash = Boolean(params.allowBash)
     const orchestrationEnabled = Boolean(params.orchestrationEnabled && orchestrationBridge)
-    const isSubAgent = Boolean(params.subAgentDepth && params.subAgentDepth > 0)
     // Top-level chat agent can delegate to child agents; sub-agents cannot
-    // (depth cap). Gated on the same orchestration opt-in.
-    const canSpawn = orchestrationEnabled && !isSubAgent && Boolean(orchestrationBridge?.spawnSubAgent)
+    // (depth cap). Gated on its own "allow sub-agents" setting (default on),
+    // independent of the headless group-orchestration toggle.
+    const canSpawn =
+      params.allowSubagents !== false && !isSubAgent && Boolean(orchestrationBridge?.spawnSubAgent)
     const toolOpts: ToolSetOpts = { allowBash, orchestrationEnabled, isSubAgent, canSpawn }
     const contextWindow = contextWindowFor(model, pc)
     const planMode = Boolean(params.planMode)
@@ -613,21 +695,35 @@ export async function runIdeAgent(
     }
     let adapter = buildAdapter(pc, key, model, activeSpecs)
     const loadedGroups = new Set<string>()
-    const system = buildSystemPrompt(params, workspaceRoot, { canSpawn })
+    const system = buildSystemPrompt(params, workspaceRoot, {
+      canSpawn,
+      preferSubagents: canSpawn && Boolean(params.preferSubagents),
+    })
     // Seed the conversation with the prior chat turns (user + assistant text).
     const messages: unknown[] = params.messages.map((m) => ({ role: m.role, content: m.content }))
 
-    let finalText = ''
-    let turns = 0
-    let anyActivity = false // any tool call ran this run
     let lengthContinues = 0 // auto-continuations after hitting the output cap
     let intentNudges = 0    // "you said you'd do it — call the tool" nudges
     let continuing = false  // this turn continues a capped reply
     let browserApproved = false // approve-once: driving the browser beyond localhost
+    // ── bounds that replaced the turn cap (see the constants at the top) ──
+    let runCostUsd = 0        // accumulated spend for THIS run
+    let unproductive = 0      // consecutive turns that produced nothing new
+    // `${name}:${args}` → fingerprint of what it returned last time. A repeat
+    // call whose OUTPUT changed still counts as progress: polling a background
+    // job with BashOutput, or re-running a test after a fix, are both
+    // legitimate and must not read as a stuck loop.
+    const toolResults = new Map<string, string>()
+    // Every terminal path goes through here so none can forget its reason.
+    const finish = (reason: StopReason): void => {
+      emit({ type: 'done', text: finalText, turns, reason })
+    }
 
-    for (let i = 0; i < MAX_TURNS; i++) {
-      if (signal.aborted) { emit({ type: 'error', error: 'cancelled' }); return }
+    for (let i = 0; i < HARD_CEILING; i++) {
+      if (signal.aborted) { finish(abortReason); return }
       const turn = turns
+      // Nothing new counts until a tool call this turn proves otherwise.
+      let turnProductive = false
 
       // Call the provider with retries. Two failure modes we recover from, as
       // long as nothing has streamed yet this turn (retrying after partial
@@ -670,15 +766,23 @@ export async function runIdeAgent(
       turns++
 
       // Record cost under a virtual role so it shows in the dashboard.
+      const turnCostUsd = estimateCostUsd(usage.input, usage.output, rates)
+      runCostUsd += turnCostUsd
       db.addUsage({
         ts: nowStamp(),
         role: 'ide-agent',
         model,
         tokens_in: usage.input,
         tokens_out: usage.output,
-        cost_usd: estimateCostUsd(usage.input, usage.output, rates),
+        cost_usd: turnCostUsd,
         task_id: null,
       })
+
+      // Long run: tell the UI, keep working. This is the SOFT bound — it exists
+      // so a long job is visible, not so it gets cut off.
+      if (turns === SOFT_CHECKPOINT) emit({ type: 'checkpoint', turns, costUsd: runCostUsd })
+      // Hard cost backstop. Only reachable when the provider declares pricing.
+      if (MAX_RUN_USD > 0 && runCostUsd > MAX_RUN_USD) { finish('budget'); return }
 
       // Report context fill: prompt tokens this turn = current context size.
       if (usage.input > 0) {
@@ -717,27 +821,33 @@ export async function runIdeAgent(
         // The model ANNOUNCED an action ("I'll now fix X:") but called no tool
         // and ended its turn — without a nudge the run would just stop there.
         // Push it to execute; bounded so a chatty model can't loop forever.
-        if (!capped && t && looksLikeAnnouncedAction(t) && intentNudges < 2 && !signal.aborted) {
-          intentNudges++
-          messages.push(assistantMsg)
-          messages.push({
-            role: 'user',
-            content:
-              'You announced an action but did not call any tool — the turn ended with words only. ' +
-              'CALL the tool(s) directly now to actually do it; do not re-describe the action. ' +
-              'If the task is already fully complete, reply with only the final summary.',
-          })
-          continue
-        }
-        // Still empty after retries, nothing streamed, no tools ever ran →
-        // surface it instead of silently ending the run with no reply at all.
-        if (!finalText && !streamedThisTurn && !anyActivity) {
-          emit({ type: 'error', error: 'provider returned an empty response (stream dropped) — please send again' })
+        if (!capped && t && looksLikeAnnouncedAction(t)) {
+          if (intentNudges < 2 && !signal.aborted) {
+            intentNudges++
+            messages.push(assistantMsg)
+            messages.push({
+              role: 'user',
+              content:
+                'You announced an action but did not call any tool — the turn ended with words only. ' +
+                'CALL the tool(s) directly now to actually do it; do not re-describe the action. ' +
+                'If the task is already fully complete, reply with only the final summary.',
+            })
+            continue
+          }
+          // Nudged twice and it STILL only narrated. Ending as a plain 'done'
+          // here is what made an opening line ("I'll map that tree now.") look
+          // like a delivered result. See agent-behavior-bug.md §2.
+          finish('nudge_exhausted')
           return
         }
-        break
+        // Nothing came back at all this turn, after the retries above. The old
+        // guard also required !anyActivity — so in a LONG session (where tools
+        // had already run) a dropped stream fell through to `break` and
+        // reported the PREVIOUS turn's text as a finished answer. See §5, đường 2.
+        if (!text && !streamedThisTurn) { finish('empty_response'); return }
+        finish('completed')
+        return
       }
-      anyActivity = true
 
       const reviewOn = Boolean(params.reviewMode && requestReview)
       const results: string[] = []
@@ -758,8 +868,15 @@ export async function runIdeAgent(
         return approved
       }
       for (const call of toolCalls) {
-        if (signal.aborted) { emit({ type: 'error', error: 'cancelled' }); return }
+        if (signal.aborted) { finish(abortReason); return }
         const callId = call.id || `${call.name}-${Date.now()}`
+        // Progress accounting: a call we have NOT already made with these exact
+        // arguments is new information. Repeating one — and getting the same
+        // answer back — is what a stuck loop does. Args are clamped so a single
+        // huge payload can't bloat the map.
+        const sig = `${call.name}:${JSON.stringify(call.args ?? {}).slice(0, 512)}`
+        const seenSig = toolResults.has(sig)
+        if (!seenSig) turnProductive = true
         emit({ type: 'tool_call', callId, name: call.name, args: call.args })
 
         // The call's argument JSON arrived truncated/malformed (output cap or
@@ -863,6 +980,32 @@ export async function runIdeAgent(
           }
         }
 
+        // Office files must go through their own tool family. A Bash edit
+        // (python-docx, unzip/rezip) silently flattens every run in the
+        // paragraph it touches — verified on a real contract, a run carrying
+        // b/i/sz=26/Times New Roman came back with NO formatting at all, and
+        // the command still reported success. Bash is a core tool while Docx*/
+        // Excel* need LoadToolGroup, so the model takes the shortcut unless it
+        // is closed. Telling it not to in the system prompt did not work.
+        // See agent-behavior-bug.md §7.
+        if (call.name === 'Bash') {
+          const cmd = String((call.args as { command?: string }).command || '')
+          const touchesOffice = /\.(docx|xlsx|pptx)\b/i.test(cmd)
+          // Only block commands that could WRITE — ls/cp/stat on a .docx stay fine.
+          const mutates = /\b(python3?|unzip|zip|sed|perl|awk|mv|rm|truncate|dd|tee)\b/i.test(cmd)
+            || />>?\s*\S*\.(docx|xlsx|pptx)\b/i.test(cmd)
+          if (touchesOffice && mutates) {
+            const r =
+              'error: refusing to modify an Office file from Bash — it destroys the formatting of every ' +
+              'paragraph it touches (python-docx\'s `para.text = …` deletes all runs) and the live viewer ' +
+              'will not refresh. Use LoadToolGroup("docx") then the Docx* tools for .docx, or ' +
+              'LoadToolGroup("excel") then the Excel* tools for .xlsx. Call DocxOutline first.'
+            results.push(r)
+            emit({ type: 'tool_result', callId, name: call.name, result: r, isError: true })
+            continue
+          }
+        }
+
         // Review mode: mutators without a diff card ask via Approve/Decline.
         if (reviewOn && (REVIEW_CONFIRM_TOOLS.has(call.name) || EXCEL_MUTATORS.has(call.name))) {
           const detail = call.name === 'Bash'
@@ -883,7 +1026,7 @@ export async function runIdeAgent(
         if (call.name === 'SpawnAgent') {
           const a = call.args as { task?: string; label?: string }
           if (!canSpawn || !orchestrationBridge?.spawnSubAgent) {
-            const denied = 'error: SpawnAgent is unavailable — enable orchestration in Backend Settings'
+            const denied = 'error: SpawnAgent is unavailable — enable "Allow agent to spawn sub-agents" in Backend Settings'
             results.push(denied)
             emit({ type: 'tool_result', callId, name: call.name, result: denied, isError: true })
           } else if (!a.task?.trim()) {
@@ -891,7 +1034,6 @@ export async function runIdeAgent(
             results.push(denied)
             emit({ type: 'tool_result', callId, name: call.name, result: denied, isError: true })
           } else {
-            anyActivity = true
             const index = results.length
             results.push('') // placeholder; filled once the child finishes
             const promise = orchestrationBridge.spawnSubAgent({ task: a.task, label: a.label })
@@ -908,6 +1050,7 @@ export async function runIdeAgent(
         const isOrchTool = ORCH_TOOL_NAMES.has(call.name)
         const isExtraTool = EXTRA_TOOL_NAMES.has(call.name)
         const isExcelTool = EXCEL_TOOL_NAMES.has(call.name)
+        const isDocxTool = DOCX_TOOL_NAMES.has(call.name)
         const isBrowserTool = BROWSER_TOOL_NAMES.has(call.name)
 
         if (isBrowserTool) {
@@ -929,6 +1072,22 @@ export async function runIdeAgent(
             isError = true
           }
           if (!isError && EXCEL_MUTATORS.has(call.name)) {
+            const rel = (call.args as { path?: string }).path
+            if (rel) emit({ type: 'file_changed', path: rel })
+          }
+        } else if (isDocxTool) {
+          // Docx tools are async (jszip + xmldom) → dispatched like Excel. A
+          // mutating op emits file_changed so the live DocxViewer re-renders,
+          // letting the user watch the edit land step by step.
+          try {
+            const r = await runDocxTool(workspaceRoot, call.name, call.args)
+            result = r == null ? `error: unknown tool ${call.name}` : r
+            isError = result.startsWith('error:')
+          } catch (e: any) {
+            result = `error: ${e?.message || e}`
+            isError = true
+          }
+          if (!isError && DOCX_MUTATORS.has(call.name)) {
             const rel = (call.args as { path?: string }).path
             if (rel) emit({ type: 'file_changed', path: rel })
           }
@@ -1004,7 +1163,19 @@ export async function runIdeAgent(
             const rel = a.path || a.to
             if (rel) emit({ type: 'file_changed', path: rel })
           }
+          // A shell command can write anything and we cannot know what. An
+          // empty path means "re-read every live surface" — cheaper than
+          // leaving the editor and the docx viewer showing stale content.
+          if (!isError && call.name === 'Bash') emit({ type: 'file_changed', path: '' })
         }
+
+        // A successful mutation is progress even when its arguments repeat.
+        if (!isError && MUTATOR_TOOLS.has(call.name)) turnProductive = true
+        // Same call, different answer → the world moved (a background job
+        // produced new output, a test now passes). Still progress.
+        const fingerprint = `${result.length}:${result.slice(0, 120)}`
+        if (seenSig && toolResults.get(sig) !== fingerprint) turnProductive = true
+        if (toolResults.size < 5000) toolResults.set(sig, fingerprint)
 
         // Cap what goes back to the model — a single huge result (full-file
         // Read, big command output) could blow the context for the whole run.
@@ -1031,11 +1202,27 @@ export async function runIdeAgent(
       // turn until the 80% emergency brake. The trim is deterministic, so the
       // already-trimmed prefix stays byte-stable for provider prompt caches.
       trimOldToolResults(messages, 8)
+
+      // No-progress detection — the actual replacement for the turn cap. Only
+      // turns that DID call tools reach here (a turn without tool calls always
+      // returns above), so this counts consecutive tool-turns that produced
+      // nothing new: the exact shape of a stuck loop.
+      if (turnProductive) unproductive = 0
+      else if (++unproductive >= MAX_UNPRODUCTIVE) { finish('no_progress'); return }
     }
 
-    emit({ type: 'done', text: finalText, turns })
+    finish('hard_ceiling')
   } catch (e: any) {
-    emit({ type: 'error', error: e?.message || String(e) })
+    const msg = e?.message || String(e)
+    // Stop pressed while a request was in flight: fetch rejects with an
+    // AbortError that is NOT transient, so it propagates here. That is a
+    // deliberate stop, not a failure — reporting it as an error made a
+    // cancelled sub-agent look like a crashed one.
+    if (signal.aborted || e?.name === 'AbortError' || /\baborted\b/i.test(msg)) {
+      emit({ type: 'done', text: finalText, turns, reason: abortReason })
+      return
+    }
+    emit({ type: 'error', error: msg })
   }
 }
 

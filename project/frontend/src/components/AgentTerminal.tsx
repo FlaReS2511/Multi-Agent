@@ -19,6 +19,11 @@ export function AgentTerminal({ agent, active }: Props) {
   const fitRef = useRef<FitAddon | null>(null)
   const [alive, setAlive] = useState<boolean | null>(null)
   const [starting, setStarting] = useState(false)
+  // Once the terminal has been mounted for a live session, keep it mounted even
+  // after the agent dies so its final output (including the crash message)
+  // stays readable instead of being torn down within one poll cycle.
+  const [hasMounted, setHasMounted] = useState(false)
+  const shown = alive === true || hasMounted
   // Hidden terminals don't parse/render output — chunks buffer here and flush
   // in one write when the terminal is shown again.
   const activeRef = useRef(active)
@@ -42,9 +47,12 @@ export function AgentTerminal({ agent, active }: Props) {
     }
   }, [agent])
 
-  // Mount xterm + attach (no spawn) when agent is alive.
+  // Mount xterm + attach (no spawn) once shown. Keyed on `shown` (not `alive`)
+  // so a dying agent doesn't tear the terminal down — the still-live onPtyData
+  // subscription keeps appending, and a Restart reuses this same instance.
   useEffect(() => {
-    if (!alive || !containerRef.current) return
+    if (!shown || !containerRef.current || termRef.current) return
+    setHasMounted(true)
 
     const term = new Terminal({
       cursorBlink: true,
@@ -141,7 +149,7 @@ export function AgentTerminal({ agent, active }: Props) {
       termRef.current = null
       fitRef.current = null
     }
-  }, [agent, alive])
+  }, [agent, shown])
 
   // When this terminal becomes active: flush buffered output, upgrade to the
   // GPU renderer, refit & focus.
@@ -176,7 +184,8 @@ export function AgentTerminal({ agent, active }: Props) {
     }
   }
 
-  if (alive === null) {
+  // Still checking, and never mounted → spinner.
+  if (alive === null && !hasMounted) {
     return (
       <div className="h-full w-full bg-zinc-950 flex items-center justify-center">
         <span className="text-xs text-zinc-600">Checking session…</span>
@@ -184,7 +193,8 @@ export function AgentTerminal({ agent, active }: Props) {
     )
   }
 
-  if (!alive) {
+  // Never ran in this view → the Start placeholder.
+  if (!shown) {
     return (
       <div className="h-full w-full bg-zinc-950 flex flex-col items-center justify-center gap-3">
         <div className="text-xs text-zinc-500">
@@ -205,8 +215,25 @@ export function AgentTerminal({ agent, active }: Props) {
     )
   }
 
+  // Mounted: keep the terminal (and its final output) on screen. When the agent
+  // has exited, overlay a slim banner with Restart instead of unmounting.
   return (
-    <div className="h-full w-full bg-zinc-950">
+    <div className="h-full w-full bg-zinc-950 relative">
+      {alive === false && (
+        <div className="absolute top-0 left-0 right-0 z-10 flex items-center gap-2 px-3 py-1 bg-rose-950/70 border-b border-rose-500/30 backdrop-blur-sm">
+          <span className="size-1.5 rounded-full bg-rose-400 flex-shrink-0" />
+          <span className="text-[11px] text-rose-200 flex-1">
+            <span className="font-mono">{agent}</span> exited — output kept below
+          </span>
+          <button
+            onClick={onStart}
+            disabled={starting}
+            className="text-[11px] font-medium px-2 py-0.5 rounded bg-rose-600 hover:bg-rose-500 disabled:opacity-60 text-white"
+          >
+            {starting ? 'Restarting…' : 'Restart'}
+          </button>
+        </div>
+      )}
       <div ref={containerRef} className="h-full w-full p-2" />
     </div>
   )

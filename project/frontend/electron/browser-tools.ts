@@ -63,11 +63,23 @@ export const BROWSER_TOOL_SPECS: ToolSpec[] = [
   },
   {
     name: 'BrowserType',
-    description: 'Type text into the input with the given ref from the last BrowserSnapshot. submit=true presses Enter afterwards.',
+    description: 'Type text into the input with the given ref from the last BrowserSnapshot. submit=true presses Enter afterwards. Escalates through several input methods automatically (including rich-text editors and React-controlled fields) and VERIFIES the text actually landed — if it returns an error, nothing was typed, so pick a different ref instead of assuming it worked. Pass text="" to clear the field.',
     input_schema: {
       type: 'object',
       properties: { ref: { type: 'string' }, text: { type: 'string' }, submit: { type: 'boolean' } },
       required: ['ref', 'text'],
+    },
+  },
+  {
+    name: 'BrowserPressKey',
+    description: 'Press a key on the page: "Enter", "Tab", "Escape", "Backspace", "ArrowDown", or a chord like "Control+a". Pass ref to focus that element first (from the last BrowserSnapshot); without ref the key goes to whatever is currently focused. Use for dropdowns, modals, and multi-step forms that BrowserClick/BrowserType cannot drive.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        key: { type: 'string' },
+        ref: { type: 'string', description: 'element to focus before pressing (optional)' },
+      },
+      required: ['key'],
     },
   },
   {
@@ -475,6 +487,135 @@ async function pointAt(pg: Page, loc: ReturnType<Page['locator']>, click: boolea
   } catch { /* cursor is decoration only — never block the real action */ }
 }
 
+// ── typing: escalation ladder ────────────────────────────────────
+// fill() alone loses to contenteditable editors (Draft/Slate/ProseMirror/
+// CodeMirror), React-controlled inputs behind a custom widget, and IME fields.
+// The previous code fell back exactly once and swallowed BOTH failures with
+// `.catch(() => {})`, so a field that never received a character still returned
+// an ordinary snapshot and the agent moved on believing it had typed. Every
+// rung below is verified by reading the value back, and the tool now fails
+// loudly instead of lying.
+
+// What the field currently holds. contenteditable has no .value, so fall back
+// to textContent.
+async function readFieldText(loc: ReturnType<Page['locator']>): Promise<string> {
+  try {
+    return String(await loc.evaluate((el: any) => el.value ?? el.textContent ?? ''))
+  } catch {
+    return '' // detached / unreadable — treat as "nothing landed"
+  }
+}
+
+// Did `want` actually land? Widgets reformat while you type (phone numbers,
+// dates, currency), so compare on a prefix and ignore whitespace differences.
+function textLanded(got: string, want: string): boolean {
+  if (want === '') return got.trim() === ''
+  const squash = (s: string) => s.replace(/\s+/g, '')
+  const probe = want.slice(0, 12)
+  return got.includes(probe) || squash(got).includes(squash(probe))
+}
+
+// Is this page our embedded view (as opposed to an attached external browser)?
+// Only the embedded one can be driven through Electron's own webContents API.
+function onIdeView(pg: Page): boolean {
+  return pg === idePage && !!view && !view.webContents.isDestroyed()
+}
+
+// Rung 4 — insert BELOW the JS layer, at the browser's own input pipeline.
+// Embedded view: Electron's webContents API. External Chrome/Edge: a raw CDP
+// session. Neither emits keydown/keyup — they place text into whatever holds
+// focus, which is what reaches editors the Playwright rungs cannot touch.
+async function lowLevelInsert(pg: Page, text: string): Promise<void> {
+  if (onIdeView(pg)) {
+    view!.webContents.focus() // sendInputEvent/insertText need a focused contents
+    await view!.webContents.insertText(text)
+    return
+  }
+  const cdp = await pg.context().newCDPSession(pg)
+  try {
+    await cdp.send('Input.insertText', { text })
+  } finally {
+    await cdp.detach().catch(() => { /* session dies with the page anyway */ })
+  }
+}
+
+// Rung 4b — synthesize one `char` event per character. Slower, but it is the
+// only rung that reaches widgets listening for keypress/textInput rather than
+// for input. Capped: this costs a round-trip per character.
+const CHAR_RUNG_MAX = 200
+async function lowLevelChars(pg: Page, text: string): Promise<void> {
+  if (text.length > CHAR_RUNG_MAX) throw new Error('too long for char-by-char injection')
+  if (onIdeView(pg)) {
+    view!.webContents.focus()
+    for (const ch of text) {
+      view!.webContents.sendInputEvent({ type: 'char', keyCode: ch })
+      await pg.waitForTimeout(4)
+    }
+    return
+  }
+  const cdp = await pg.context().newCDPSession(pg)
+  try {
+    for (const ch of text) await cdp.send('Input.dispatchKeyEvent', { type: 'char', text: ch })
+  } finally {
+    await cdp.detach().catch(() => { /* ignore */ })
+  }
+}
+
+// Walk the rungs until the text is verifiably in the field. Returns which rung
+// worked (null = none did) plus everything tried, for the error message.
+async function typeIntoField(
+  pg: Page,
+  loc: ReturnType<Page['locator']>,
+  text: string,
+): Promise<{ via: string | null; tried: string[] }> {
+  // Focus is best-effort on the lower rungs: they insert into whatever is
+  // focused, so a click that misses is survivable but worth attempting.
+  const focus = () => loc.click({ force: true, timeout: 2500 }).catch(() => { /* best effort */ })
+  const external = !onIdeView(pg)
+
+  const rungs: [string, () => Promise<void>][] = [
+    // 1 — proper input events; handles React's patched value descriptor.
+    ['fill', async () => { await loc.fill(text, { timeout: 4000 }) }],
+    // 2 — real key events, for fields that only react to keydown.
+    ['type', async () => {
+      await loc.click({ timeout: 2500 })
+      await loc.clear({ timeout: 1500 }).catch(() => { /* nothing to clear */ })
+      await pg.keyboard.type(text, { delay: 12 })
+    }],
+    // 3 — CDP Input.insertText through playwright: contenteditable + IME.
+    ['insertText', async () => { await focus(); await pg.keyboard.insertText(text) }],
+    // 4 — below JS. On an EXTERNAL browser this is the same CDP call rung 3
+    // already made, so it is skipped there and we go straight to char events.
+    ...(external
+      ? []
+      : ([['lowlevel', async () => { await focus(); await lowLevelInsert(pg, text) }]] as [string, () => Promise<void>][])),
+    // 4b — per-character char events (keypress/textInput listeners).
+    ['chars', async () => { await focus(); await lowLevelChars(pg, text) }],
+    // 5 — last resort: write through the native setter React patched over, then
+    // announce it. The most synthetic rung, so it goes last.
+    ['nativeSet', async () => {
+      await loc.evaluate((el: any, t: string) => {
+        const proto = el instanceof HTMLTextAreaElement
+          ? HTMLTextAreaElement.prototype
+          : HTMLInputElement.prototype
+        const set = Object.getOwnPropertyDescriptor(proto, 'value')?.set
+        if (set && 'value' in el) set.call(el, t)
+        else el.textContent = t
+        el.dispatchEvent(new Event('input', { bubbles: true }))
+        el.dispatchEvent(new Event('change', { bubbles: true }))
+      }, text)
+    }],
+  ]
+
+  const tried: string[] = []
+  for (const [name, run] of rungs) {
+    try { await run() } catch { /* rung failed outright — escalate */ }
+    tried.push(name)
+    if (textLanded(await readFieldText(loc), text)) return { via: name, tried }
+  }
+  return { via: null, tried }
+}
+
 // ── external browser launch (phase 2) ───────────────────────────
 
 async function cdpAlive(port: number): Promise<boolean> {
@@ -600,22 +741,63 @@ export async function runBrowserTool(
       const stale = await ensureRef(pg, String(args.ref))
       if (stale) return stale
       const loc = refLocator(pg, String(args.ref))
+      const text = String(args.text ?? '')
       const urlBefore = pg.url()
       await pointAt(pg, loc, false) // glide the virtual cursor to the field
-      try {
-        await loc.fill(String(args.text ?? ''), { timeout: 5000 })
-      } catch {
-        // Some inputs reject fill() (contenteditable, custom widgets) — focus
-        // and type key-by-key instead.
-        await loc.click({ force: true, timeout: 3000 }).catch(() => {})
-        await loc.pressSequentially(String(args.text ?? ''), { timeout: 5000 }).catch(() => {})
+      const { via, tried } = await typeIntoField(pg, loc, text)
+      if (!via) {
+        const snap = await snapshot(pg, { after: `typing into ${args.ref} FAILED — the field is unchanged` })
+        return `error: could not type into ${args.ref}; every input method failed (tried: ${tried.join(' → ')}) ` +
+          'and the field still does not contain the text. It may be disabled/readonly, a custom editor that ' +
+          'ignores injected input, or the ref may point at a wrapper rather than the real input. Pick a ' +
+          `different ref from the page below, or ask the user to type it by hand.\n${snap}`
       }
       if (args.submit) {
-        await loc.press('Enter').catch(() => {})
+        await loc.press('Enter').catch(() => { /* element may detach on submit */ })
         await pg.waitForLoadState('load', { timeout: 10_000 }).catch(() => { /* SPA — no full navigation */ })
       }
       const navved = pg.url() !== urlBefore
-      return snapshot(pg, { settleFirst: true, after: navved ? `submitted → navigated to ${pg.url()}` : (args.submit ? 'after submit' : 'after typing') })
+      // Name the rung only when it wasn't the ordinary one — a note on every
+      // single type() call would be noise in the transcript.
+      const how = via === 'fill' ? '' : ` (via ${via})`
+      return snapshot(pg, {
+        settleFirst: true,
+        after: navved
+          ? `submitted → navigated to ${pg.url()}`
+          : args.submit ? `after submit${how}` : `typed${how}`,
+      })
+    }
+    case 'BrowserPressKey': {
+      const pg = currentPage()
+      const key = String(args.key ?? '').trim()
+      if (!key) return 'error: key is required (e.g. "Enter", "Tab", "Escape", "ArrowDown", "Control+a")'
+      const urlBefore = pg.url()
+      if (args.ref) {
+        const stale = await ensureRef(pg, String(args.ref))
+        if (stale) return stale
+        const loc = refLocator(pg, String(args.ref))
+        await pointAt(pg, loc, false)
+        try {
+          await loc.press(key, { timeout: 4000 })
+        } catch (e: any) {
+          return `error: could not press ${key} on ${args.ref}: ${String(e?.message || e).slice(0, 160)}`
+        }
+      } else {
+        try {
+          await pg.keyboard.press(key)
+        } catch (e: any) {
+          return `error: invalid key "${key}" (${String(e?.message || e).slice(0, 120)}) — use a key name ` +
+            'like Enter/Tab/Escape/ArrowDown/Backspace, or a chord like "Control+a"'
+        }
+      }
+      // The key may navigate, open a menu, or do nothing visible — wait for a
+      // navigation if one starts, then report the settled page either way.
+      await pg.waitForLoadState('load', { timeout: 8000 }).catch(() => { /* no navigation */ })
+      const navved = pg.url() !== urlBefore
+      return snapshot(pg, {
+        settleFirst: true,
+        after: navved ? `pressed ${key} → navigated to ${pg.url()}` : `after pressing ${key}`,
+      })
     }
     case 'BrowserScroll': {
       const pg = currentPage()

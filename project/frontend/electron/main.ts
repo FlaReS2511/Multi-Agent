@@ -11,6 +11,8 @@ import { GroupCoordinator, DEFAULT_ORCHESTRATION, OrchestrationConfig } from './
 import { normalizeDiscordConfig, type DiscordConfig } from './group-params'
 import { runIdeAgent, IdeAgentParams, IdeAgentEvent, PendingChange, ReviewDecision, EditorRequest, EditorResponse } from './ide-agent'
 import { PendingAction, killAllBackgroundJobs } from './extra-tools'
+import { resolveDefinition, resetDefinitionServices } from './ts-definitions'
+import { closeDocxSession, resetDocxSessions } from './docx-tools'
 import {
   initBrowserTools, browserSetBounds, browserSetVisible, browserUserNavigate, closeBrowserView,
 } from './browser-tools'
@@ -620,21 +622,84 @@ ipcMain.handle('set-provider', async (_evt, input: {
   name?: string
   base_url?: string
   models?: string[]
+  price_in?: number
+  price_out?: number
 }) => {
-  const { id, kind, name, base_url, models } = input
+  const { id, kind, name, base_url, models, price_in, price_out } = input
   if (!id) return { ok: false, error: 'provider id required' }
   const config = await readConfig()
   config.providers = config.providers ?? {}
-  const existing = config.providers[id] ?? { kind }
+  const existing = (config.providers[id] ?? { kind }) as unknown as Record<string, unknown>
   config.providers[id] = {
     ...existing,
     kind,
     name: name ?? existing.name,
     base_url: base_url ?? existing.base_url,
     models: models ?? existing.models ?? [],
-  }
+    // Pricing ($ per 1M tokens) — lets the cost dashboard show real numbers for
+    // custom gateways. undefined leaves the existing value untouched.
+    ...(price_in != null ? { price_in } : {}),
+    ...(price_out != null ? { price_out } : {}),
+  } as (typeof config.providers)[string]
   await writeConfig(config)
   return { ok: true }
+})
+
+// Resolve a provider's base URL + auth headers for a raw REST call (test /
+// list-models). Key comes from the passed override or the decrypted store.
+async function providerRest(id: string, apiKeyOverride?: string): Promise<
+  { ok: true; url: string; headers: Record<string, string>; kind: string } | { ok: false; error: string }
+> {
+  const config = await readConfig()
+  const pc = (config.providers ?? {})[id] as { kind?: string; base_url?: string } | undefined
+  if (!pc) return { ok: false, error: `unknown provider: ${id}` }
+  const kind = pc.kind || 'openai-compatible'
+  let key = apiKeyOverride || ''
+  if (!key) { const enc = db.getSecret(id); key = enc ? decryptKey(enc) : '' }
+  if (kind === 'anthropic') {
+    const base = (pc.base_url || 'https://api.anthropic.com').replace(/\/$/, '')
+    return { ok: true, kind, url: `${base}/v1/models`, headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01' } }
+  }
+  // openai / openai-compatible / google-openai gateways all expose /models.
+  const base = (pc.base_url || 'https://api.openai.com/v1').replace(/\/$/, '')
+  return { ok: true, kind, url: `${base}/models`, headers: { Authorization: `Bearer ${key || 'no-key'}` } }
+}
+
+// Test a provider's connection: GET its /models. Cheap, no tokens billed.
+ipcMain.handle('provider-test', async (_evt, id: string, apiKey?: string) => {
+  const r = await providerRest(id, apiKey)
+  if (!r.ok) return r
+  try {
+    const resp = await fetch(r.url, { headers: r.headers })
+    if (!resp.ok) {
+      const body = await resp.text().catch(() => '')
+      return { ok: false, error: `HTTP ${resp.status}${body ? ': ' + body.slice(0, 180) : ''}` }
+    }
+    const json: any = await resp.json().catch(() => ({}))
+    const count = Array.isArray(json.data) ? json.data.length : Array.isArray(json.models) ? json.models.length : undefined
+    return { ok: true, modelCount: count }
+  } catch (e: any) {
+    return { ok: false, error: e?.message || String(e) }
+  }
+})
+
+// Fetch the model id list the provider advertises, to populate the models field.
+ipcMain.handle('provider-fetch-models', async (_evt, id: string, apiKey?: string) => {
+  const r = await providerRest(id, apiKey)
+  if (!r.ok) return r
+  try {
+    const resp = await fetch(r.url, { headers: r.headers })
+    if (!resp.ok) {
+      const body = await resp.text().catch(() => '')
+      return { ok: false, error: `HTTP ${resp.status}${body ? ': ' + body.slice(0, 180) : ''}` }
+    }
+    const json: any = await resp.json().catch(() => ({}))
+    const rows: any[] = Array.isArray(json.data) ? json.data : Array.isArray(json.models) ? json.models : []
+    const models = rows.map((m) => (typeof m === 'string' ? m : m.id || m.name)).filter(Boolean)
+    return { ok: true, models }
+  } catch (e: any) {
+    return { ok: false, error: e?.message || String(e) }
+  }
 })
 
 ipcMain.handle('delete-provider', async (_evt, id: string) => {
@@ -1397,9 +1462,13 @@ ipcMain.handle('read-artifact-file', async (_evt, taskId: string, filename: stri
 // The workspace root is dynamic: defaults to the project ROOT, but the user can
 // open any folder. Persisted in the DB (meta.workspace_root) + a recent list.
 let workspaceRoot: string = ROOT
+// True until the user has ever picked a folder — on first launch we fall back
+// to the app's own dir, but the renderer shows an "Open a folder" welcome
+// instead of exposing the install directory's files as the workspace.
+let workspaceUnset = true
 try {
   const saved = db.getMeta('workspace_root')
-  if (saved && fsSync.existsSync(saved)) workspaceRoot = saved
+  if (saved && fsSync.existsSync(saved)) { workspaceRoot = saved; workspaceUnset = false }
 } catch { /* use ROOT */ }
 
 function getRecentWorkspaces(): string[] {
@@ -1420,8 +1489,13 @@ function pushRecentWorkspace(dir: string): void {
 
 function setWorkspaceRoot(dir: string): void {
   workspaceRoot = dir
+  workspaceUnset = false
   db.setMeta('workspace_root', dir)
   pushRecentWorkspace(dir)
+  // The TS language service caches file lists / configs per root — drop it so
+  // Peek Definition resolves against the new workspace.
+  resetDefinitionServices()
+  resetDocxSessions()
 }
 
 // Resolve a workspace-relative path to an absolute path, guarding against
@@ -1460,6 +1534,7 @@ ipcMain.handle('workspace-get-root', () => ({
   root: workspaceRoot,
   name: path.basename(workspaceRoot),
   recent: getRecentWorkspaces(),
+  unset: workspaceUnset,
 }))
 
 ipcMain.handle('workspace-open-dialog', async () => {
@@ -1499,6 +1574,44 @@ ipcMain.handle('workspace-read-file', async (_evt, relPath: string) => {
     return { ok: false, content: err.message }
   }
 })
+
+// Binary read (base64) — the DocxViewer needs the raw .docx bytes to render
+// with docx-preview; utf-8 read would corrupt the zip.
+ipcMain.handle('workspace-read-file-bytes', async (_evt, relPath: string) => {
+  const absPath = resolveInWorkspace(relPath)
+  if (!absPath) return { ok: false, error: 'Access denied: path is outside workspace root' }
+  try {
+    const buf = await fs.readFile(absPath)
+    return { ok: true, base64: buf.toString('base64') }
+  } catch (err: any) {
+    return { ok: false, error: err.message }
+  }
+})
+
+// Drop a cached docx edit session when its tab closes (frees the parsed DOM).
+ipcMain.handle('docx-close', (_evt, relPath: string) => {
+  const absPath = resolveInWorkspace(relPath)
+  if (absPath) closeDocxSession(absPath)
+  return { ok: true }
+})
+
+// Peek / Go-to Definition: resolve the symbol at a character offset via the
+// TypeScript compiler API. `contents` is the renderer's live buffer for the
+// queried file so offsets match unsaved edits. Runs off the main thread's hot
+// path lazily (service built on first query per tsconfig scope).
+ipcMain.handle(
+  'resolve-definition',
+  async (_evt, relPath: string, offset: number, contents?: string) => {
+    const absPath = resolveInWorkspace(relPath)
+    if (!absPath) return { ok: false, defs: [] }
+    try {
+      const defs = resolveDefinition(absPath, offset, workspaceRoot, contents)
+      return { ok: true, defs }
+    } catch (err: any) {
+      return { ok: false, defs: [], error: err?.message }
+    }
+  },
+)
 
 ipcMain.handle('workspace-write-file', async (_evt, relPath: string, content: string) => {
   bustGitCache()
@@ -1897,8 +2010,24 @@ interface SubAgentRec {
   summary: string
 }
 const subAgents = new Map<string, SubAgentRec>()
+// Abort handle per child, kept OUT of SubAgentRec: that record is structured-
+// cloned to the renderer by broadcastSubAgents() and a function is not cloneable.
+const subAgentAborts = new Map<string, AbortController>()
 let subAgentCounter = 0
 const MAX_SUBAGENTS = 4
+
+// Events a child agent must ALSO deliver on its PARENT's channel: the
+// approve/decline UI and the editor reload both live there, and the child has no
+// surface of its own for them. Without this, review mode + SpawnAgent deadlocked
+// (the child waited forever on a pending_change nothing displayed) and files a
+// sub-agent wrote never live-reloaded.
+//
+// This is the contract for the parent↔child boundary — all three bugs in
+// agent-behavior-bug.md were born here. Adding a new event of this kind means
+// adding it to THIS set, not to a hand-written condition somewhere.
+const FORWARD_TO_PARENT: ReadonlySet<IdeAgentEvent['type']> = new Set([
+  'pending_change', 'change_resolved', 'pending_action', 'action_resolved', 'file_changed',
+])
 function broadcastSubAgents(): void {
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('subagent-event', [...subAgents.values()])
@@ -1995,6 +2124,10 @@ ipcMain.handle('ai-agent-run', async (_evt, runId: string, params: IdeAgentParam
     ...params,
     allowBash: Boolean(ideCfg.allowBash),
     orchestrationEnabled: Boolean(orch.enabled),
+    // Sub-agent delegation: default ON (only false when explicitly disabled);
+    // "prefer" biases the prompt toward parallelizing and is off by default.
+    allowSubagents: ideCfg.allowSubagents !== false,
+    preferSubagents: Boolean(ideCfg.preferSubagents),
   }
   // Delegate a sub-task to a child IDE-agent (full toolset, minus editor
   // round-trip and minus its own SpawnAgent). Runs to completion; returns the
@@ -2023,22 +2156,19 @@ ipcMain.handle('ai-agent-run', async (_evt, runId: string, params: IdeAgentParam
     broadcastSubAgents()
 
     let summary = ''
+    // Did the child actually DO anything? A child that ran no tool and produced
+    // only an opening line has not done the work — reporting that as success is
+    // what let "I'll map that tree now." reach the lead as a result.
+    let childRanTool = false
+    let childStopReason: string = 'completed'
     const childEmit = (e: IdeAgentEvent) => {
-      if (e.type === 'done') summary = e.text || ''
+      if (e.type === 'tool_call') childRanTool = true
+      else if (e.type === 'done') { summary = e.text || ''; childStopReason = e.reason }
       else if (e.type === 'blocked') summary = `blocked: ${e.reason}`
       else if (e.type === 'error') summary = `error: ${e.error}`
       if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.webContents.send(`ai-agent-event:${childRunId}`, e)
-        // Approval requests and file writes must ALSO reach the parent
-        // channel — that is where the approve/decline UI and the editor
-        // reload live. Without this, review mode + SpawnAgent deadlocked
-        // (the child waited forever on a pending_change no surface showed)
-        // and files a sub-agent wrote never live-reloaded in the editor.
-        if (
-          e.type === 'pending_change' || e.type === 'change_resolved' ||
-          e.type === 'pending_action' || e.type === 'action_resolved' ||
-          e.type === 'file_changed'
-        ) {
+        if (FORWARD_TO_PARENT.has(e.type)) {
           mainWindow.webContents.send(`ai-agent-event:${runId}`, e)
         }
       }
@@ -2057,14 +2187,40 @@ ipcMain.handle('ai-agent-run', async (_evt, runId: string, params: IdeAgentParam
       createTask: orchestrationBridge.createTask,
       createGroup: orchestrationBridge.createGroup,
     }
+    // The child gets its OWN AbortController, LINKED to the parent's: stopping
+    // the parent still stops the child, but the child is no longer killed by
+    // whatever else touches the parent's signal, and it can be cancelled alone.
+    // Sharing one controller is why four SpawnAgents in a turn reported
+    // "cancelled" together (agent-behavior-bug.md §1).
+    const childAc = new AbortController()
+    subAgentAborts.set(childRunId, childAc)
+    const onParentAbort = () => childAc.abort()
+    if (ac.signal.aborted) childAc.abort()
+    else ac.signal.addEventListener('abort', onParentAbort, { once: true })
+
     try {
       // editorBridge = undefined: a sub-agent must not drive the user's single
       // editor; it writes to disk and the file_changed events reload the tab.
-      await runIdeAgent(SHARED, childParams, decryptKey, childEmit, ac.signal, requestReview, undefined, subBridge, requestAction)
-      rec.status = summary.startsWith('error:') ? 'error' : 'done'
+      await runIdeAgent(SHARED, childParams, decryptKey, childEmit, childAc.signal, requestReview, undefined, subBridge, requestAction)
+      // A run the user (or the parent) stopped is not a failure — keep it out
+      // of the error bucket so a deliberate Stop doesn't read as a crash.
+      if (childStopReason === 'parent_stopped' || childStopReason === 'user_stopped') {
+        rec.status = 'done'
+        summary = summary.trim() || '(stopped before finishing)'
+      } else if (!childRanTool && !summary.startsWith('error:')) {
+        summary = summary.trim()
+          ? `error: sub-agent ended without running a single tool — it only said: ${JSON.stringify(summary.slice(0, 200))}`
+          : 'error: sub-agent ended without running any tool and without a summary'
+        rec.status = 'error'
+      } else {
+        rec.status = summary.startsWith('error:') ? 'error' : 'done'
+      }
     } catch (e) {
       summary = `error: ${(e as Error).message || e}`
       rec.status = 'error'
+    } finally {
+      ac.signal.removeEventListener('abort', onParentAbort)
+      subAgentAborts.delete(childRunId)
     }
     rec.summary = summary
     rec.endedAt = Date.now()
@@ -2115,20 +2271,31 @@ ipcMain.handle('ai-agent-cancel', (_evt, runId: string) => {
   return { ok: true }
 })
 
-// IDE-agent config (reviewMode + allowBash) persisted in meta.
-ipcMain.handle('ide-agent-config-get', () => {
+// IDE-agent config (reviewMode + allowBash + sub-agent settings) in meta.
+// allowSubagents defaults ON (absent key → true); preferSubagents defaults OFF.
+function readIdeAgentConfig() {
   const raw = db.getMeta('ide_agent_config')
   const cfg = raw ? JSON.parse(raw) : {}
-  return { reviewMode: Boolean(cfg.reviewMode), allowBash: Boolean(cfg.allowBash) }
-})
+  return {
+    reviewMode: Boolean(cfg.reviewMode),
+    allowBash: Boolean(cfg.allowBash),
+    allowSubagents: cfg.allowSubagents !== false,
+    preferSubagents: Boolean(cfg.preferSubagents),
+  }
+}
 
-ipcMain.handle('ide-agent-config-set', (_evt, patch: { reviewMode?: boolean; allowBash?: boolean }) => {
-  const raw = db.getMeta('ide_agent_config')
-  const cfg = raw ? JSON.parse(raw) : {}
-  const next = { ...cfg, ...patch }
-  db.setMeta('ide_agent_config', JSON.stringify(next))
-  return { ok: true, reviewMode: Boolean(next.reviewMode), allowBash: Boolean(next.allowBash) }
-})
+ipcMain.handle('ide-agent-config-get', () => readIdeAgentConfig())
+
+ipcMain.handle(
+  'ide-agent-config-set',
+  (_evt, patch: { reviewMode?: boolean; allowBash?: boolean; allowSubagents?: boolean; preferSubagents?: boolean }) => {
+    const raw = db.getMeta('ide_agent_config')
+    const cfg = raw ? JSON.parse(raw) : {}
+    const next = { ...cfg, ...patch }
+    db.setMeta('ide_agent_config', JSON.stringify(next))
+    return { ok: true, ...readIdeAgentConfig() }
+  },
+)
 
 // ── Git account profiles (used by the IDE agent's SwitchGitAccount) ──
 

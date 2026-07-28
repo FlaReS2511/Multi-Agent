@@ -110,6 +110,8 @@ export interface SetProviderInput {
   name?: string
   base_url?: string
   models?: string[]
+  price_in?: number
+  price_out?: number
 }
 
 export interface SetProviderKeyInput {
@@ -329,6 +331,19 @@ export interface AgentSessionRow extends AgentSessionMeta {
   created_at: string
 }
 
+// MIRRORS `StopReason` in electron/ide-agent.ts — keep both in sync (tsc cannot
+// see across the process boundary, so a one-sided edit compiles and breaks at
+// runtime). Why a run ended; anything other than 'completed' is shown to the user.
+export type StopReason =
+  | 'completed'
+  | 'no_progress'
+  | 'budget'
+  | 'hard_ceiling'
+  | 'empty_response'
+  | 'nudge_exhausted'
+  | 'user_stopped'
+  | 'parent_stopped'
+
 export type IdeAgentEvent =
   | { type: 'reasoning'; delta: string; turn: number }
   | { type: 'token'; delta: string; turn: number }
@@ -343,9 +358,24 @@ export type IdeAgentEvent =
   | { type: 'context'; used: number; window: number; turn: number }
   | { type: 'blocked'; reason: string; turns: number }
   | { type: 'plan'; plan: string; turns: number }
-  | { type: 'done'; text: string; turns: number }
+  | { type: 'done'; text: string; turns: number; reason: StopReason }
+  | { type: 'checkpoint'; turns: number; costUsd: number }
   | { type: 'error'; error: string }
   | { type: 'subagent_started'; childRunId: string; label: string; task: string }
+
+// One line shown in the transcript when a run ended for a reason the user did
+// not choose. 'completed' and 'user_stopped' render nothing: the first is the
+// normal case, the second already showed "⏹ Stopped." when Stop was pressed.
+export const STOP_REASON_NOTE: Record<StopReason, string | null> = {
+  completed: null,
+  user_stopped: null,
+  parent_stopped: null,
+  no_progress: '⚠ Dừng: nhiều lượt liên tiếp không có tiến triển mới — agent có thể đang kẹt vòng lặp. Xem lại yêu cầu rồi gửi tiếp.',
+  budget: '⚠ Dừng: run này đã vượt trần chi phí. Gửi tiếp để chạy thêm, hoặc nâng IDE_AGENT_MAX_USD.',
+  hard_ceiling: '⚠ Dừng: chạm trần số lượt của một run. Gõ "tiếp tục" để chạy tiếp.',
+  empty_response: '⚠ Dừng: provider trả về rỗng (stream bị đứt) — gửi lại để tiếp tục.',
+  nudge_exhausted: '⚠ Dừng: model nói sẽ làm nhưng không gọi tool sau 2 lần nhắc. Thử diễn đạt lại yêu cầu cụ thể hơn.',
+}
 
 declare global {
   interface Window {
@@ -361,6 +391,8 @@ declare global {
       getBackendSettings(): Promise<BackendSettings>
       setAgentBackend(input: SetAgentBackendInput): Promise<{ ok: boolean }>
       setProvider(input: SetProviderInput): Promise<{ ok: boolean; error?: string }>
+      providerTest(id: string, apiKey?: string): Promise<{ ok: boolean; error?: string; modelCount?: number }>
+      providerFetchModels(id: string, apiKey?: string): Promise<{ ok: boolean; error?: string; models?: string[] }>
       deleteProvider(id: string): Promise<{ ok: boolean }>
       setProviderKey(input: SetProviderKeyInput): Promise<{ ok: boolean; error?: string }>
       clearProviderKey(provider: SecretProvider): Promise<{ ok: boolean }>
@@ -397,10 +429,29 @@ declare global {
       onAgentKilled(cb: (info: { agent: string; reason: string }) => void): () => void
       workspaceListFiles(): Promise<any[]>
       workspaceReadFile(relPath: string): Promise<{ ok: boolean; content: string }>
+      workspaceReadFileBytes(relPath: string): Promise<{ ok: boolean; base64?: string; error?: string }>
+      docxClose(relPath: string): Promise<{ ok: boolean }>
+      resolveDefinition(
+        relPath: string,
+        offset: number,
+        contents?: string,
+      ): Promise<{
+        ok: boolean
+        error?: string
+        defs: {
+          file: string
+          line: number
+          column: number
+          endLine: number
+          endColumn: number
+          name?: string
+          kind?: string
+        }[]
+      }>
       workspaceWriteFile(relPath: string, content: string): Promise<{ ok: boolean; error?: string }>
       workspaceGitStatus(): Promise<{ file: string; type: string; staged?: boolean }[]>
       workspaceGitShowHead(relPath: string): Promise<{ ok: boolean; content: string }>
-      workspaceGetRoot(): Promise<{ root: string; name: string; recent: string[] }>
+      workspaceGetRoot(): Promise<{ root: string; name: string; recent: string[]; unset?: boolean }>
       workspaceOpenDialog(): Promise<{ ok: boolean; root?: string; name?: string }>
       workspaceSetRoot(dir: string): Promise<{ ok: boolean; root?: string; name?: string; error?: string }>
       workspaceCreateFile(relPath: string): Promise<{ ok: boolean; error?: string }>
@@ -464,8 +515,8 @@ declare global {
       agentSessionRename(id: number, title: string): Promise<{ ok: boolean }>
       agentSessionDelete(id: number): Promise<{ ok: boolean }>
       onAiAgentEvent(runId: string, cb: (e: IdeAgentEvent) => void): () => void
-      ideAgentConfigGet(): Promise<{ reviewMode: boolean; allowBash: boolean }>
-      ideAgentConfigSet(patch: { reviewMode?: boolean; allowBash?: boolean }): Promise<{ ok: boolean; reviewMode: boolean; allowBash: boolean }>
+      ideAgentConfigGet(): Promise<{ reviewMode: boolean; allowBash: boolean; allowSubagents: boolean; preferSubagents: boolean }>
+      ideAgentConfigSet(patch: { reviewMode?: boolean; allowBash?: boolean; allowSubagents?: boolean; preferSubagents?: boolean }): Promise<{ ok: boolean; reviewMode: boolean; allowBash: boolean; allowSubagents: boolean; preferSubagents: boolean }>
       onAiAgentEditorReq(runId: string, cb: (req: EditorRequest) => void): () => void
       aiAgentEditorRes(resp: EditorResponse): Promise<{ ok: boolean }>
       browserSetBounds(rect: { x: number; y: number; width: number; height: number }): void

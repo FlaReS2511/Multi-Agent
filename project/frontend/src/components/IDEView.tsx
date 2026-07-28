@@ -1,6 +1,7 @@
 import React, { useEffect, useState, useCallback, useRef, useMemo, lazy, Suspense } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
 import '../lib/monacoSetup' // local Monaco + workers (no CDN) — before <Editor>
+import { setDefinitionOpener } from '../lib/monacoDefinition'
 import Editor, { DiffEditor } from '@monaco-editor/react'
 import {
   FolderTree,
@@ -50,6 +51,10 @@ const SearchPanel = lazy(() => import('./SearchPanel').then((m) => ({ default: m
 const GitPanel = lazy(() => import('./GitPanel').then((m) => ({ default: m.GitPanel })))
 const GroupsPanel = lazy(() => import('./GroupsPanel').then((m) => ({ default: m.GroupsPanel })))
 const AgentsLivePanel = lazy(() => import('./AgentsLivePanel').then((m) => ({ default: m.AgentsLivePanel })))
+// docx-preview is heavy — keep it (and its chunk) out until a .docx opens.
+const DocxViewer = lazy(() => import('./DocxViewer').then((m) => ({ default: m.DocxViewer })))
+
+const isDocx = (p: string | null): boolean => !!p && /\.docx$/i.test(p)
 
 // Sentinel tab id for the embedded agent browser (not a file on disk).
 const BROWSER_TAB = 'orqon://browser'
@@ -106,7 +111,7 @@ const SIDEBAR_ITEM = {
   show: { opacity: 1, y: 0, transition: { duration: 0.26, ease: 'easeOut' } },
 }
 
-export function IDEView() {
+export function IDEView({ onOpenSettings }: { onOpenSettings?: () => void }) {
   // Sidebar State
   const [activeSidebar, setActiveSidebar] = useState<'explorer' | 'search' | 'git' | 'agents' | 'groups'>('explorer')
   const [isSidebarOpen, setIsSidebarOpen] = useState(true)
@@ -151,6 +156,9 @@ export function IDEView() {
   const [workspaceName, setWorkspaceName] = useState<string>('')
   const [workspaceRootPath, setWorkspaceRootPath] = useState<string>('')
   const [recentWorkspaces, setRecentWorkspaces] = useState<string[]>([])
+  // First launch: no folder chosen yet. Show a welcome instead of exposing the
+  // app's own install directory as the workspace.
+  const [workspaceUnset, setWorkspaceUnset] = useState(false)
   const [showWorkspaceMenu, setShowWorkspaceMenu] = useState(false)
 
   // Files & Git State
@@ -171,6 +179,11 @@ export function IDEView() {
   const [activeTab, setActiveTab] = useState<string | null>(null)
   // Recently closed tabs (Cmd+Shift+T reopens), newest last.
   const closedTabsRef = useRef<string[]>([])
+  // Live .docx viewer: bump per open-docx path when the agent writes it →
+  // DocxViewer re-fetches + re-renders. `docxTarget` = a paragraph the user
+  // clicked in the viewer, attached to the next chat message (click-to-target).
+  const [docxReload, setDocxReload] = useState<Record<string, number>>({})
+  const [docxTarget, setDocxTarget] = useState<{ path: string; index: number; text: string } | null>(null)
   // Tab currently being drag-reordered.
   const dragTabRef = useRef<string | null>(null)
   // Shared confirm dialog (dirty-close, deletes, discards).
@@ -195,6 +208,10 @@ export function IDEView() {
   useEffect(() => { activeTabRef.current = activeTab }, [activeTab])
   const gitChangesRef = useRef<GitChange[]>([])
   useEffect(() => { gitChangesRef.current = gitChanges }, [gitChanges])
+  // Mirrored so path resolution below stays a stable callback (it is handed to
+  // the memoized ChatPanel — a changing identity would re-render it).
+  const workspaceRootRef = useRef('')
+  useEffect(() => { workspaceRootRef.current = workspaceRootPath }, [workspaceRootPath])
 
   // Editor View Configuration
   const [diffMode, setDiffMode] = useState(false)
@@ -368,6 +385,15 @@ export function IDEView() {
   // at send time so the model always sees the latest file + selection).
   const getChatContext = useCallback(() => {
     if (!activeTab || activeTab === BROWSER_TAB) return null
+    // A .docx is open in the live viewer — hand the agent its exact path (so it
+    // edits THIS file with the docx tools) instead of the binary content.
+    if (isDocx(activeTab)) {
+      return {
+        path: activeTab,
+        language: 'docx',
+        content: '[This is a binary Word .docx open in the live viewer. Use LoadToolGroup("docx"), then DocxOutline on this path to read it, then the Docx* tools to edit — the user watches changes render live.]',
+      }
+    }
     const content = contentsRef.current.get(activeTab) ?? ''
     let selection: string | undefined
     const editor = editorRef.current
@@ -418,7 +444,8 @@ export function IDEView() {
     setWorkspaceName(info.name)
     setWorkspaceRootPath(info.root)
     setRecentWorkspaces(info.recent ?? [])
-    return info.root
+    setWorkspaceUnset(Boolean(info.unset))
+    return info.unset ? '' : info.root
   }, [])
 
   // ── Session restore (per-workspace) ─────────────────────────
@@ -541,9 +568,11 @@ export function IDEView() {
       if (root && !sessionReadyRef.current) {
         await restoreSession(root)
         sessionReadyRef.current = true
+        refreshWorkspace()
       }
+      // root === '' → first launch, no folder chosen: skip scanning the app
+      // dir; the explorer shows the welcome state instead.
     })
-    refreshWorkspace()
   }, [refreshWorkspace, loadWorkspaceInfo, restoreSession])
 
   // Persist the session (debounced) whenever layout/tabs change.
@@ -606,7 +635,7 @@ export function IDEView() {
   // active tab — the old deps on fileContents/dirtyFiles rebuilt this interval
   // on every keystroke; live values are read from refs instead.
   useEffect(() => {
-    if (!activeTab || activeTab === BROWSER_TAB) return
+    if (!activeTab || activeTab === BROWSER_TAB || isDocx(activeTab)) return
     const rel = activeTab
 
     const checkFileOnDisk = async () => {
@@ -643,7 +672,7 @@ export function IDEView() {
   useEffect(() => {
     const ed = editorRef.current
     const mon = monacoRef.current
-    if (!ed || !mon || !activeTab || activeTab === BROWSER_TAB || diffMode) {
+    if (!ed || !mon || !activeTab || activeTab === BROWSER_TAB || isDocx(activeTab) || diffMode) {
       try { gitGutterRef.current?.clear() } catch { /* ignore */ }
       return
     }
@@ -744,6 +773,14 @@ export function IDEView() {
   // Handle open a file. Stable identity (reads live state from refs) so the
   // memoized tree/palette/panels that receive it don't re-render for nothing.
   const openFile = useCallback(async (relPath: string) => {
+    // .docx is binary — it renders in the DocxViewer, not Monaco. Just open the
+    // tab (no text read into contentsRef, no HEAD baseline, no diff mode).
+    if (isDocx(relPath)) {
+      setOpenTabs((prev) => (prev.includes(relPath) ? prev : [...prev, relPath]))
+      setDiffMode(false)
+      setActiveTab(relPath)
+      return
+    }
     // If not already in tabs, load content + HEAD baseline (in parallel), then add it
     const firstOpen = !openTabsRef.current.includes(relPath)
     if (firstOpen) {
@@ -778,15 +815,108 @@ export function IDEView() {
     }, 120)
   }, [openFile])
 
+  // Let Peek Definition "Open full" / cross-file F12 open a real editor tab.
+  useEffect(() => {
+    setDefinitionOpener((rel, line, column) => { void openFileAtLine(rel, line, column) })
+    return () => setDefinitionOpener(null)
+  }, [openFileAtLine])
+
+  // Re-render every open .docx viewer from its current on-disk bytes.
+  const bumpOpenDocx = useCallback(() => {
+    setDocxReload((m) => {
+      let changed = false
+      const next = { ...m }
+      for (const tab of openTabsRef.current) if (isDocx(tab)) { next[tab] = (next[tab] ?? 0) + 1; changed = true }
+      return changed ? next : m
+    })
+  }, [])
+
+  // Map a path the AGENT reported to the key of an open buffer. Exact string
+  // matching missed three real cases: the agent may report an ABSOLUTE path;
+  // macOS stores filenames as NFD while a tab key can be NFC (any Vietnamese
+  // name with diacritics differs byte-wise); and separators can be mixed on
+  // Windows. Returns null when there is no unambiguous match.
+  const resolveOpenBuffer = useCallback((incoming: string): string | null => {
+    const norm = (p: string) => p.replace(/\\/g, '/').normalize('NFC')
+    const keys = Array.from(contentsRef.current.keys())
+    const target = norm(incoming)
+
+    const exact = keys.find((k) => norm(k) === target)
+    if (exact) return exact
+
+    // Absolute path under the workspace → strip the root and retry.
+    const root = norm(workspaceRootRef.current)
+    if (root && target.startsWith(root + '/')) {
+      const rel = target.slice(root.length + 1)
+      const m = keys.find((k) => norm(k) === rel)
+      if (m) return m
+    }
+
+    // Last resort: basename, and ONLY when it is unique among open buffers —
+    // guessing between two same-named files would reload the wrong one.
+    const base = target.split('/').pop()
+    const hits = keys.filter((k) => norm(k).split('/').pop() === base)
+    return hits.length === 1 ? hits[0] : null
+  }, [])
+
+  // Re-read every open text buffer from disk (skipping unsaved ones — an
+  // agent's write must never clobber the user's edits). The safety net for a
+  // per-file event that was missed: docx already had one, text files did not.
+  const reloadOpenTextBuffers = useCallback(async () => {
+    for (const rel of openTabsRef.current) {
+      if (rel === BROWSER_TAB || isDocx(rel)) continue
+      if (dirtyRef.current[rel]) continue
+      try {
+        const disk = await window.api.workspaceReadFile(rel)
+        if (disk.ok && disk.content !== contentsRef.current.get(rel)) setBufferText(rel, disk.content)
+      } catch { /* a file that vanished is handled by the tree refresh */ }
+    }
+  }, [setBufferText])
+
   // Called when the IDE agent writes/edits a file. Re-read it from disk if it's
   // open so the editor reflects the agent's change, and refresh tree + git.
   const onAgentFileChanged = useCallback(async (relPath: string) => {
-    if (contentsRef.current.has(relPath)) {
-      const disk = await window.api.workspaceReadFile(relPath)
-      if (disk.ok) setBufferText(relPath, disk.content)
+    // Empty path = "something changed, we don't know what" (a Bash command, a
+    // git checkout). Re-read every live surface rather than guess.
+    if (!relPath) {
+      bumpOpenDocx()
+      void reloadOpenTextBuffers()
+      refreshWorkspace()
+      return
+    }
+    if (isDocx(relPath)) {
+      // Binary — the DocxViewer re-fetches + re-renders when its key bumps.
+      // Path matching is fragile here (agent may use an absolute path; macOS
+      // filenames are NFD while the tab may be NFC; Vietnamese diacritics), so
+      // just refresh EVERY open docx viewer. Re-rendering an unchanged doc is a
+      // harmless no-op, and this guarantees the live view never goes stale.
+      bumpOpenDocx()
+      refreshWorkspace()
+      return
+    }
+    const key = resolveOpenBuffer(relPath)
+    if (key && !dirtyRef.current[key]) {
+      // Read through the buffer's OWN key, not the agent's spelling of it —
+      // the two can differ (absolute vs relative, NFD vs NFC).
+      const disk = await window.api.workspaceReadFile(key)
+      if (disk.ok) setBufferText(key, disk.content)
     }
     refreshWorkspace()
-  }, [setBufferText, refreshWorkspace])
+  }, [setBufferText, refreshWorkspace, bumpOpenDocx, resolveOpenBuffer, reloadOpenTextBuffers])
+
+  // Safety net: when an agent run finishes (busy → idle), refresh every open
+  // docx viewer to the final on-disk state — so even if a per-edit event was
+  // missed, the view is never left stale after a run.
+  const prevBusyRef = useRef(false)
+  useEffect(() => {
+    if (prevBusyRef.current && !agentBusy) {
+      bumpOpenDocx()
+      // Text files get the same net as docx now — a sub-agent writes with
+      // editorBridge = undefined, so `file_changed` was their ONLY reload path.
+      void reloadOpenTextBuffers()
+    }
+    prevBusyRef.current = agentBusy
+  }, [agentBusy, bumpOpenDocx, reloadOpenTextBuffers])
 
   // ── Agent review mode: pending change awaiting the user's verdict ─────
   const [pendingChange, setPendingChange] = useState<PendingChange | null>(null)
@@ -983,6 +1113,10 @@ export function IDEView() {
   // Close a tab unconditionally (dirty state already resolved by the caller).
   const doCloseTab = (relPath: string) => {
     if (relPath === BROWSER_TAB) window.api.browserTabClosed()
+    if (isDocx(relPath)) {
+      window.api.docxClose(relPath).catch(() => {})
+      setDocxTarget((t) => (t?.path === relPath ? null : t))
+    }
     const nextTabs = openTabs.filter((t) => t !== relPath)
     setOpenTabs(nextTabs)
     if (activeTab === relPath) {
@@ -1197,6 +1331,36 @@ export function IDEView() {
       } else if (mod && e.shiftKey && (e.key === 'F' || e.key === 'f')) {
         e.preventDefault()
         setActiveSidebar('search'); setIsSidebarOpen(true)
+      } else if (mod && !e.altKey && (e.key === 'b' || e.key === 'B')) {
+        // Cmd+B — toggle the sidebar
+        e.preventDefault()
+        setIsSidebarOpen((v) => !v)
+      } else if (mod && !e.altKey && (e.key === 'j' || e.key === 'J')) {
+        // Cmd+J — toggle the bottom dock
+        e.preventDefault()
+        setIsBottomOpen((v) => !v)
+      } else if (mod && !e.altKey && (e.key === 'l' || e.key === 'L')) {
+        // Cmd+L — toggle the AI chat (and focus its composer on open)
+        e.preventDefault()
+        setChatOpen((v) => !v); setChatUnread(false)
+      } else if (e.ctrlKey && e.key === 'Tab') {
+        // Ctrl+Tab / Ctrl+Shift+Tab — cycle editor tabs
+        e.preventDefault()
+        if (openTabs.length > 1 && activeTab) {
+          const i = openTabs.indexOf(activeTab)
+          const n = openTabs.length
+          const next = openTabs[(i + (e.shiftKey ? -1 : 1) + n) % n]
+          if (next === BROWSER_TAB) setActiveTab(next); else openFile(next)
+        }
+      } else if (mod && e.shiftKey && (e.key === ']' || e.key === '[')) {
+        // Cmd+Shift+] / [ — next / previous tab (VS Code)
+        e.preventDefault()
+        if (openTabs.length > 1 && activeTab) {
+          const i = openTabs.indexOf(activeTab)
+          const n = openTabs.length
+          const next = openTabs[(i + (e.key === ']' ? 1 : -1) + n) % n]
+          if (next === BROWSER_TAB) setActiveTab(next); else openFile(next)
+        }
       } else if (mod && (e.key === '=' || e.key === '+')) {
         // Cmd+= — zoom in
         e.preventDefault()
@@ -1211,7 +1375,7 @@ export function IDEView() {
     }
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [activeTab, dirtyFiles, openTabs, ui.zoom])
+  }, [activeTab, dirtyFiles, openTabs, ui.zoom, openFile])
 
   // Commands for the palette. Intentionally NOT memoized: the actions close
   // over live editor state (activeTab, dirtyFiles, …) and a memo made "File:
@@ -1227,6 +1391,9 @@ export function IDEView() {
     { id: 'search', label: 'Search: Find in Files', hint: 'Ctrl+Shift+F', run: () => { setActiveSidebar('search'); setIsSidebarOpen(true) } },
     { id: 'git', label: 'View: Source Control', run: () => { setActiveSidebar('git'); setIsSidebarOpen(true) } },
     { id: 'explorer', label: 'View: Explorer', run: () => { setActiveSidebar('explorer'); setIsSidebarOpen(true) } },
+    { id: 'togglechat', label: 'View: Toggle AI Chat', hint: 'Ctrl+L', run: () => { setChatOpen((v) => !v); setChatUnread(false) } },
+    { id: 'togglesidebar', label: 'View: Toggle Sidebar', hint: 'Ctrl+B', run: () => setIsSidebarOpen((v) => !v) },
+    { id: 'toggledock', label: 'View: Toggle Bottom Dock', hint: 'Ctrl+J', run: () => setIsBottomOpen((v) => !v) },
     { id: 'refresh', label: 'Workspace: Refresh', run: () => refreshWorkspace() },
     { id: 'quickopen', label: 'Go to File…', hint: 'Ctrl+P', run: () => { setPaletteMode('files'); setPaletteOpen(true) } },
   ]
@@ -1485,19 +1652,50 @@ export function IDEView() {
           >
             <Suspense fallback={null}>
             {activeSidebar === 'explorer' && (
-              <IDEFileTree
-                files={files}
-                selectedFile={activeTab}
-                onSelectFile={openFile}
-                gitChanges={gitChanges}
-                onRenameCommit={handleRenameCommit}
-                onDelete={deletePrompt}
-                onCreateCommit={handleCreateCommit}
-                onMove={handleMove}
-                createRequest={createReq}
-                revealNonce={revealNonce}
-                collapseNonce={collapseNonce}
-              />
+              workspaceUnset ? (
+                <div className="p-3 text-center">
+                  <FolderOpen size={22} className="text-zinc-600 mx-auto mb-2" />
+                  <div className="text-xs text-zinc-300 font-medium">No folder open</div>
+                  <div className="text-[10px] text-zinc-600 mt-1 mb-3 leading-relaxed">
+                    Open a folder to browse and edit your project.
+                  </div>
+                  <button
+                    onClick={() => switchWorkspace()}
+                    className="px-3 py-1.5 text-xs font-medium rounded bg-blue-600 hover:bg-blue-500 text-white"
+                  >
+                    Open Folder…
+                  </button>
+                  {recentWorkspaces.length > 0 && (
+                    <div className="mt-4 text-left">
+                      <div className="text-[9px] uppercase tracking-wider text-zinc-600 px-1 mb-1">Recent</div>
+                      {recentWorkspaces.map((d) => (
+                        <button
+                          key={d}
+                          onClick={() => switchWorkspace(d)}
+                          className="w-full text-left px-2 py-1 text-[11px] text-zinc-400 hover:bg-zinc-800/60 hover:text-zinc-200 rounded truncate"
+                          title={d}
+                        >
+                          {d.split(/[\\/]/).pop()}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <IDEFileTree
+                  files={files}
+                  selectedFile={activeTab}
+                  onSelectFile={openFile}
+                  gitChanges={gitChanges}
+                  onRenameCommit={handleRenameCommit}
+                  onDelete={deletePrompt}
+                  onCreateCommit={handleCreateCommit}
+                  onMove={handleMove}
+                  createRequest={createReq}
+                  revealNonce={revealNonce}
+                  collapseNonce={collapseNonce}
+                />
+              )
             )}
 
             {activeSidebar === 'search' && (
@@ -1718,7 +1916,17 @@ export function IDEView() {
               <div ref={browserHostRef} className="flex-1 bg-zinc-950" />
             </div>
           )}
-          {activeTab && activeTab !== BROWSER_TAB ? (
+          {isDocx(activeTab) && (
+            <Suspense fallback={null}>
+              <DocxViewer
+                relPath={activeTab as string}
+                reloadKey={docxReload[activeTab as string] ?? 0}
+                busy={agentBusy}
+                onSelectParagraph={setDocxTarget}
+              />
+            </Suspense>
+          )}
+          {activeTab && activeTab !== BROWSER_TAB && !isDocx(activeTab) ? (
             <div className="absolute inset-0 flex flex-col">
               {diffMode ? (
                 <div className="flex-1 w-full overflow-hidden relative">
@@ -1937,7 +2145,7 @@ export function IDEView() {
                       {shells.length > 1 && (
                         <button
                           onClick={(e) => { e.stopPropagation(); closeShell(s.id) }}
-                          className="opacity-0 group-hover/shell:opacity-100 text-zinc-600 hover:text-rose-400"
+                          className="opacity-0 group-hover/shell:opacity-100 focus-visible:opacity-100 text-zinc-600 hover:text-rose-400"
                         >
                           <X size={9} />
                         </button>
@@ -2069,6 +2277,9 @@ export function IDEView() {
             onSubAgentStarted={onSubAgentStarted}
             onAttentionNeeded={onChatAttentionNeeded}
             onRunFinished={onChatRunFinished}
+            onOpenSettings={onOpenSettings}
+            docxTarget={docxTarget}
+            onDocxTargetUsed={() => setDocxTarget(null)}
           />
         </div>
       </motion.aside>
@@ -2093,7 +2304,12 @@ export function IDEView() {
         commands={paletteCommands}
         files={flatFiles}
         onClose={() => setPaletteOpen(false)}
-        onOpenFile={openFile}
+        onOpenFile={async (f) => {
+          await openFile(f)
+          // Palette closes → focus would otherwise fall to <body>. Put it back
+          // in the editor so the user can type/navigate immediately.
+          requestAnimationFrame(() => { try { editorRef.current?.focus() } catch { /* ignore */ } })
+        }}
       />
 
       <ConfirmDialog dialog={dialog} />

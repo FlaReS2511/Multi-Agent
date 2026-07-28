@@ -15,9 +15,9 @@ import {
   TerminalSquare, ListPlus, Boxes, Undo2, AlertTriangle,
   GitBranch, GitCommitHorizontal, GitPullRequestArrow, UserCog, Globe, ListChecks, FolderTree, Trash, FileInput,
   History, Plus, Archive, Telescope, Copy, Check, ArrowDown, Pencil, AtSign,
-  ChevronRight, Loader2,
+  ChevronRight, Loader2, X,
 } from 'lucide-react'
-import { ModelOption, IdeAgentEvent, PendingChange, PendingAction, AgentTodo, AgentSessionMeta } from '../lib/api'
+import { ModelOption, IdeAgentEvent, PendingChange, PendingAction, AgentTodo, AgentSessionMeta, STOP_REASON_NOTE } from '../lib/api'
 import { useUiSettings } from '../lib/uiSettings'
 
 // Slash commands available in agent mode. Typing "/" pops up a filtered menu.
@@ -78,6 +78,19 @@ function itemText(it: AgentItem): string {
 
 // Per-tool result budget when folding tool activity into cross-turn history.
 const TOOL_RESULT_BUDGET = 800
+
+// Truncate keeping BOTH ends. Tool output is usually append-only — command
+// tails, logs, test runs — so the head is the least useful part, and the old
+// slice(0, n) threw away exactly the part that says what happened. Keep a small
+// head for context plus the tail, where the result actually is.
+// (`BashOutput` already tails correctly at the source; this fixes the places
+// that rebuilt history/display from a stored result.)
+function clampMiddle(s: string, max: number): string {
+  if (s.length <= max) return s
+  const head = Math.floor(max * 0.3)
+  const tail = max - head
+  return `${s.slice(0, head)}\n…[cắt ${s.length - max} ký tự ở giữa]…\n${s.slice(-tail)}`
+}
 
 // Transcript items rendered by default; older ones sit behind "Show earlier"
 // so a long session doesn't keep hundreds of markdown blocks in the DOM.
@@ -167,9 +180,7 @@ function buildHistory(items: AgentItem[]): Msg[] {
       const head = `• ${it.name}${target ? ` (${target})` : ''}`
       let body = ''
       if (it.result) {
-        const r = it.result.length > TOOL_RESULT_BUDGET
-          ? it.result.slice(0, TOOL_RESULT_BUDGET) + ' …(truncated)'
-          : it.result
+        const r = clampMiddle(it.result, TOOL_RESULT_BUDGET)
         body = it.isError ? ` → error: ${r}` : ` → ${r}`
       }
       toolBuf.push(head + body)
@@ -202,7 +213,7 @@ function serializeItems(items: AgentItem[]): AgentItem[] {
       return {
         ...t,
         running: false,
-        result: t.result && t.result.length > 1000 ? t.result.slice(0, 1000) + ' …(truncated)' : t.result,
+        result: t.result ? clampMiddle(t.result, 1000) : t.result,
       }
     })
 }
@@ -275,6 +286,12 @@ interface Props {
   // Fired when the agent needs the user (approval/review) while they aren't
   // looking, so the host can raise the chat badge.
   onAttentionNeeded?: () => void
+  // Open Backend Settings (shown in the no-provider setup card).
+  onOpenSettings?: () => void
+  // A paragraph the user clicked in the live DocxViewer — attached to the next
+  // agent message so it edits exactly that paragraph. Cleared after send.
+  docxTarget?: { path: string; index: number; text: string } | null
+  onDocxTargetUsed?: () => void
 }
 
 // Wind-up choreography: the frame slides open first (handled by the parent),
@@ -294,7 +311,8 @@ const itemVariants = {
 // changes (typing, git polls, caret moves) no longer re-render the chat tree.
 export const ChatPanel = memo(ChatPanelImpl)
 
-function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onChangeResolved, onEditorRequest, windup = true, visible = true, onRunStateChange, onContextUsage, onRunFinished, files = [], workspaceRoot = '', onSubAgentStarted, onAttentionNeeded }: Props) {
+function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onChangeResolved, onEditorRequest, windup = true, visible = true, onRunStateChange, onContextUsage, onRunFinished, files = [], workspaceRoot = '', onSubAgentStarted, onAttentionNeeded, onOpenSettings, docxTarget, onDocxTargetUsed }: Props) {
+  const noProvider = models.length === 0
   const { chatFontSize } = useUiSettings()
   const [mode, setMode] = useState<'ask' | 'agent'>('ask')
   // Plan mode is a toggle WITHIN agent mode (via /plan): runs read-only and
@@ -323,6 +341,9 @@ function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onC
   const [dirtyWarn, setDirtyWarn] = useState<{ count: number } | null>(null)
   // Context fill of the latest agent turn (prompt tokens vs the model window).
   const [ctxUsage, setCtxUsage] = useState<{ used: number; window: number } | null>(null)
+  // Long-run checkpoint: the run passed the soft turn threshold and is STILL
+  // going. Shown beside "working…" so a long job is visible instead of cut off.
+  const [checkpoint, setCheckpoint] = useState<{ turns: number; costUsd: number } | null>(null)
   // A sensitive git/login/background action awaiting the user's approval.
   const [pendingAction, setPendingAction] = useState<PendingAction | null>(null)
   // The agent's current run checklist (from TodoWrite).
@@ -354,6 +375,16 @@ function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onC
   const [model, setModel] = useState('')
   const reqIdRef = useRef<string | null>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
+  const composerRef = useRef<HTMLTextAreaElement>(null)
+  // Focus the composer whenever the panel becomes visible (Cmd+L / clicking
+  // the chat button opens it) so the user can type immediately.
+  const wasVisibleRef = useRef(visible)
+  useEffect(() => {
+    if (visible && !wasVisibleRef.current) {
+      requestAnimationFrame(() => composerRef.current?.focus())
+    }
+    wasVisibleRef.current = visible
+  }, [visible])
   // Typewriter: target[id] = full text received; displayed length is advanced
   // toward it by a steady rAF loop so streamed tokens reveal smoothly.
   const targetRef = useRef<Map<string, string>>(new Map())
@@ -785,11 +816,18 @@ function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onC
     const useResearch = opts?.researchMode ?? researchMode
 
     const ctx = useFileContext ? getContext() : null
+    // Click-to-target: if the user clicked a paragraph in the live DocxViewer,
+    // tell the model to apply the request to THAT paragraph. Sent to the model
+    // only — the visible user bubble stays clean.
+    const docxNote = docxTarget
+      ? `\n\n[The user is pointing at paragraph ¶${docxTarget.index} of "${docxTarget.path}": ${JSON.stringify(docxTarget.text.slice(0, 200))}. Apply this request to THAT paragraph; confirm its index with DocxOutline if unsure.]`
+      : ''
     // Preserve tool activity from earlier turns so the agent remembers what it
     // already read/searched instead of re-scanning the folder every turn.
-    const history: Msg[] = [...buildHistory(agentItems), { role: 'user', content: text }]
+    const history: Msg[] = [...buildHistory(agentItems), { role: 'user', content: text + docxNote }]
 
     setAgentItems((prev) => [...prev, { kind: 'text', role: 'user', content: text }])
+    if (docxTarget) onDocxTargetUsed?.()
     setInput('')
     setStreaming(true)
 
@@ -800,6 +838,7 @@ function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onC
     runFilesRef.current = new Set()
     setLastRunFiles([])
     setCtxUsage(null)
+    setCheckpoint(null)
     setPendingAction(null)
     setTodos([])
 
@@ -842,6 +881,8 @@ function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onC
       if (e.type === 'action_resolved') { setPendingAction(null); return }
       if (e.type === 'todos') { setTodos(e.todos); return }
       if (e.type === 'context') { setCtxUsage({ used: e.used, window: e.window }); return }
+      // Non-terminal: the run is long and STILL going — surface it, don't stop it.
+      if (e.type === 'checkpoint') { setCheckpoint({ turns: e.turns, costUsd: e.costUsd }); return }
       if (e.type === 'subagent_started') {
         // A child agent was delegated: render a nested live card. The plain
         // SpawnAgent tool entry is kept for history but hidden from view.
@@ -876,6 +917,7 @@ function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onC
         reqIdRef.current = null
         setStreaming(false)
         setPendingAction(null)
+        setCheckpoint(null)
         // Surface an Undo affordance if the run wrote files (done or blocked).
         if (e.type !== 'error' && runFilesRef.current.size > 0) {
           setLastRunFiles(Array.from(runFilesRef.current))
@@ -912,6 +954,12 @@ function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onC
           if (e.type === 'error') copy.push({ kind: 'text', role: 'assistant', content: `⚠ ${e.error}` })
           if (e.type === 'blocked') copy.push({ kind: 'text', role: 'assistant', content: `⛔ Blocked: ${e.reason}` })
           if (e.type === 'plan') copy.push({ kind: 'text', role: 'assistant', content: `📋 **Plan**\n\n${e.plan}` })
+          // A run that stopped for a reason the user did NOT choose used to be
+          // indistinguishable from a finished one — same "done", same UI. Say why.
+          if (e.type === 'done') {
+            const note = STOP_REASON_NOTE[e.reason]
+            if (note) copy.push({ kind: 'text', role: 'assistant', content: note })
+          }
           // Snap chunks → content: finished replies render as ONE static
           // markdown block instead of a growing span list from here on.
           return flattenFinished(copy)
@@ -991,6 +1039,7 @@ function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onC
       if (wasAgent) snapped.push({ kind: 'text', role: 'assistant', content: '⏹ Stopped.' })
       return snapped
     })
+    setCheckpoint(null)
     setStreaming(false)
   }
 
@@ -1222,10 +1271,16 @@ function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onC
                       sessions.map((s) => (
                         <div
                           key={s.id}
-                          className={`group flex items-center gap-1.5 px-2.5 py-1.5 hover:bg-zinc-800/60 cursor-pointer ${
+                          role="button"
+                          tabIndex={renamingSession === s.id ? -1 : 0}
+                          className={`group flex items-center gap-1.5 px-2.5 py-1.5 hover:bg-zinc-800/60 cursor-pointer outline-none focus-visible:bg-zinc-800/60 focus-visible:ring-1 focus-visible:ring-blue-500/50 ${
                             s.id === sessionId ? 'bg-zinc-800/40' : ''
                           }`}
                           onClick={() => { if (renamingSession !== s.id) loadSession(s.id) }}
+                          onKeyDown={(e) => {
+                            if (renamingSession === s.id) return
+                            if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); loadSession(s.id) }
+                          }}
                         >
                           {renamingSession === s.id ? (
                             <input
@@ -1248,7 +1303,7 @@ function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onC
                           <button
                             onClick={(e) => { e.stopPropagation(); setRenamingSession(s.id); setRenameValue(s.title) }}
                             title="Rename session"
-                            className="opacity-0 group-hover:opacity-100 text-zinc-600 hover:text-zinc-200 flex-shrink-0"
+                            className="opacity-0 group-hover:opacity-100 focus-visible:opacity-100 group-focus-within:opacity-100 text-zinc-600 hover:text-zinc-200 flex-shrink-0"
                           >
                             <Pencil size={11} />
                           </button>
@@ -1264,7 +1319,7 @@ function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onC
                             <button
                               onClick={(e) => { e.stopPropagation(); setConfirmDeleteSession(s.id) }}
                               title="Delete session"
-                              className="opacity-0 group-hover:opacity-100 text-zinc-600 hover:text-rose-400 flex-shrink-0"
+                              className="opacity-0 group-hover:opacity-100 focus-visible:opacity-100 group-focus-within:opacity-100 text-zinc-600 hover:text-rose-400 flex-shrink-0"
                             >
                               <Trash size={11} />
                             </button>
@@ -1305,7 +1360,24 @@ function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onC
         onScroll={handleTranscriptScroll}
         className="flex-1 min-h-0 overflow-y-auto px-3 py-3 space-y-4"
       >
-        {mode === 'ask' ? (
+        {noProvider ? (
+          // No provider configured yet → point the user at Settings instead of
+          // an empty model dropdown and a cryptic '⚠ unknown provider' on send.
+          <div className="mt-8 mx-auto max-w-xs rounded-lg border border-blue-500/30 bg-blue-500/5 p-4 text-center">
+            <Sparkles size={18} className="text-blue-400 mx-auto mb-2" />
+            <div className="text-sm font-semibold text-zinc-200">No AI provider connected</div>
+            <div className="text-[11px] text-zinc-500 mt-1 leading-relaxed">
+              Add a provider and API key to start chatting and running the agent.
+              Works with Anthropic, OpenAI, or any OpenAI-compatible gateway.
+            </div>
+            <button
+              onClick={() => onOpenSettings?.()}
+              className="mt-3 px-3 py-1.5 text-xs font-medium rounded bg-blue-600 hover:bg-blue-500 text-white"
+            >
+              Connect a provider
+            </button>
+          </div>
+        ) : mode === 'ask' ? (
           <>
             {messages.length === 0 && (
               <div className="text-center text-zinc-600 text-xs mt-8 leading-relaxed px-4">
@@ -1353,6 +1425,13 @@ function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onC
               <div className="flex items-center gap-1.5 text-[11px] text-zinc-500 px-1">
                 <span className="size-1.5 rounded-full bg-blue-400 animate-pulse" />
                 working…
+                {/* Long run: the agent is NOT being cut off, it is still going.
+                    Shown so a big job is visible without a turn cap. */}
+                {checkpoint && (
+                  <span className="text-zinc-600" title="Bấm Stop nếu muốn dừng">
+                    · {checkpoint.turns} lượt{checkpoint.costUsd > 0 ? ` · $${checkpoint.costUsd.toFixed(2)}` : ''}
+                  </span>
+                )}
               </div>
             )}
             {compacting && (
@@ -1594,7 +1673,28 @@ function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onC
               ))}
             </div>
           )}
+          {docxTarget && (
+            <div className="mb-1.5 flex items-center gap-1.5 text-[11px]">
+              <span
+                className="inline-flex items-center gap-1 max-w-full rounded-md bg-blue-600/20 border border-blue-500/40 text-blue-200 px-2 py-0.5"
+                title={docxTarget.text}
+              >
+                <span className="font-mono">¶{docxTarget.index}</span>
+                <span className="truncate max-w-[220px] text-blue-300/80">{docxTarget.text || '(empty paragraph)'}</span>
+                <button
+                  type="button"
+                  onClick={() => onDocxTargetUsed?.()}
+                  className="ml-0.5 text-blue-300/70 hover:text-white"
+                  title="Detach paragraph"
+                >
+                  <X size={11} />
+                </button>
+              </span>
+              <span className="text-zinc-600">target for next message</span>
+            </div>
+          )}
           <textarea
+            ref={composerRef}
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onDragOver={(e) => { if (e.dataTransfer.types.includes('text/orqon-path')) e.preventDefault() }}
@@ -1714,6 +1814,91 @@ function ChatPanelImpl({ models, getContext, onFileChanged, onPendingChange, onC
   )
 }
 
+// ── Progressive streaming markdown ──────────────────────────────────────────
+// While a reply streams we used to show raw text and markdown-parse ONCE at the
+// end — re-parsing the whole growing reply every tick was O(n²) in React
+// reconciliation (the real cost, not the parse). Instead: peel off the
+// fully-formed leading blocks and markdown-render each one MEMOIZED by its own
+// string (committed blocks never re-parse or re-reconcile), while the still-
+// growing tail renders raw. Amortized O(n): each tick touches only the tail
+// plus at most one newly-committed block.
+
+// Split `text` into leading blocks that are safe to render+memoize, and the
+// still-growing `tail` (rendered raw). A boundary is a blank-line run OUTSIDE a
+// code fence whose following block is NOT a list/blockquote/table/indented
+// continuation — committing mid-list would restart <ol> numbering or split a
+// loose list; an open ``` fence keeps everything raw until it closes.
+function splitStableBlocks(text: string): { blocks: string[]; tail: string } {
+  const lines = text.split('\n')
+  const blocks: string[] = []
+  let cur: string[] = []
+  let inFence = false
+  let fenceCh = ''
+  const isBlank = (l: string) => l.trim() === ''
+  // A table row (`|…`) is NOT treated as a continuation: a blank line always
+  // ends a GFM table, so a `|` line after a blank starts a fresh block and the
+  // preceding paragraph is safe to commit.
+  const isContinuation = (l: string) =>
+    /^\s*([-*+]|\d+[.)])\s/.test(l) || // list item
+    /^\s*>/.test(l) ||                 // blockquote
+    /^(\t| {2,})\S/.test(l)            // indented code / lazy continuation
+  let i = 0
+  while (i < lines.length) {
+    const line = lines[i]
+    const fence = line.match(/^\s*(```+|~~~+)/)
+    if (fence) {
+      if (!inFence) { inFence = true; fenceCh = fence[1][0] }
+      else if (line.trim().startsWith(fenceCh)) { inFence = false }
+      cur.push(line); i++; continue
+    }
+    if (isBlank(line) && !inFence) {
+      let j = i
+      while (j < lines.length && isBlank(lines[j])) j++
+      if (j >= lines.length) break // trailing blank(s): keep prior text as tail (a list item may still stream in)
+      if (isContinuation(lines[j])) {
+        for (let k = i; k < j; k++) cur.push(lines[k]) // keep blank inside a loose list / continuation
+        i = j
+      } else {
+        if (cur.length) { blocks.push(cur.join('\n')); cur = [] } // safe boundary → commit block
+        i = j
+      }
+      continue
+    }
+    cur.push(line); i++
+  }
+  return { blocks, tail: cur.join('\n') }
+}
+
+// One committed block, markdown-rendered and memoized by its exact string so an
+// unchanged block is skipped entirely on later reveal ticks.
+const StreamBlock = memo(function StreamBlock({ text }: { text: string }) {
+  return (
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm]}
+      components={{
+        a: ({ node: _n, ...p }) => <a {...p} target="_blank" rel="noreferrer" />,
+        pre: ({ node: _n, ...p }) => <PreBlock {...p} />,
+      }}
+    >
+      {text}
+    </ReactMarkdown>
+  )
+})
+
+// Assistant reply that is STILL streaming: committed blocks format progressively
+// (memoized), the growing tail stays raw. One `.md-body` wraps everything so
+// react-markdown's fragment output collapses margins between blocks exactly like
+// the finished single-parse render.
+const StreamingMarkdown = memo(function StreamingMarkdown({ text }: { text: string }) {
+  const { blocks, tail } = splitStableBlocks(stripToolEcho(text))
+  return (
+    <div className="md-body">
+      {blocks.map((b, i) => <StreamBlock key={i} text={b} />)}
+      {tail && <div className="whitespace-pre-wrap break-words">{tail}</div>}
+    </div>
+  )
+})
+
 const MessageBubble = memo(function MessageBubble({ role, content, streaming }: { role: 'user' | 'assistant'; content: string; streaming: boolean }) {
   const isUser = role === 'user'
   const contentRef = useRef<HTMLDivElement>(null)
@@ -1729,12 +1914,12 @@ const MessageBubble = memo(function MessageBubble({ role, content, streaming }: 
         <div ref={contentRef}>
           {content
             ? (isUser
-                // While streaming, render plain text — re-parsing the whole
-                // growing reply as markdown per frame was O(n²). One markdown
-                // parse happens when the stream finishes.
+                // User text isn't markdown-rendered.
                 ? <div className="whitespace-pre-wrap break-words">{content}</div>
                 : streaming
-                  ? <div className="whitespace-pre-wrap break-words">{content}</div>
+                  // Progressive: committed blocks format as they complete, the
+                  // growing tail stays raw (no O(n²) whole-reply reparse).
+                  ? <StreamingMarkdown text={content} />
                   : <MessageContent text={content} />)
             : streaming ? (
               <span className="inline-flex gap-1 items-center text-zinc-500">
@@ -1762,7 +1947,7 @@ function CopyButton({ getText }: { getText: () => string }) {
           .catch(() => {})
       }}
       title="Copy message"
-      className="absolute top-1 right-1 p-1 rounded bg-zinc-800/90 border border-zinc-700 text-zinc-400 hover:text-zinc-100 opacity-0 group-hover:opacity-100 transition-opacity"
+      className="absolute top-1 right-1 p-1 rounded bg-zinc-800/90 border border-zinc-700 text-zinc-400 hover:text-zinc-100 opacity-0 group-hover:opacity-100 focus-visible:opacity-100 group-focus-within:opacity-100 transition-opacity"
     >
       {copied ? <Check size={11} className="text-emerald-400" /> : <Copy size={11} />}
     </button>
@@ -1784,7 +1969,7 @@ function PreBlock(props: React.HTMLAttributes<HTMLPreElement>) {
             .catch(() => {})
         }}
         title="Copy code"
-        className="absolute top-1.5 right-1.5 p-1 rounded bg-zinc-800/90 border border-zinc-700 text-zinc-400 hover:text-zinc-100 opacity-0 group-hover/code:opacity-100 transition-opacity"
+        className="absolute top-1.5 right-1.5 p-1 rounded bg-zinc-800/90 border border-zinc-700 text-zinc-400 hover:text-zinc-100 opacity-0 group-hover/code:opacity-100 focus-visible:opacity-100 transition-opacity"
       >
         {copied ? <Check size={11} className="text-emerald-400" /> : <Copy size={11} />}
       </button>
@@ -1823,13 +2008,13 @@ const GlowMessage = memo(function GlowMessage({ role, chunks }: { role: 'user' |
   return (
     <div className={isUser ? 'flex justify-end' : 'flex justify-start'}>
       <div
-        className={`group relative select-text max-w-[92%] min-w-0 overflow-hidden break-words whitespace-pre-wrap rounded-lg px-3 py-2 text-xs leading-relaxed ${
+        className={`group relative select-text max-w-[92%] min-w-0 overflow-hidden break-words rounded-lg px-3 py-2 text-xs leading-relaxed ${
           isUser
-            ? 'bg-blue-600/20 border border-blue-500/30 text-zinc-100'
+            ? 'whitespace-pre-wrap bg-blue-600/20 border border-blue-500/30 text-zinc-100'
             : 'bg-zinc-900 border border-zinc-800 text-zinc-200'
         }`}
       >
-        {text}
+        {isUser ? text : <StreamingMarkdown text={text} />}
       </div>
     </div>
   )
@@ -1956,7 +2141,15 @@ const SubAgentCard = memo(function SubAgentCard({ entry }: { entry: SubAgentEntr
       if (buf.raf != null) { cancelAnimationFrame(buf.raf); flush() }
       if (e.type === 'tool_call') setTools((ts) => [...ts, { kind: 'tool', callId: e.callId, name: e.name, args: e.args, running: true }])
       else if (e.type === 'tool_result') setTools((ts) => ts.map((t) => t.callId === e.callId ? { ...t, result: e.result, isError: e.isError, running: false } : t))
-      else if (e.type === 'done') { setStatus('done'); if (e.text) setText(e.text) }
+      else if (e.type === 'done') {
+        // A child stopped because the user (or its parent) stopped is NOT a
+        // failure — only a reason the child itself hit counts as one.
+        const clean = e.reason === 'completed' || e.reason === 'user_stopped' || e.reason === 'parent_stopped'
+        setStatus(clean ? 'done' : 'error')
+        if (e.text) setText(e.text)
+        const note = STOP_REASON_NOTE[e.reason]
+        if (note) setText((t) => t + (t ? '\n\n' : '') + note)
+      }
       else if (e.type === 'error') { setStatus('error'); setText((t) => t + `\n⚠ ${e.error}`) }
       else if (e.type === 'blocked') { setStatus('blocked'); setText((t) => t + `\n⛔ ${e.reason}`) }
     })
@@ -2083,7 +2276,7 @@ const ToolActivity = memo(function ToolActivity({ entry }: { entry: ToolEntry })
         <pre className={`px-2.5 pb-2 max-h-40 overflow-y-auto whitespace-pre-wrap font-mono text-[10px] leading-snug scrollbar-thin ${
           entry.isError ? 'text-rose-300/80' : 'text-zinc-500'
         }`}>
-          {entry.result!.length > 1000 ? entry.result!.slice(0, 1000) + '…' : entry.result}
+          {clampMiddle(entry.result!, 1000)}
         </pre>
       )}
     </div>

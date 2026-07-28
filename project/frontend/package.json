@@ -13,14 +13,17 @@
   "dependencies": {
     "@fontsource-variable/geist": "^5.2.9",
     "@monaco-editor/react": "^4.7.0",
+    "@xmldom/xmldom": "^0.9.10",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/addon-search": "^0.16.0",
     "@xterm/addon-webgl": "^0.19.0",
     "@xterm/xterm": "^6.0.0",
     "better-sqlite3": "^11.8.0",
     "discord.js": "^14.16.3",
+    "docx-preview": "^0.4.0",
     "exceljs": "^4.4.0",
     "framer-motion": "^11.15.0",
+    "jszip": "^3.10.1",
     "lucide-react": "^1.16.0",
     "monaco-editor": "^0.56.0",
     "node-pty": "^1.1.0",
@@ -29,7 +32,8 @@
     "react-dom": "^18.3.1",
     "react-icons": "^5.7.0",
     "react-markdown": "^9.1.0",
-    "remark-gfm": "^4.0.1"
+    "remark-gfm": "^4.0.1",
+    "typescript": "^5.7.2"
   },
   "devDependencies": {
     "@electron/rebuild": "^4.0.4",
@@ -40,7 +44,6 @@
     "@vitejs/plugin-react": "^4.3.4",
     "electron": "^33.2.0",
     "tailwindcss": "^4.0.0",
-    "typescript": "^5.7.2",
     "vite": "^6.0.3",
     "vite-plugin-electron": "^0.29.0",
     "vite-plugin-electron-renderer": "^0.14.6"
