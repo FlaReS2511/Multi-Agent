@@ -14,7 +14,7 @@
 // page.evaluate and actions target them with locator('[data-orqon-ref=...]')
 // — public API only, auto-waiting retained.
 
-import { app, BrowserWindow, WebContentsView } from 'electron'
+import { app, BrowserWindow, WebContentsView, clipboard } from 'electron'
 import fs from 'node:fs'
 import path from 'node:path'
 import { createRequire } from 'node:module'
@@ -496,14 +496,49 @@ async function pointAt(pg: Page, loc: ReturnType<Page['locator']>, click: boolea
 // rung below is verified by reading the value back, and the tool now fails
 // loudly instead of lying.
 
-// What the field currently holds. contenteditable has no .value, so fall back
-// to textContent.
+// What the field currently holds.
+//
+// Code editors are the trap here. Monaco and CodeMirror put a 1-line proxy
+// <textarea> over the document for IME/clipboard; a snapshot ref lands on THAT,
+// and its .value is a window around the caret, never the document. Reading it
+// makes every verification fail, and a ladder that escalates on failure then
+// writes the text again — measured on LeetCode: the proxy read 1001 chars while
+// the real model held 1510, and the solution went in several times over, each
+// copy spliced into the middle of the last.
 async function readFieldText(loc: ReturnType<Page['locator']>): Promise<string> {
   try {
-    return String(await loc.evaluate((el: any) => el.value ?? el.textContent ?? ''))
+    return String(await loc.evaluate((el: any) => {
+      const host = el.closest?.('.monaco-editor')
+      if (host) {
+        // Prefer the real model: .view-lines is virtualized, so it only holds
+        // the lines currently scrolled into view.
+        try {
+          const models = (window as any).monaco?.editor?.getModels?.() ?? []
+          if (models.length) {
+            return models.map((m: any) => m.getValue()).sort((a: string, b: string) => b.length - a.length)[0]
+          }
+        } catch { /* monaco not exposed on this page */ }
+        return host.querySelector('.view-lines')?.innerText ?? ''
+      }
+      const cm = el.closest?.('.cm-editor')
+      if (cm) return cm.querySelector('.cm-content')?.innerText ?? ''
+      return el.value ?? el.textContent ?? ''
+    }))
   } catch {
     return '' // detached / unreadable — treat as "nothing landed"
   }
+}
+
+// Empty the field in a way the EDITOR understands. loc.clear() sets the DOM
+// element's value, which on a Monaco proxy textarea leaves the document
+// untouched — so the next rung appends instead of replacing.
+async function clearField(pg: Page, loc: ReturnType<Page['locator']>): Promise<void> {
+  try {
+    await loc.click({ force: true, timeout: 2000 })
+    const mod = process.platform === 'darwin' ? 'Meta' : 'Control'
+    await pg.keyboard.press(`${mod}+a`)
+    await pg.keyboard.press('Delete')
+  } catch { /* best effort — the dirty-stop below is the real guard */ }
 }
 
 // Did `want` actually land? Widgets reformat while you type (phone numbers,
@@ -561,59 +596,104 @@ async function lowLevelChars(pg: Page, text: string): Promise<void> {
   }
 }
 
+// Rung: system clipboard + a real paste keystroke.
+//
+// This is the ONLY path that puts multi-line code into a code editor verbatim.
+// Every other rung reaches the document through the editor's type handler,
+// which re-runs auto-indent on each newline — measured on LeetCode's Monaco,
+// `type` turned a 6-line Python solution into a widening staircase and
+// `insertText` doubled every indent level, while a real paste landed the same
+// 185 characters byte-for-byte. A synthesized ClipboardEvent does NOT work
+// (Monaco ignores untrusted paste); it has to be the OS clipboard.
+//
+// The user's clipboard is theirs, so it is restored afterwards.
+async function clipboardPaste(pg: Page, loc: ReturnType<Page['locator']>, text: string): Promise<void> {
+  const previous = clipboard.readText()
+  try {
+    clipboard.writeText(text)
+    await loc.click({ force: true, timeout: 2500 }).catch(() => { /* focus best effort */ })
+    await pg.keyboard.press(process.platform === 'darwin' ? 'Meta+v' : 'Control+v')
+    await pg.waitForTimeout(250) // let the editor apply the paste before we restore
+  } finally {
+    clipboard.writeText(previous)
+  }
+}
+
 // Walk the rungs until the text is verifiably in the field. Returns which rung
 // worked (null = none did) plus everything tried, for the error message.
 async function typeIntoField(
   pg: Page,
   loc: ReturnType<Page['locator']>,
   text: string,
-): Promise<{ via: string | null; tried: string[] }> {
+): Promise<{ via: string | null; tried: string[]; dirtied?: boolean }> {
   // Focus is best-effort on the lower rungs: they insert into whatever is
   // focused, so a click that misses is survivable but worth attempting.
   const focus = () => loc.click({ force: true, timeout: 2500 }).catch(() => { /* best effort */ })
   const external = !onIdeView(pg)
+  // Key events run the editor's own input handling: Monaco auto-indents after
+  // every newline (and again after a Python `:`), so typing multi-line text
+  // key-by-key produces a widening staircase. The atomic rungs insert the text
+  // as one edit and are unaffected, so they go first once text spans lines.
+  const multiline = text.includes('\n')
 
-  const rungs: [string, () => Promise<void>][] = [
-    // 1 — proper input events; handles React's patched value descriptor.
-    ['fill', async () => { await loc.fill(text, { timeout: 4000 }) }],
-    // 2 — real key events, for fields that only react to keydown.
-    ['type', async () => {
-      await loc.click({ timeout: 2500 })
-      await loc.clear({ timeout: 1500 }).catch(() => { /* nothing to clear */ })
-      await pg.keyboard.type(text, { delay: 12 })
-    }],
-    // 3 — CDP Input.insertText through playwright: contenteditable + IME.
-    ['insertText', async () => { await focus(); await pg.keyboard.insertText(text) }],
-    // 4 — below JS. On an EXTERNAL browser this is the same CDP call rung 3
-    // already made, so it is skipped there and we go straight to char events.
-    ...(external
-      ? []
-      : ([['lowlevel', async () => { await focus(); await lowLevelInsert(pg, text) }]] as [string, () => Promise<void>][])),
-    // 4b — per-character char events (keypress/textInput listeners).
-    ['chars', async () => { await focus(); await lowLevelChars(pg, text) }],
-    // 5 — last resort: write through the native setter React patched over, then
-    // announce it. The most synthetic rung, so it goes last.
-    ['nativeSet', async () => {
-      await loc.evaluate((el: any, t: string) => {
-        const proto = el instanceof HTMLTextAreaElement
-          ? HTMLTextAreaElement.prototype
-          : HTMLInputElement.prototype
-        const set = Object.getOwnPropertyDescriptor(proto, 'value')?.set
-        if (set && 'value' in el) set.call(el, t)
-        else el.textContent = t
-        el.dispatchEvent(new Event('input', { bubbles: true }))
-        el.dispatchEvent(new Event('change', { bubbles: true }))
-      }, text)
-    }],
-  ]
+  const fill: [string, () => Promise<void>] =
+    ['fill', async () => { await loc.fill(text, { timeout: 4000 }) }]
+  const type: [string, () => Promise<void>] =
+    ['type', async () => { await focus(); await pg.keyboard.type(text, { delay: 12 }) }]
+  const insertText: [string, () => Promise<void>] =
+    ['insertText', async () => { await focus(); await pg.keyboard.insertText(text) }]
+  // Below JS. On an EXTERNAL browser this is the same CDP call insertText
+  // already made, so it is dropped there and escalation goes to char events.
+  const lowlevel: [string, () => Promise<void>][] = external
+    ? []
+    : [['lowlevel', async () => { await focus(); await lowLevelInsert(pg, text) }]]
+  const chars: [string, () => Promise<void>] =
+    ['chars', async () => { await focus(); await lowLevelChars(pg, text) }]
+  // Last resort: write through the native setter React patched over, then
+  // announce it. The most synthetic rung, so it goes last.
+  const nativeSet: [string, () => Promise<void>] = ['nativeSet', async () => {
+    await loc.evaluate((el: any, t: string) => {
+      const proto = el instanceof HTMLTextAreaElement
+        ? HTMLTextAreaElement.prototype
+        : HTMLInputElement.prototype
+      const set = Object.getOwnPropertyDescriptor(proto, 'value')?.set
+      if (set && 'value' in el) set.call(el, t)
+      else el.textContent = t
+      el.dispatchEvent(new Event('input', { bubbles: true }))
+      el.dispatchEvent(new Event('change', { bubbles: true }))
+    }, text)
+  }]
+
+  const paste: [string, () => Promise<void>] =
+    ['paste', async () => { await clipboardPaste(pg, loc, text) }]
+
+  // Multi-line goes to paste FIRST. Not a preference — an ordering constraint:
+  // any earlier rung that half-writes trips the dirty-stop below, and paste
+  // would never be reached. Single-line text is unaffected by auto-indent, so
+  // it keeps the cheap rungs first and only borrows the clipboard as a
+  // late fallback.
+  const rungs: [string, () => Promise<void>][] = multiline
+    ? [paste, fill, insertText, ...lowlevel, type, chars, nativeSet]
+    : [fill, type, insertText, ...lowlevel, chars, paste, nativeSet]
 
   const tried: string[] = []
   for (const [name, run] of rungs) {
+    // Start every rung from a known-empty field, through the editor rather than
+    // through the DOM element, so a rung that partially wrote cannot leave a
+    // prefix for the next one to append to.
+    await clearField(pg, loc)
+    const before = await readFieldText(loc)
     try { await run() } catch { /* rung failed outright — escalate */ }
     tried.push(name)
-    if (textLanded(await readFieldText(loc), text)) return { via: name, tried }
+    const after = await readFieldText(loc)
+    if (textLanded(after, text)) return { via: name, tried }
+    // The rung did not land the text but DID change the field. Escalating now
+    // would write a second copy on top of the first — which is exactly how six
+    // rungs put a LeetCode solution into Monaco six times, each spliced into
+    // the middle of the last. Stop and report instead.
+    if (after !== before && after.trim() !== '') return { via: null, tried, dirtied: true }
   }
-  return { via: null, tried }
+  return { via: null, tried, dirtied: false }
 }
 
 // ── external browser launch (phase 2) ───────────────────────────
@@ -744,13 +824,23 @@ export async function runBrowserTool(
       const text = String(args.text ?? '')
       const urlBefore = pg.url()
       await pointAt(pg, loc, false) // glide the virtual cursor to the field
-      const { via, tried } = await typeIntoField(pg, loc, text)
+      const { via, tried, dirtied } = await typeIntoField(pg, loc, text)
       if (!via) {
-        const snap = await snapshot(pg, { after: `typing into ${args.ref} FAILED — the field is unchanged` })
-        return `error: could not type into ${args.ref}; every input method failed (tried: ${tried.join(' → ')}) ` +
-          'and the field still does not contain the text. It may be disabled/readonly, a custom editor that ' +
-          'ignores injected input, or the ref may point at a wrapper rather than the real input. Pick a ' +
-          `different ref from the page below, or ask the user to type it by hand.\n${snap}`
+        const snap = await snapshot(pg, {
+          after: dirtied ? `typing into ${args.ref} FAILED — the field was left modified` : `typing into ${args.ref} FAILED`,
+        })
+        return dirtied
+          // Stopped on purpose after the first rung that changed the field:
+          // retrying would stack another copy on top. The field is NOT clean,
+          // so say so — the agent must inspect before writing again.
+          ? `error: typing into ${args.ref} did not produce the expected content, and the field HAS been ` +
+            `modified (tried: ${tried.join(' → ')}, then stopped so a retry could not stack a second copy). ` +
+            'Do NOT simply call BrowserType again — first read the field back to see what is actually in it, ' +
+            `clear it, and only then retry.\n${snap}`
+          : `error: could not type into ${args.ref}; every input method failed (tried: ${tried.join(' → ')}) ` +
+            'and the field is unchanged. It may be disabled/readonly, a custom editor that ignores injected ' +
+            'input, or the ref may point at a wrapper rather than the real input. Pick a different ref from ' +
+            `the page below, or ask the user to type it by hand.\n${snap}`
       }
       if (args.submit) {
         await loc.press('Enter').catch(() => { /* element may detach on submit */ })
