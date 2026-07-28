@@ -508,7 +508,14 @@ async function pointAt(pg: Page, loc: ReturnType<Page['locator']>, click: boolea
 async function readFieldText(loc: ReturnType<Page['locator']>): Promise<string> {
   try {
     return String(await loc.evaluate((el: any) => {
-      const host = el.closest?.('.monaco-editor')
+      // Follow FOCUS, not the ref. A snapshot ref frequently lands on a wrapper
+      // beside the editor rather than on its proxy textarea — keystrokes still
+      // reach the focused editor, so describing the ref element describes the
+      // wrong thing entirely. That mismatch is what produced a staircase
+      // (suppression skipped because the ref was not "in" an editor) stacked
+      // under two more copies (clear aimed at an element that ignored it).
+      const host = document.activeElement?.closest?.('.monaco-editor')
+        ?? el.closest?.('.monaco-editor')
       if (host) {
         // Prefer the real model: .view-lines is virtualized, so it only holds
         // the lines currently scrolled into view.
@@ -520,7 +527,7 @@ async function readFieldText(loc: ReturnType<Page['locator']>): Promise<string> 
         } catch { /* monaco not exposed on this page */ }
         return host.querySelector('.view-lines')?.innerText ?? ''
       }
-      const cm = el.closest?.('.cm-editor')
+      const cm = document.activeElement?.closest?.('.cm-editor') ?? el.closest?.('.cm-editor')
       if (cm) return cm.querySelector('.cm-content')?.innerText ?? ''
       return el.value ?? el.textContent ?? ''
     }))
@@ -538,7 +545,18 @@ async function clearField(pg: Page, loc: ReturnType<Page['locator']>): Promise<v
     const mod = process.platform === 'darwin' ? 'Meta' : 'Control'
     await pg.keyboard.press(`${mod}+a`)
     await pg.keyboard.press('Delete')
-  } catch { /* best effort — the dirty-stop below is the real guard */ }
+    // Select-all only empties the thing that has focus. When the ref named a
+    // wrapper the keys went nowhere, the field stayed full, and the next rung
+    // appended to it. If an editor holds focus, empty it through its own model
+    // as well, so "cleared" means cleared regardless of what the ref pointed at.
+    await loc.evaluate(() => {
+      const host = document.activeElement?.closest?.('.monaco-editor')
+      if (!host) return
+      const editors = (window as any).monaco?.editor?.getEditors?.() ?? []
+      const ed = editors.find((e: any) => host.contains(e.getDomNode?.()))
+      if (ed?.getModel?.()?.getValue?.()) ed.getModel().setValue('')
+    }).catch(() => { /* no monaco on this page */ })
+  } catch { /* best effort — the verification below is the real guard */ }
 }
 
 // Did `want` actually land?
@@ -660,8 +678,12 @@ const TYPING_HOSTILE_OPTIONS = {
 // Editors we cannot reach through the monaco API just get plain typing; the
 // verification below catches it if that comes out wrong.
 async function typewriter(pg: Page, loc: ReturnType<Page['locator']>, text: string): Promise<void> {
+  // Focus FIRST, then resolve the editor from what actually holds focus — the
+  // ref may name a wrapper, and suppressing options on the wrong instance (or
+  // on none) is what let auto-indent through.
+  await loc.click({ force: true, timeout: 2500 }).catch(() => { /* focus best effort */ })
   const suppressed = await loc.evaluate((el: any, opts: Record<string, unknown>) => {
-    const host = el.closest?.('.monaco-editor')
+    const host = document.activeElement?.closest?.('.monaco-editor') ?? el.closest?.('.monaco-editor')
     if (!host) return false
     const editors = (window as any).monaco?.editor?.getEditors?.() ?? []
     const ed = editors.find((e: any) => host.contains(e.getDomNode?.())) ?? editors[0]
@@ -675,12 +697,11 @@ async function typewriter(pg: Page, loc: ReturnType<Page['locator']>, text: stri
   }, { ...TYPING_HOSTILE_OPTIONS }).catch(() => false)
 
   try {
-    await loc.click({ force: true, timeout: 2500 }).catch(() => { /* focus best effort */ })
     await pg.keyboard.type(text, { delay: TYPE_DELAY_MS })
   } finally {
     if (suppressed) {
       await loc.evaluate((el: any) => {
-        const host = el.closest?.('.monaco-editor')
+        const host = document.activeElement?.closest?.('.monaco-editor') ?? el.closest?.('.monaco-editor')
         const editors = (window as any).monaco?.editor?.getEditors?.() ?? []
         const ed = editors.find((e: any) => host?.contains(e.getDomNode?.())) ?? editors[0]
         const prev = (window as any).__orqonTypingOpts
