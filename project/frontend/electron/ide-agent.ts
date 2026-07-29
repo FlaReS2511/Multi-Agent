@@ -342,7 +342,7 @@ const GROUP_BLURBS: Record<string, string> = {
   background: 'background (run/monitor/kill long-running commands)',
   excel: 'excel (create/read/edit .xlsx: sheets, ranges, formulas, formatting)',
   docx: 'docx (edit .docx live in the IDE, preserving layout: outline/inspect/read, replace/insert/delete paragraphs, run+paragraph formatting, styles, images, tab-stops + column alignment for forms, tables. ALWAYS DocxOutline first — everything targets a paragraph by its ¶index)',
-  browser: 'browser (drive a real page inside the IDE: open/click/type/read console+text — ideal for testing localhost apps and reading JS-rendered sites)',
+  browser: 'browser (drive a real page — in the IDE or an attached Chrome: open/click/type/press keys/read console+text — ideal for testing localhost apps and reading JS-rendered sites. In a code editor on the page, BrowserType fills an EMPTY editor; every later correction goes through BrowserEditCode, which replaces one snippet in place instead of rewriting the whole file)',
 }
 const LOAD_GROUP_SPEC: ToolSpec = {
   name: 'LoadToolGroup',

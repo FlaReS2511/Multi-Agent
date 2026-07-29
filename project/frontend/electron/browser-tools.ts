@@ -71,6 +71,20 @@ export const BROWSER_TOOL_SPECS: ToolSpec[] = [
     },
   },
   {
+    name: 'BrowserEditCode',
+    description: 'Fix code that is ALREADY in the page\'s code editor by replacing one exact snippet — the way a person selects those lines and retypes them. Scrolls to the snippet, selects it (the user sees the highlight), and types the replacement over it, leaving the rest of the file untouched. Use this for every correction; BrowserType rewrites the WHOLE editor and is only for filling an empty one. Include leading indentation in both strings, exactly as it appears. old_string must match exactly once unless replace_all is true.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        old_string: { type: 'string', description: 'the snippet to replace, matched exactly (indentation included)' },
+        new_string: { type: 'string', description: 'what to type in its place; pass "" to delete the snippet' },
+        ref: { type: 'string', description: 'the editor element from the last snapshot (optional — defaults to the focused editor)' },
+        replace_all: { type: 'boolean' },
+      },
+      required: ['old_string', 'new_string'],
+    },
+  },
+  {
     name: 'BrowserPressKey',
     description: 'Press a key on the page: "Enter", "Tab", "Escape", "Backspace", "ArrowDown", or a chord like "Control+a". Pass ref to focus that element first (from the last BrowserSnapshot); without ref the key goes to whatever is currently focused. Use for dropdowns, modals, and multi-step forms that BrowserClick/BrowserType cannot drive.',
     input_schema: {
@@ -349,10 +363,23 @@ function errorPage(url: string, desc: string): string {
 }
 
 const CHALLENGE_RE = /captcha|cloudflare|turnstile|verify you are (a )?human|just a moment|access denied/i
-function challengeHint(text: string): string {
-  return CHALLENGE_RE.test(text)
-    ? '\n\n⚠ This page appears to be showing a CAPTCHA / verification challenge. Do NOT retry — ask the user to complete it by hand in the browser tab, then continue.'
-    : ''
+// A real interstitial is a nearly-empty page whose visible text IS the
+// challenge. Testing the token anywhere in a fully-rendered page flags ordinary
+// content instead: LeetCode ships the i18n string "Still processing. Just a
+// moment..." in its own page data, so a problem page that had rendered
+// perfectly came back carrying "Do NOT retry — ask the user to complete it by
+// hand", and the agent obeyed and stopped.
+//
+// Two signals now, both specific. The document title is the strong one —
+// Cloudflare literally sets "Just a moment..." — and a body match only counts
+// while the page is too small to be anything but a challenge.
+const CHALLENGE_MAX_CHARS = 1200
+function challengeHint(text: string, title?: string): string {
+  const byTitle = !!title && CHALLENGE_RE.test(title)
+  const byBody = text.length <= CHALLENGE_MAX_CHARS && CHALLENGE_RE.test(text)
+  if (!byTitle && !byBody) return ''
+  return '\n\n⚠ This page appears to be showing a CAPTCHA / verification challenge. Do NOT retry ' +
+    'or try to bypass it — ask the user to complete it by hand in the browser tab, then continue.'
 }
 
 // Tag interactive elements with data-orqon-ref and return a text map of the
@@ -415,7 +442,8 @@ async function snapshot(pg: Page, opts?: { waitMs?: number; settleFirst?: boolea
   const banner = opts?.after
     ? `== CURRENT PAGE (${opts.after}) — use these refs for your next action, do not guess ==`
     : '== CURRENT PAGE — use these refs for your next action, do not guess =='
-  const head = `${banner}\nURL: ${pg.url()}\nTitle: ${await pg.title()}`
+  const title = await pg.title()
+  const head = `${banner}\nURL: ${pg.url()}\nTitle: ${title}`
   const text = `${head}\n${body || '(no interactive elements found — try BrowserScroll or BrowserRead)'}`
   // Cap generously: a truncated element list is the main cause of the model
   // "guessing" a target it never saw (busy pages like GitHub list 100+
@@ -424,7 +452,9 @@ async function snapshot(pg: Page, opts?: { waitMs?: number; settleFirst?: boolea
   const capped = text.length > LIMIT
     ? text.slice(0, LIMIT) + `\n… (element list truncated — ${body.length - LIMIT}+ chars more; if your target is not listed above, BrowserRead the page or ask the user to narrow the view rather than guessing)`
     : text
-  return capped + challengeHint(capped)
+  // The BODY is what gets size-tested for a challenge, not the assembled
+  // snapshot — the banner and element list would push any page past the limit.
+  return capped + challengeHint(body, title)
 }
 
 // Playwright accepts only canonical key names — "cmd+a", "ctrl+a", "esc",
@@ -755,6 +785,140 @@ async function typewriter(pg: Page, loc: ReturnType<Page['locator']>, text: stri
   }
 }
 
+// Count a snippet the way the editor search counts it. Verification has to use
+// the SAME line-start rule as the search, or an indented snippet still reads as
+// present inside a more deeply indented line and the tool reports a failure it
+// invented — the edit having in fact been correct.
+function countSnippet(hay: string, needle: string): number {
+  if (!needle) return 0
+  const lineAnchored = /^[ \t]/.test(needle)
+  let n = 0
+  for (let i = 0; ; ) {
+    const at = hay.indexOf(needle, i)
+    if (at === -1) return n
+    if (!lineAnchored || at === 0 || hay[at - 1] === '\n') n++
+    i = at + 1
+  }
+}
+
+// Replace one snippet inside the page's code editor, in place.
+//
+// Every duplication bug in this file came from rewriting the whole buffer: a
+// rewrite that does not fully replace what was there leaves the old version
+// above the new one. An in-place edit cannot do that — it touches a range and
+// nothing else. So corrections go through here, and BrowserType is left for
+// filling an empty editor.
+//
+// The user still sees the work: the editor scrolls to the snippet, highlights
+// it, and the replacement is typed over the selection.
+async function editInEditor(
+  pg: Page,
+  loc: ReturnType<Page['locator']>,
+  oldStr: string,
+  newStr: string,
+  replaceAll: boolean,
+): Promise<string> {
+  await loc.click({ force: true, timeout: 2500 }).catch(() => { /* focus best effort */ })
+
+  // The editor is resolved through focus, like everything else here, because a
+  // ref often names a wrapper rather than the editor itself.
+  const count = await loc.evaluate((el: any, needle: string) => {
+    const host = document.activeElement?.closest?.('.monaco-editor') ?? el.closest?.('.monaco-editor')
+    if (!host) return -1
+    const eds = (window as any).monaco?.editor?.getEditors?.() ?? []
+    const ed = eds.find((e: any) => host.contains(e.getDomNode?.())) ?? eds[0]
+    const model = ed?.getModel?.()
+    if (!model) return -1
+    const ms = model.findMatches(needle, false, false, true, null, false)
+    // Plain substring search is not enough for indented code. "        return
+    // False" (8 spaces) also matches INSIDE "            return False" (12
+    // spaces) on another line, starting at column 5 — verified on a real file,
+    // where that was the ONLY match, the edit landed on the line above the
+    // intended one, and every check still came back green.
+    //
+    // A snippet beginning with indentation is meant to begin a line, so for
+    // those nothing but a line-start match counts. Falling back to the others
+    // when none exists is precisely the behaviour that produced the wrong edit,
+    // so a miss is reported as a miss.
+    if (/^[ \t]/.test(needle)) return ms.filter((m: any) => m.range.startColumn === 1).length
+    return ms.length
+  }, oldStr).catch(() => -1)
+
+  if (count === -1) {
+    return 'error: no code editor is focused here — click the editor first (BrowserClick on its ref), or use ' +
+      'BrowserType if this is an ordinary input rather than a code editor'
+  }
+  if (count === 0) {
+    return 'error: old_string was not found in the editor. It must match EXACTLY, including indentation, and ' +
+      'when it starts with indentation it must start a line — a snippet that only matches partway into a more ' +
+      'deeply indented line is rejected rather than edited in the wrong place. Read the current contents with ' +
+      'BrowserRead and copy the snippet from there, whole lines at a time.'
+  }
+  if (count > 1 && !replaceAll) {
+    return `error: old_string appears ${count} times — include more surrounding lines to make it unique, ` +
+      'or pass replace_all=true.'
+  }
+
+  // Work backwards: replacing a later range cannot move an earlier one.
+  for (let i = count - 1; i >= 0; i--) {
+    const placed = await loc.evaluate((el: any, arg: { needle: string; index: number; opts: Record<string, unknown> }) => {
+      const host = document.activeElement?.closest?.('.monaco-editor') ?? el.closest?.('.monaco-editor')
+      const eds = (window as any).monaco?.editor?.getEditors?.() ?? []
+      const ed = eds.find((e: any) => host?.contains(e.getDomNode?.())) ?? eds[0]
+      const model = ed?.getModel?.()
+      if (!model) return false
+      let ms = model.findMatches(arg.needle, false, false, true, null, false)
+      // Same line-start rule the count used, so index i means the same match.
+      if (/^[ \t]/.test(arg.needle)) ms = ms.filter((x: any) => x.range.startColumn === 1)
+      const m = ms[arg.index]
+      if (!m) return false
+      ed.revealRangeInCenter(m.range)  // scroll to it, so the user sees the edit
+      ed.setSelection(m.range)         // highlight it, the way a drag-select looks
+      ed.focus()
+      const raw = ed.getRawOptions?.() ?? {}
+      const prev: Record<string, unknown> = {}
+      for (const k of Object.keys(arg.opts)) prev[k] = raw[k]
+      ;(window as any).__orqonEditOpts = prev
+      ed.updateOptions(arg.opts)
+      return true
+    }, { needle: oldStr, index: i, opts: { ...TYPING_HOSTILE_OPTIONS } }).catch(() => false)
+
+    if (!placed) return `error: could not select occurrence ${i + 1} of old_string (the editor changed underneath)`
+
+    try {
+      // Empty replacement = delete the selection.
+      if (newStr === '') await pg.keyboard.press('Delete')
+      else await pg.keyboard.type(newStr, { delay: TYPE_DELAY_MS })
+    } finally {
+      await loc.evaluate((el: any) => {
+        const host = document.activeElement?.closest?.('.monaco-editor') ?? el.closest?.('.monaco-editor')
+        const eds = (window as any).monaco?.editor?.getEditors?.() ?? []
+        const ed = eds.find((e: any) => host?.contains(e.getDomNode?.())) ?? eds[0]
+        const prev = (window as any).__orqonEditOpts
+        if (ed?.updateOptions && prev) ed.updateOptions(prev)
+        delete (window as any).__orqonEditOpts
+      }).catch(() => { /* page navigated */ })
+    }
+    if (!replaceAll) break
+  }
+
+  // Verify against the model rather than trusting the keystrokes.
+  const after = await readFieldText(loc)
+  const remaining = countSnippet(after, oldStr)
+  const expected = replaceAll ? 0 : Math.max(0, count - 1)
+  if (remaining > expected) {
+    return `error: the edit did not take — old_string still appears ${remaining} time(s) ` +
+      `(expected ${expected}). The editor may have reformatted the replacement; read it back with BrowserRead.`
+  }
+  if (newStr && !after.includes(newStr)) {
+    return 'error: the replacement is not in the editor as written — it was probably reformatted on the way in. ' +
+      'Read the current contents with BrowserRead before editing again.'
+  }
+  const n = replaceAll ? count : 1
+  return `replaced ${n} occurrence(s) in the editor; the rest of the file is unchanged. ` +
+    `Editor now holds ${after.length} characters.`
+}
+
 // Walk the rungs until the text is verifiably in the field. Returns which rung
 // worked (null = none did) plus everything tried, for the error message.
 async function typeIntoField(
@@ -917,7 +1081,9 @@ export async function runBrowserTool(
       ).catch(() => { /* decoration only */ })
       const slice = text.slice(off, off + 8000)
       const more = off + 8000 < text.length ? `\n… (${text.length - off - 8000} more chars — call again with offset=${off + 8000})` : ''
-      return `URL: ${pg.url()}\n${slice}${more}` + challengeHint(slice)
+      // Judge the WHOLE page, not this window: a challenge page is short, and a
+      // long page's later slices would each look short on their own.
+      return `URL: ${pg.url()}\n${slice}${more}` + challengeHint(text, await pg.title())
     }
     case 'BrowserClick': {
       const pg = currentPage()
@@ -1001,6 +1167,23 @@ export async function runBrowserTool(
           ? `submitted${how} → navigated to ${pg.url()}`
           : args.submit ? `after submit${how}` : `typed${how}`,
       })
+    }
+    case 'BrowserEditCode': {
+      const pg = currentPage()
+      const oldStr = String(args.old_string ?? '')
+      const newStr = String(args.new_string ?? '')
+      if (!oldStr) return 'error: old_string is required (the exact snippet to replace, indentation included)'
+      if (args.ref) {
+        const stale = await ensureRef(pg, String(args.ref))
+        if (stale) return stale
+      }
+      const loc = args.ref
+        ? refLocator(pg, String(args.ref))
+        : pg.locator('.monaco-editor textarea.inputarea').first()
+      await pointAt(pg, loc, false)
+      const result = await editInEditor(pg, loc, oldStr, newStr, Boolean(args.replace_all))
+      const snap = await snapshot(pg, { settleFirst: true, after: result.startsWith('error:') ? 'edit FAILED' : 'after edit' })
+      return `${result}\n\n${snap}`
     }
     case 'BrowserPressKey': {
       const pg = currentPage()
